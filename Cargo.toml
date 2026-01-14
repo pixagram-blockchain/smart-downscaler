@@ -1,0 +1,61 @@
+[package]
+name = "smart-downscaler"
+version = "0.1.0"
+edition = "2021"
+authors = ["Pixagram"]
+description = "Intelligent pixel art downscaler with region-aware color quantization"
+license = "MIT"
+repository = "https://github.com/pixagram/smart-downscaler"
+keywords = ["pixel-art", "image-processing", "downscaling", "quantization", "wasm"]
+categories = ["multimedia::images", "graphics", "wasm"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ordered-float = "4.2"
+thiserror = "1.0"
+
+# Optional dependencies
+image = { version = "0.24", optional = true }
+rayon = { version = "=1.5.3", optional = true }
+rand = { version = "0.8", optional = true }
+
+# WASM dependencies
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", optional = true, features = ["console"] }
+getrandom = { version = "0.2", features = ["js"], optional = true }
+
+# For serde serialization of configs
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+
+[dev-dependencies]
+criterion = "0.4"
+
+[features]
+default = ["native"]
+native = ["image", "rayon", "rand"]
+parallel = ["rayon"]
+wasm = ["wasm-bindgen", "js-sys", "web-sys", "getrandom", "serde", "serde-wasm-bindgen"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[profile.release-wasm]
+inherits = "release"
+opt-level = "s"
+lto = true
+
+[[bench]]
+name = "downscale_bench"
+harness = false
+required-features = ["native"]
+
+[[bin]]
+name = "smart-downscaler"
+path = "src/bin/smart-downscaler.rs"
+required-features = ["native"]

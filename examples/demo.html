@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Downscaler Demo</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #1a1a2e;
+            color: #eee;
+        }
+        h1 {
+            text-align: center;
+            color: #00d9ff;
+        }
+        .container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-top: 20px;
+        }
+        .panel {
+            background: #16213e;
+            border-radius: 12px;
+            padding: 20px;
+        }
+        .panel h2 {
+            margin-top: 0;
+            color: #00d9ff;
+            font-size: 1.2em;
+        }
+        canvas {
+            max-width: 100%;
+            border: 2px solid #0f3460;
+            border-radius: 8px;
+            image-rendering: pixelated;
+            image-rendering: crisp-edges;
+            background: repeating-conic-gradient(#333 0% 25%, #222 0% 50%) 50% / 20px 20px;
+        }
+        .controls {
+            margin-top: 15px;
+        }
+        .control-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 0.9em;
+            color: #aaa;
+        }
+        input[type="range"] {
+            width: 100%;
+            accent-color: #00d9ff;
+        }
+        input[type="file"] {
+            width: 100%;
+            padding: 10px;
+            background: #0f3460;
+            border: none;
+            border-radius: 6px;
+            color: #eee;
+            cursor: pointer;
+        }
+        select, button {
+            width: 100%;
+            padding: 10px;
+            background: #0f3460;
+            border: none;
+            border-radius: 6px;
+            color: #eee;
+            cursor: pointer;
+            font-size: 1em;
+        }
+        button {
+            background: #00d9ff;
+            color: #1a1a2e;
+            font-weight: bold;
+        }
+        button:hover {
+            background: #00b8d4;
+        }
+        button:disabled {
+            background: #444;
+            color: #888;
+            cursor: not-allowed;
+        }
+        .value-display {
+            text-align: right;
+            color: #00d9ff;
+            font-size: 0.9em;
+        }
+        .palette {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            margin-top: 10px;
+        }
+        .palette-color {
+            width: 24px;
+            height: 24px;
+            border-radius: 4px;
+            border: 2px solid #0f3460;
+        }
+        .stats {
+            margin-top: 15px;
+            padding: 10px;
+            background: #0f3460;
+            border-radius: 6px;
+            font-size: 0.85em;
+        }
+        .stats div {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 5px;
+        }
+        .stats span:last-child {
+            color: #00d9ff;
+        }
+        #status {
+            text-align: center;
+            padding: 10px;
+            margin-bottom: 20px;
+            border-radius: 6px;
+            background: #0f3460;
+        }
+        #status.loading {
+            background: #4a3f00;
+        }
+        #status.ready {
+            background: #004a1d;
+        }
+        #status.error {
+            background: #4a0000;
+        }
+        .download-btn {
+            margin-top: 10px;
+            background: #0f3460;
+        }
+        .download-btn:hover {
+            background: #1a4a80;
+        }
+    </style>
+</head>
+<body>
+    <h1>🎨 Smart Pixel Art Downscaler</h1>
+    
+    <div id="status" class="loading">Loading WebAssembly module...</div>
+
+    <div class="container">
+        <div class="panel">
+            <h2>Source Image</h2>
+            <canvas id="sourceCanvas" width="256" height="256"></canvas>
+            <div class="controls">
+                <div class="control-group">
+                    <label>Load Image</label>
+                    <input type="file" id="imageInput" accept="image/*">
+                </div>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Result</h2>
+            <canvas id="resultCanvas" width="256" height="256"></canvas>
+            <div class="palette" id="paletteDisplay"></div>
+            <div class="stats" id="stats" style="display: none;">
+                <div><span>Output Size:</span> <span id="outputSize">-</span></div>
+                <div><span>Colors Used:</span> <span id="colorsUsed">-</span></div>
+                <div><span>Processing Time:</span> <span id="procTime">-</span></div>
+            </div>
+            <button class="download-btn" id="downloadBtn" disabled>Download Result</button>
+        </div>
+    </div>
+
+    <div class="panel" style="margin-top: 20px;">
+        <h2>Settings</h2>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px;">
+            <div class="control-group">
+                <label>Output Width: <span class="value-display" id="widthValue">64</span></label>
+                <input type="range" id="targetWidth" min="8" max="256" value="64">
+            </div>
+            <div class="control-group">
+                <label>Output Height: <span class="value-display" id="heightValue">64</span></label>
+                <input type="range" id="targetHeight" min="8" max="256" value="64">
+            </div>
+            <div class="control-group">
+                <label>Palette Size: <span class="value-display" id="paletteValue">16</span></label>
+                <input type="range" id="paletteSize" min="2" max="64" value="16">
+            </div>
+            <div class="control-group">
+                <label>Neighbor Weight: <span class="value-display" id="neighborValue">0.30</span></label>
+                <input type="range" id="neighborWeight" min="0" max="100" value="30">
+            </div>
+            <div class="control-group">
+                <label>Region Weight: <span class="value-display" id="regionValue">0.20</span></label>
+                <input type="range" id="regionWeight" min="0" max="100" value="20">
+            </div>
+            <div class="control-group">
+                <label>Segmentation Method</label>
+                <select id="segmentation">
+                    <option value="hierarchy_fast">Hierarchy (Fast)</option>
+                    <option value="hierarchy">Hierarchy (Full)</option>
+                    <option value="slic">SLIC Superpixels</option>
+                    <option value="none">None</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>Preset Palette</label>
+                <select id="presetPalette">
+                    <option value="">Auto-extract</option>
+                    <option value="pico8">PICO-8</option>
+                    <option value="gameboy">Game Boy</option>
+                    <option value="nes">NES</option>
+                    <option value="cga">CGA</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>Two-Pass Refinement</label>
+                <select id="refinement">
+                    <option value="true">Enabled</option>
+                    <option value="false">Disabled</option>
+                </select>
+            </div>
+        </div>
+        <button id="processBtn" disabled style="margin-top: 20px;">Process Image</button>
+    </div>
+
+    <script type="module">
+        // Import the WASM module
+        // In production, change this path to your actual module location
+        import init, * as wasm from './pkg/web/smart_downscaler.js';
+
+        let sourceImage = null;
+        let resultImageData = null;
+
+        // DOM elements
+        const statusEl = document.getElementById('status');
+        const sourceCanvas = document.getElementById('sourceCanvas');
+        const resultCanvas = document.getElementById('resultCanvas');
+        const sourceCtx = sourceCanvas.getContext('2d');
+        const resultCtx = resultCanvas.getContext('2d');
+
+        // Initialize WASM
+        async function initialize() {
+            try {
+                await init();
+                statusEl.textContent = 'Ready! Load an image to begin.';
+                statusEl.className = 'ready';
+                document.getElementById('processBtn').disabled = false;
+            } catch (err) {
+                statusEl.textContent = `Error loading WASM: ${err.message}`;
+                statusEl.className = 'error';
+                console.error(err);
+            }
+        }
+
+        // Load image from file
+        document.getElementById('imageInput').addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const img = new Image();
+            img.onload = () => {
+                sourceImage = img;
+                sourceCanvas.width = img.width;
+                sourceCanvas.height = img.height;
+                sourceCtx.drawImage(img, 0, 0);
+                statusEl.textContent = `Loaded: ${img.width}×${img.height}`;
+                statusEl.className = 'ready';
+            };
+            img.src = URL.createObjectURL(file);
+        });
+
+        // Update value displays
+        document.querySelectorAll('input[type="range"]').forEach(input => {
+            const valueEl = document.getElementById(input.id.replace(/([A-Z])/g, '') + 'Value') ||
+                           document.getElementById(input.id + 'Value');
+            if (valueEl) {
+                const update = () => {
+                    if (input.id.includes('Weight')) {
+                        valueEl.textContent = (input.value / 100).toFixed(2);
+                    } else {
+                        valueEl.textContent = input.value;
+                    }
+                };
+                input.addEventListener('input', update);
+                update();
+            }
+        });
+
+        // Process image
+        document.getElementById('processBtn').addEventListener('click', async () => {
+            if (!sourceImage) {
+                alert('Please load an image first!');
+                return;
+            }
+
+            const btn = document.getElementById('processBtn');
+            btn.disabled = true;
+            btn.textContent = 'Processing...';
+            statusEl.textContent = 'Processing...';
+            statusEl.className = 'loading';
+
+            // Get settings
+            const targetWidth = parseInt(document.getElementById('targetWidth').value);
+            const targetHeight = parseInt(document.getElementById('targetHeight').value);
+            const paletteSize = parseInt(document.getElementById('paletteSize').value);
+            const neighborWeight = parseInt(document.getElementById('neighborWeight').value) / 100;
+            const regionWeight = parseInt(document.getElementById('regionWeight').value) / 100;
+            const segmentation = document.getElementById('segmentation').value;
+            const refinement = document.getElementById('refinement').value === 'true';
+            const presetPalette = document.getElementById('presetPalette').value;
+
+            // Get source image data
+            const imageData = sourceCtx.getImageData(0, 0, sourceImage.width, sourceImage.height);
+
+            try {
+                const startTime = performance.now();
+
+                let result;
+                
+                // Configure downscaler
+                const config = new wasm.WasmDownscaleConfig();
+                config.palette_size = paletteSize;
+                config.neighbor_weight = neighborWeight;
+                config.region_weight = regionWeight;
+                config.segmentation_method = segmentation;
+                config.two_pass_refinement = refinement;
+                
+                if (presetPalette) {
+                    // Use preset palette
+                    const palette = getPresetPalette(presetPalette);
+                    result = wasm.downscale_with_palette(
+                        new Uint8Array(imageData.data.buffer),
+                        imageData.width,
+                        imageData.height,
+                        targetWidth,
+                        targetHeight,
+                        palette,
+                        config
+                    );
+                } else {
+                    // Auto-extract palette
+                    result = wasm.downscale_rgba(
+                        imageData.data,
+                        imageData.width,
+                        imageData.height,
+                        targetWidth,
+                        targetHeight,
+                        config
+                    );
+                }
+
+                const endTime = performance.now();
+
+                // Display result
+                resultCanvas.width = result.width;
+                resultCanvas.height = result.height;
+                resultImageData = new ImageData(result.data, result.width, result.height);
+                resultCtx.putImageData(resultImageData, 0, 0);
+
+                // Display palette
+                displayPalette(result.palette);
+
+                // Display stats
+                document.getElementById('stats').style.display = 'block';
+                document.getElementById('outputSize').textContent = `${result.width}×${result.height}`;
+                document.getElementById('colorsUsed').textContent = result.palette_size;
+                document.getElementById('procTime').textContent = `${(endTime - startTime).toFixed(1)}ms`;
+
+                document.getElementById('downloadBtn').disabled = false;
+
+                statusEl.textContent = 'Done!';
+                statusEl.className = 'ready';
+
+            } catch (err) {
+                statusEl.textContent = `Error: ${err.message}`;
+                statusEl.className = 'error';
+                console.error(err);
+            }
+
+            btn.disabled = false;
+            btn.textContent = 'Process Image';
+        });
+
+        // Display palette colors
+        function displayPalette(paletteData) {
+            const container = document.getElementById('paletteDisplay');
+            container.innerHTML = '';
+
+            for (let i = 0; i < paletteData.length; i += 3) {
+                const r = paletteData[i];
+                const g = paletteData[i + 1];
+                const b = paletteData[i + 2];
+                
+                const div = document.createElement('div');
+                div.className = 'palette-color';
+                div.style.backgroundColor = `rgb(${r}, ${g}, ${b})`;
+                div.title = `RGB(${r}, ${g}, ${b})`;
+                container.appendChild(div);
+            }
+        }
+
+        // Preset palettes
+        function getPresetPalette(name) {
+            const palettes = {
+                gameboy: new Uint8Array([
+                    0x0f, 0x38, 0x0f,
+                    0x30, 0x62, 0x30,
+                    0x8b, 0xac, 0x0f,
+                    0x9b, 0xbc, 0x0f,
+                ]),
+                nes: new Uint8Array([
+                    0x00, 0x00, 0x00, 0xfc, 0xfc, 0xfc, 0xf8, 0xf8, 0xf8, 0xbc, 0xbc, 0xbc,
+                    0x7c, 0x7c, 0x7c, 0xa4, 0x00, 0x00, 0xfc, 0x00, 0x00, 0xfc, 0x74, 0x60,
+                    0xfc, 0xa0, 0x44, 0xfc, 0xbc, 0x00, 0xb4, 0xd0, 0x00, 0x00, 0xa8, 0x00,
+                    0x00, 0xa8, 0x44, 0x00, 0x88, 0x88, 0x00, 0x78, 0xf8, 0x00, 0x58, 0xf8,
+                ]),
+                cga: new Uint8Array([
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0xaa, 0x00, 0xaa, 0x00, 0x00, 0xaa, 0xaa,
+                    0xaa, 0x00, 0x00, 0xaa, 0x00, 0xaa, 0xaa, 0x55, 0x00, 0xaa, 0xaa, 0xaa,
+                    0x55, 0x55, 0x55, 0x55, 0x55, 0xff, 0x55, 0xff, 0x55, 0x55, 0xff, 0xff,
+                    0xff, 0x55, 0x55, 0xff, 0x55, 0xff, 0xff, 0xff, 0x55, 0xff, 0xff, 0xff,
+                ]),
+                pico8: new Uint8Array([
+                    0x00, 0x00, 0x00, 0x1d, 0x2b, 0x53, 0x7e, 0x25, 0x53, 0x00, 0x87, 0x51,
+                    0xab, 0x52, 0x36, 0x5f, 0x57, 0x4f, 0xc2, 0xc3, 0xc7, 0xff, 0xf1, 0xe8,
+                    0xff, 0x00, 0x4d, 0xff, 0xa3, 0x00, 0xff, 0xec, 0x27, 0x00, 0xe4, 0x36,
+                    0x29, 0xad, 0xff, 0x83, 0x76, 0x9c, 0xff, 0x77, 0xa8, 0xff, 0xcc, 0xaa,
+                ]),
+            };
+            return palettes[name];
+        }
+
+        // Download result
+        document.getElementById('downloadBtn').addEventListener('click', () => {
+            if (!resultImageData) return;
+
+            const link = document.createElement('a');
+            link.download = 'pixel-art.png';
+            link.href = resultCanvas.toDataURL('image/png');
+            link.click();
+        });
+
+        // Initialize on load
+        initialize();
+    </script>
+</body>
+</html>
