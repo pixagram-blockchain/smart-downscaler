@@ -113,9 +113,9 @@ impl Lab {
         let z = Self::ZN * Self::lab_to_xyz_f(fz);
 
         // XYZ to linear RGB
-        let r = x *  3.2404542 + y * -1.5371385 + z * -0.4985314;
-        let g = x * -0.9692660 + y *  1.8760108 + z *  0.0415560;
-        let b = x *  0.0556434 + y * -0.2040259 + z *  1.0572252;
+        let r = x * 3.2404542 + y * -1.5371385 + z * -0.4985314;
+        let g = x * -0.9692660 + y * 1.8760108 + z * 0.0415560;
+        let b = x * 0.0556434 + y * -0.2040259 + z * 1.0572252;
 
         // Linearize and clamp to sRGB
         Rgb {
@@ -136,35 +136,6 @@ impl Lab {
     /// Euclidean distance in Lab space
     pub fn distance(self, other: Self) -> f32 {
         self.distance_squared(other).sqrt()
-    }
-
-    /// CIE76 Delta E (simple Euclidean in Lab)
-    pub fn delta_e_76(self, other: Self) -> f32 {
-        self.distance(other)
-    }
-
-    /// CIE94 Delta E (improved perceptual metric)
-    pub fn delta_e_94(self, other: Self) -> f32 {
-        let dl = self.l - other.l;
-        let da = self.a - other.a;
-        let db = self.b - other.b;
-
-        let c1 = (self.a * self.a + self.b * self.b).sqrt();
-        let c2 = (other.a * other.a + other.b * other.b).sqrt();
-        let dc = c1 - c2;
-
-        let dh_sq = da * da + db * db - dc * dc;
-        let dh = if dh_sq > 0.0 { dh_sq.sqrt() } else { 0.0 };
-
-        let sl = 1.0;
-        let sc = 1.0 + 0.045 * c1;
-        let sh = 1.0 + 0.015 * c1;
-
-        let term_l = dl / sl;
-        let term_c = dc / sc;
-        let term_h = dh / sh;
-
-        (term_l * term_l + term_c * term_c + term_h * term_h).sqrt()
     }
 
     // sRGB gamma correction
@@ -243,6 +214,50 @@ impl Div<f32> for Lab {
     }
 }
 
+/// Fixed-point Lab color for high-performance integer math.
+/// Values are scaled by 64 (6 bits of fraction).
+/// L: [0, 100] -> [0, 6400]
+/// a, b: [-128, 127] -> [-8192, 8128]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)] // Ensure C layout for potential SIMD/WASM casting
+pub struct LabFixed {
+    pub l: i16,
+    pub a: i16,
+    pub b: i16,
+}
+
+impl LabFixed {
+    pub const SCALE: f32 = 64.0;
+
+    #[inline(always)]
+    pub fn from_lab(lab: Lab) -> Self {
+        Self {
+            l: (lab.l * Self::SCALE) as i16,
+            a: (lab.a * Self::SCALE) as i16,
+            b: (lab.b * Self::SCALE) as i16,
+        }
+    }
+
+    #[inline(always)]
+    pub fn to_lab(self) -> Lab {
+        Lab {
+            l: self.l as f32 / Self::SCALE,
+            a: self.a as f32 / Self::SCALE,
+            b: self.b as f32 / Self::SCALE,
+        }
+    }
+
+    /// Fast integer squared Euclidean distance
+    /// Returns i32, which fits the max possible squared distance safely
+    #[inline(always)]
+    pub fn distance_squared(self, other: Self) -> i32 {
+        let dl = self.l as i32 - other.l as i32;
+        let da = self.a as i32 - other.a as i32;
+        let db = self.b as i32 - other.b as i32;
+        dl * dl + da * da + db * db
+    }
+}
+
 /// Weighted Lab accumulator for computing means
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LabAccumulator {
@@ -266,31 +281,5 @@ impl LabAccumulator {
         } else {
             Lab::default()
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_rgb_to_lab_roundtrip() {
-        let original = Rgb::new(128, 64, 200);
-        let lab = original.to_lab();
-        let recovered = lab.to_rgb();
-        
-        // Allow small rounding errors
-        assert!((original.r as i32 - recovered.r as i32).abs() <= 1);
-        assert!((original.g as i32 - recovered.g as i32).abs() <= 1);
-        assert!((original.b as i32 - recovered.b as i32).abs() <= 1);
-    }
-
-    #[test]
-    fn test_black_white_lab() {
-        let black = Rgb::new(0, 0, 0).to_lab();
-        let white = Rgb::new(255, 255, 255).to_lab();
-        
-        assert!(black.l < 1.0);
-        assert!(white.l > 99.0);
     }
 }

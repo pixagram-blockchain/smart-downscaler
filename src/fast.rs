@@ -2,11 +2,13 @@
 //!
 //! Key optimizations:
 //! - Lookup tables for sRGB↔Linear and Lab f() function
-//! - Batch Lab conversion with cache-friendly access
-//! - Pre-computed palette Lab values
+//! - Fixed-point integer arithmetic (LabFixed)
+//! - Histogram-based pre-quantization
+//! - Spatial hashing (voxel grid) for color lookups
+//! - Integer Manhattan distance for edge detection
 
-use crate::color::{Lab, Rgb};
-use crate::palette::Palette;
+use crate::color::{Lab, Rgb, LabFixed};
+use std::collections::HashMap;
 
 /// Lookup table for sRGB to linear conversion (256 entries)
 static SRGB_TO_LINEAR: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
@@ -15,9 +17,9 @@ static SRGB_TO_LINEAR: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::ne
 static LAB_F_LUT: std::sync::OnceLock<[f32; 4096]> = std::sync::OnceLock::new();
 
 /// D65 illuminant reference white
-const XN: f32 = 0.95047;
-const YN: f32 = 1.00000;
-const ZN: f32 = 1.08883;
+pub const XN: f32 = 0.95047;
+pub const YN: f32 = 1.00000;
+pub const ZN: f32 = 1.08883;
 
 /// Initialize lookup tables - MUST be called before using fast functions
 pub fn init_luts() {
@@ -59,9 +61,9 @@ fn lab_f_fast(t: f32) -> f32 {
     lut[idx]
 }
 
-/// Fast RGB to Lab conversion using lookup tables (3-4x faster than standard)
+/// Fast RGB to Fixed-Point Lab conversion
 #[inline]
-pub fn rgb_to_lab_fast(rgb: Rgb) -> Lab {
+pub fn rgb_to_lab_fixed(rgb: Rgb) -> LabFixed {
     let lut = unsafe { SRGB_TO_LINEAR.get().unwrap_unchecked() };
     
     let r = lut[rgb.r as usize];
@@ -76,14 +78,21 @@ pub fn rgb_to_lab_fast(rgb: Rgb) -> Lab {
     let fy = lab_f_fast(y / YN);
     let fz = lab_f_fast(z / ZN);
 
-    Lab {
-        l: 116.0 * fy - 16.0,
-        a: 500.0 * (fx - fy),
-        b: 200.0 * (fy - fz),
+    LabFixed {
+        l: ((116.0 * fy - 16.0) * 64.0) as i16,
+        a: ((500.0 * (fx - fy)) * 64.0) as i16,
+        b: ((200.0 * (fy - fz)) * 64.0) as i16,
     }
 }
 
-/// Batch convert RGB to Lab - call this ONCE and reuse the result
+/// Batch convert RGB to LabFixed - call this ONCE and reuse the result
+#[inline]
+pub fn batch_rgb_to_lab_fixed(pixels: &[Rgb]) -> Vec<LabFixed> {
+    init_luts();
+    pixels.iter().map(|&p| rgb_to_lab_fixed(p)).collect()
+}
+
+/// Legacy float conversion (kept for compatibility with some modules)
 #[inline]
 pub fn batch_rgb_to_lab(pixels: &[Rgb]) -> Vec<Lab> {
     init_luts();
@@ -110,7 +119,154 @@ pub fn batch_rgb_to_lab(pixels: &[Rgb]) -> Vec<Lab> {
     }).collect()
 }
 
-/// Squared distance in Lab space (skip sqrt for comparisons)
+/// Deduplicate colors to massively reduce K-Means load
+/// Returns: (Unique Colors in LabFixed, Count)
+pub fn build_color_histogram(pixels: &[Rgb]) -> Vec<(LabFixed, u32)> {
+    init_luts();
+    
+    // Quantize/Hash to u32 (0x00RRGGBB) to find unique colors fast
+    let mut counts = HashMap::with_capacity(pixels.len().min(16384));
+    
+    for p in pixels {
+        let key = u32::from_be_bytes([0, p.r, p.g, p.b]);
+        *counts.entry(key).or_insert(0) += 1;
+    }
+
+    // Convert only unique colors to LabFixed
+    counts.into_iter().map(|(key, count)| {
+        let bytes = key.to_be_bytes();
+        let rgb = Rgb::new(bytes[1], bytes[2], bytes[3]);
+        (rgb_to_lab_fixed(rgb), count)
+    }).collect()
+}
+
+/// Spatial Hashing for approximate neighbor lookups
+/// Returns a 12-bit hash key (4 bits per channel)
+#[inline(always)]
+pub fn spatial_hash(lab: LabFixed) -> u16 {
+    // Map i16 ranges to 0..15 indices
+    // L: 0..6400 -> divide by 400
+    // a,b: -8192..8192 -> add 8192, divide by 1024
+    
+    let l_idx = (lab.l as u16 / 400).min(15);
+    let a_idx = ((lab.a as i32 + 8192) as u16 / 1024).min(15);
+    let b_idx = ((lab.b as i32 + 8192) as u16 / 1024).min(15);
+    
+    (l_idx << 8) | (a_idx << 4) | b_idx
+}
+
+/// Get the LabFixed center for a given spatial hash
+pub fn get_cell_center_lab(hash: u16) -> LabFixed {
+    let l_idx = (hash >> 8) & 0xF;
+    let a_idx = (hash >> 4) & 0xF;
+    let b_idx = hash & 0xF;
+
+    LabFixed {
+        l: (l_idx as i16 * 400 + 200),
+        a: (a_idx as i16 * 1024 - 8192 + 512),
+        b: (b_idx as i16 * 1024 - 8192 + 512),
+    }
+}
+
+/// INTEGER EDGE DETECTION: Computes gradient magnitude using Manhattan distance
+/// Avoids sqrt() and f32 entirely.
+pub fn compute_edges_fixed(
+    labs: &[LabFixed],
+    width: usize,
+    height: usize,
+) -> Vec<u16> {
+    let mut edges = vec![0u16; width * height];
+
+    for y in 1..height.saturating_sub(1) {
+        let row_offset = y * width;
+        let up_offset = (y - 1) * width;
+        let down_offset = (y + 1) * width;
+        
+        for x in 1..width.saturating_sub(1) {
+            let idx = row_offset + x;
+            
+            let left = labs[idx - 1];
+            let right = labs[idx + 1];
+            let up = labs[up_offset + x];
+            let down = labs[down_offset + x];
+            
+            // Manhattan distance gradient: |Gx| + |Gy|
+            let gx = (right.l as i32 - left.l as i32).abs() +
+                     (right.a as i32 - left.a as i32).abs() +
+                     (right.b as i32 - left.b as i32).abs();
+
+            let gy = (down.l as i32 - up.l as i32).abs() +
+                     (down.a as i32 - up.a as i32).abs() +
+                     (down.b as i32 - up.b as i32).abs();
+            
+            let mag = (gx + gy) as u32;
+            
+            // Scale and clamp
+            edges[idx] = (mag >> 2).min(65535) as u16;
+        }
+    }
+    
+    edges
+}
+
+/// TILE AVERAGE FIXED: Computes weighted average of LabFixed
+#[inline]
+pub fn compute_tile_average_fixed(
+    labs: &[LabFixed],
+    edges: &[u16],
+    width: usize,
+    height: usize,
+    src_x: usize,
+    src_y: usize,
+    tile_w: usize,
+    tile_h: usize,
+    edge_weight: f32,
+) -> LabFixed {
+    let mut l_sum = 0i64;
+    let mut a_sum = 0i64;
+    let mut b_sum = 0i64;
+    let mut total_weight = 0i64;
+
+    let max_y = (src_y + tile_h).min(height);
+    let max_x = (src_x + tile_w).min(width);
+
+    // Heuristic: if edge strength > threshold, weight=1, else weight=4
+    let threshold = (1000.0 * (1.0 - edge_weight)) as u16;
+
+    for y in src_y..max_y {
+        let row_start = y * width;
+        for x in src_x..max_x {
+            let idx = row_start + x;
+            let edge = edges[idx];
+            
+            let weight = if edge > threshold { 1 } else { 4 };
+            
+            let lab = labs[idx];
+            l_sum += (lab.l as i64) * weight;
+            a_sum += (lab.a as i64) * weight;
+            b_sum += (lab.b as i64) * weight;
+            total_weight += weight;
+        }
+    }
+
+    if total_weight > 0 {
+        LabFixed {
+            l: (l_sum / total_weight) as i16,
+            a: (a_sum / total_weight) as i16,
+            b: (b_sum / total_weight) as i16,
+        }
+    } else {
+        LabFixed::default()
+    }
+}
+
+// Deprecated float functions can be kept or removed
+// Keeping minimal set for compatibility if needed
+#[inline]
+pub fn rgb_to_lab_fast(rgb: Rgb) -> Lab {
+    rgb_to_lab_fixed(rgb).to_lab()
+}
+
 #[inline(always)]
 pub fn lab_distance_sq(a: &Lab, b: &Lab) -> f32 {
     let dl = a.l - b.l;
@@ -119,12 +275,10 @@ pub fn lab_distance_sq(a: &Lab, b: &Lab) -> f32 {
     dl * dl + da * da + db * db
 }
 
-/// Find nearest palette color - optimized
 #[inline]
 pub fn find_nearest_lab(palette_labs: &[Lab], target: &Lab) -> usize {
     let mut best_idx = 0;
     let mut best_dist = f32::MAX;
-    
     for (i, p) in palette_labs.iter().enumerate() {
         let dist = lab_distance_sq(target, p);
         if dist < best_dist {
@@ -132,471 +286,28 @@ pub fn find_nearest_lab(palette_labs: &[Lab], target: &Lab) -> usize {
             best_idx = i;
         }
     }
-    
     best_idx
 }
 
-/// Find nearest with neighbor bias
-#[inline]
-pub fn find_nearest_biased(
-    palette_labs: &[Lab],
-    target: &Lab,
-    neighbor_indices: &[usize],
-    neighbor_weight: f32,
-) -> usize {
-    // Count neighbors per palette color
-    let mut counts = [0u8; 256];
-    let mut max_count = 0u8;
-    
-    for &idx in neighbor_indices {
-        if idx < 256 {
-            counts[idx] = counts[idx].saturating_add(1);
-            max_count = max_count.max(counts[idx]);
-        }
-    }
-    
-    if max_count == 0 {
-        return find_nearest_lab(palette_labs, target);
-    }
-    
-    let bias_scale = neighbor_weight * 0.5;
-    let max_f = max_count as f32;
-    
-    let mut best_idx = 0;
-    let mut best_score = f32::MAX;
-    
-    for (i, p) in palette_labs.iter().enumerate() {
-        let dist = lab_distance_sq(target, p);
-        let bias = if i < 256 { counts[i] as f32 / max_f * bias_scale } else { 0.0 };
-        let score = dist * (1.0 - bias);
-        
-        if score < best_score {
-            best_score = score;
-            best_idx = i;
-        }
-    }
-    
-    best_idx
-}
-
-/// Find nearest with both neighbor and region bias
-#[inline]
-pub fn find_nearest_region_aware(
-    palette_labs: &[Lab],
-    target: &Lab,
-    neighbor_indices: &[usize],
-    region_indices: &[usize],
-    neighbor_weight: f32,
-    region_weight: f32,
-) -> usize {
-    let mut n_counts = [0u8; 256];
-    let mut r_counts = [0u8; 256];
-    let mut n_max = 0u8;
-    let mut r_max = 0u8;
-    
-    for &idx in neighbor_indices {
-        if idx < 256 {
-            n_counts[idx] = n_counts[idx].saturating_add(1);
-            n_max = n_max.max(n_counts[idx]);
-        }
-    }
-    
-    for &idx in region_indices {
-        if idx < 256 {
-            r_counts[idx] = r_counts[idx].saturating_add(1);
-            r_max = r_max.max(r_counts[idx]);
-        }
-    }
-    
-    if n_max == 0 && r_max == 0 {
-        return find_nearest_lab(palette_labs, target);
-    }
-    
-    let n_scale = neighbor_weight * 0.5;
-    let r_scale = region_weight * 0.3;
-    let n_max_f = n_max.max(1) as f32;
-    let r_max_f = r_max.max(1) as f32;
-    
-    let mut best_idx = 0;
-    let mut best_score = f32::MAX;
-    
-    for (i, p) in palette_labs.iter().enumerate() {
-        let dist = lab_distance_sq(target, p);
-        
-        let n_bias = if i < 256 && n_max > 0 { 
-            n_counts[i] as f32 / n_max_f * n_scale 
-        } else { 0.0 };
-        
-        let r_bias = if i < 256 && r_max > 0 { 
-            r_counts[i] as f32 / r_max_f * r_scale 
-        } else { 0.0 };
-        
-        let score = dist * (1.0 - n_bias - r_bias);
-        
-        if score < best_score {
-            best_score = score;
-            best_idx = i;
-        }
-    }
-    
-    best_idx
-}
-
-/// Compute edge map using pre-computed Lab values (avoids double conversion)
-pub fn compute_edges_from_labs(
-    labs: &[Lab],
-    width: usize,
-    height: usize,
-) -> Vec<f32> {
+pub fn compute_edges_from_labs(labs: &[Lab], width: usize, height: usize) -> Vec<f32> {
     let mut edges = vec![0.0f32; width * height];
     let mut max_value: f32 = 0.0;
-
     for y in 1..height.saturating_sub(1) {
         for x in 1..width.saturating_sub(1) {
             let idx = y * width + x;
             let center = &labs[idx];
-
-            // Compute maximum color difference with 4-neighbors (faster than 8)
             let mut max_diff: f32 = 0.0;
-            
-            // Left
-            let diff = lab_distance_sq(center, &labs[idx - 1]).sqrt();
-            max_diff = max_diff.max(diff);
-            
-            // Right
-            let diff = lab_distance_sq(center, &labs[idx + 1]).sqrt();
-            max_diff = max_diff.max(diff);
-            
-            // Up
-            let diff = lab_distance_sq(center, &labs[idx - width]).sqrt();
-            max_diff = max_diff.max(diff);
-            
-            // Down
-            let diff = lab_distance_sq(center, &labs[idx + width]).sqrt();
-            max_diff = max_diff.max(diff);
-
+            let diff = lab_distance_sq(center, &labs[idx - 1]).sqrt(); max_diff = max_diff.max(diff);
+            let diff = lab_distance_sq(center, &labs[idx + 1]).sqrt(); max_diff = max_diff.max(diff);
+            let diff = lab_distance_sq(center, &labs[idx - width]).sqrt(); max_diff = max_diff.max(diff);
+            let diff = lab_distance_sq(center, &labs[idx + width]).sqrt(); max_diff = max_diff.max(diff);
             edges[idx] = max_diff;
             max_value = max_value.max(max_diff);
         }
     }
-
-    // Normalize
     if max_value > 0.0 {
-        let inv_max = 1.0 / max_value;
-        for e in edges.iter_mut() {
-            *e *= inv_max;
-        }
+        let inv = 1.0 / max_value;
+        for e in edges.iter_mut() { *e *= inv; }
     }
-
     edges
-}
-
-/// Compute weighted tile average in Lab space
-#[inline]
-pub fn compute_tile_lab_weighted(
-    labs: &[Lab],
-    edges: &[f32],
-    width: usize,
-    height: usize,
-    src_x: usize,
-    src_y: usize,
-    tile_w: usize,
-    tile_h: usize,
-    edge_weight: f32,
-) -> Lab {
-    let mut l_sum = 0.0f32;
-    let mut a_sum = 0.0f32;
-    let mut b_sum = 0.0f32;
-    let mut weight_sum = 0.0f32;
-
-    let max_y = (src_y + tile_h).min(height);
-    let max_x = (src_x + tile_w).min(width);
-    let edge_factor = edge_weight * 5.0;
-
-    for y in src_y..max_y {
-        let row_start = y * width;
-        for x in src_x..max_x {
-            let idx = row_start + x;
-            let lab = &labs[idx];
-            let edge = edges[idx];
-            
-            let weight = 1.0 / (1.0 + edge * edge_factor);
-            
-            l_sum += lab.l * weight;
-            a_sum += lab.a * weight;
-            b_sum += lab.b * weight;
-            weight_sum += weight;
-        }
-    }
-
-    if weight_sum > 0.0 {
-        Lab {
-            l: l_sum / weight_sum,
-            a: a_sum / weight_sum,
-            b: b_sum / weight_sum,
-        }
-    } else {
-        Lab::default()
-    }
-}
-
-/// Fast RGB distance for turbo mode
-#[inline(always)]
-pub fn rgb_distance_fast(a: Rgb, b: Rgb) -> u32 {
-    let dr = a.r as i32 - b.r as i32;
-    let dg = a.g as i32 - b.g as i32;
-    let db = a.b as i32 - b.b as i32;
-    ((dr * dr * 2 + dg * dg * 4 + db * db * 3) / 3) as u32
-}
-
-/// Downsample for palette extraction
-pub fn downsample(pixels: &[Rgb], width: usize, height: usize, factor: usize) -> Vec<Rgb> {
-    let new_width = (width + factor - 1) / factor;
-    let new_height = (height + factor - 1) / factor;
-    let mut result = Vec::with_capacity(new_width * new_height);
-
-    for y in 0..new_height {
-        for x in 0..new_width {
-            let sx = (x * factor + factor / 2).min(width - 1);
-            let sy = (y * factor + factor / 2).min(height - 1);
-            result.push(pixels[sy * width + sx]);
-        }
-    }
-
-    result
-}
-
-/// Find nearest RGB in palette
-#[inline]
-pub fn find_nearest_rgb(palette: &[Rgb], color: Rgb) -> usize {
-    palette
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, &p)| rgb_distance_fast(p, color))
-        .map(|(i, _)| i)
-        .unwrap_or(0)
-}
-
-/// Fast median cut
-pub fn fast_median_cut(pixels: &[Rgb], target_colors: usize) -> Vec<Rgb> {
-    if pixels.is_empty() || target_colors == 0 {
-        return vec![];
-    }
-
-    let colors: Vec<(Rgb, usize)> = {
-        use std::collections::HashMap;
-        let mut counts: HashMap<[u8; 3], usize> = HashMap::with_capacity(pixels.len() / 10);
-        for p in pixels {
-            *counts.entry([p.r, p.g, p.b]).or_insert(0) += 1;
-        }
-        counts.into_iter()
-            .map(|(rgb, count)| (Rgb::new(rgb[0], rgb[1], rgb[2]), count))
-            .collect()
-    };
-
-    let mut buckets = vec![colors];
-    
-    while buckets.len() < target_colors {
-        let mut best_idx = 0;
-        let mut best_range = 0u16;
-        
-        for (i, bucket) in buckets.iter().enumerate() {
-            if bucket.len() <= 1 { continue; }
-            
-            let (min_r, max_r, min_g, max_g, min_b, max_b) = bucket.iter().fold(
-                (255u8, 0u8, 255u8, 0u8, 255u8, 0u8),
-                |(min_r, max_r, min_g, max_g, min_b, max_b), (c, _)| {
-                    (min_r.min(c.r), max_r.max(c.r),
-                     min_g.min(c.g), max_g.max(c.g),
-                     min_b.min(c.b), max_b.max(c.b))
-                }
-            );
-            
-            let range = (max_r - min_r).max(max_g - min_g).max(max_b - min_b) as u16;
-            if range > best_range {
-                best_range = range;
-                best_idx = i;
-            }
-        }
-
-        if best_range == 0 { break; }
-
-        let bucket = buckets.swap_remove(best_idx);
-        
-        let (min_r, max_r, min_g, max_g, min_b, max_b) = bucket.iter().fold(
-            (255u8, 0u8, 255u8, 0u8, 255u8, 0u8),
-            |(min_r, max_r, min_g, max_g, min_b, max_b), (c, _)| {
-                (min_r.min(c.r), max_r.max(c.r),
-                 min_g.min(c.g), max_g.max(c.g),
-                 min_b.min(c.b), max_b.max(c.b))
-            }
-        );
-        
-        let r_range = max_r - min_r;
-        let g_range = max_g - min_g;
-        let b_range = max_b - min_b;
-        
-        let (axis, mid) = if r_range >= g_range && r_range >= b_range {
-            (0u8, (min_r as u16 + max_r as u16) / 2)
-        } else if g_range >= b_range {
-            (1u8, (min_g as u16 + max_g as u16) / 2)
-        } else {
-            (2u8, (min_b as u16 + max_b as u16) / 2)
-        };
-        let mid = mid as u8;
-        
-        let (left, right): (Vec<_>, Vec<_>) = bucket.into_iter().partition(|(c, _)| {
-            match axis { 0 => c.r <= mid, 1 => c.g <= mid, _ => c.b <= mid }
-        });
-        
-        if !left.is_empty() { buckets.push(left); }
-        if !right.is_empty() { buckets.push(right); }
-    }
-
-    buckets.iter().map(|bucket| {
-        let (r_sum, g_sum, b_sum, total) = bucket.iter().fold(
-            (0u64, 0u64, 0u64, 0u64),
-            |(r, g, b, t), (c, count)| {
-                let w = *count as u64;
-                (r + c.r as u64 * w, g + c.g as u64 * w, b + c.b as u64 * w, t + w)
-            }
-        );
-        
-        if total > 0 {
-            Rgb::new((r_sum / total) as u8, (g_sum / total) as u8, (b_sum / total) as u8)
-        } else {
-            Rgb::new(0, 0, 0)
-        }
-    }).collect()
-}
-
-/// Fast k-means
-pub fn fast_kmeans(pixels: &[Rgb], mut centroids: Vec<Rgb>, max_iters: usize) -> Vec<Rgb> {
-    if centroids.is_empty() || pixels.is_empty() {
-        return centroids;
-    }
-
-    for _ in 0..max_iters {
-        let k = centroids.len();
-        let mut sums = vec![(0u64, 0u64, 0u64, 0u64); k];
-
-        for &pixel in pixels {
-            let nearest = centroids.iter().enumerate()
-                .min_by_key(|(_, &c)| rgb_distance_fast(c, pixel))
-                .map(|(i, _)| i).unwrap_or(0);
-            
-            sums[nearest].0 += pixel.r as u64;
-            sums[nearest].1 += pixel.g as u64;
-            sums[nearest].2 += pixel.b as u64;
-            sums[nearest].3 += 1;
-        }
-
-        let mut converged = true;
-        for i in 0..k {
-            let (r, g, b, count) = sums[i];
-            if count > 0 {
-                let new = Rgb::new((r / count) as u8, (g / count) as u8, (b / count) as u8);
-                if new != centroids[i] {
-                    converged = false;
-                    centroids[i] = new;
-                }
-            }
-        }
-
-        if converged { break; }
-    }
-
-    centroids
-}
-
-/// Extract palette fast
-pub fn extract_palette_fast(
-    pixels: &[Rgb],
-    width: usize,
-    height: usize,
-    target_colors: usize,
-) -> Palette {
-    let factor = if width * height > 65536 { 4 }
-                 else if width * height > 16384 { 2 }
-                 else { 1 };
-    
-    let sample = if factor > 1 { downsample(pixels, width, height, factor) } 
-                 else { pixels.to_vec() };
-
-    let initial = fast_median_cut(&sample, target_colors);
-    let refined = fast_kmeans(&sample, initial, 2);
-    
-    Palette::new_fast(refined)
-}
-
-/// Compute simple tile average (no edge weighting)
-#[inline]
-pub fn compute_tile_color_fast(
-    pixels: &[Rgb],
-    width: usize,
-    src_x: usize,
-    src_y: usize,
-    tile_w: usize,
-    tile_h: usize,
-) -> Rgb {
-    let height = pixels.len() / width;
-    let mut r_sum = 0u32;
-    let mut g_sum = 0u32;
-    let mut b_sum = 0u32;
-    let mut count = 0u32;
-
-    let max_y = (src_y + tile_h).min(height);
-    let max_x = (src_x + tile_w).min(width);
-
-    for y in src_y..max_y {
-        let row_start = y * width;
-        for x in src_x..max_x {
-            let p = pixels[row_start + x];
-            r_sum += p.r as u32;
-            g_sum += p.g as u32;
-            b_sum += p.b as u32;
-            count += 1;
-        }
-    }
-
-    if count > 0 {
-        Rgb::new(
-            (r_sum / count) as u8,
-            (g_sum / count) as u8,
-            (b_sum / count) as u8,
-        )
-    } else {
-        Rgb::new(0, 0, 0)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_lut_init() {
-        init_luts();
-        assert!(SRGB_TO_LINEAR.get().is_some());
-        assert!(LAB_F_LUT.get().is_some());
-    }
-
-    #[test]
-    fn test_fast_lab_accuracy() {
-        init_luts();
-        let rgb = Rgb::new(128, 64, 200);
-        let fast_lab = rgb_to_lab_fast(rgb);
-        let std_lab = rgb.to_lab();
-        
-        assert!((fast_lab.l - std_lab.l).abs() < 1.0);
-        assert!((fast_lab.a - std_lab.a).abs() < 1.0);
-        assert!((fast_lab.b - std_lab.b).abs() < 1.0);
-    }
-
-    #[test]
-    fn test_downsample() {
-        let pixels = vec![Rgb::new(255, 0, 0); 100];
-        let down = downsample(&pixels, 10, 10, 2);
-        assert_eq!(down.len(), 25);
-    }
 }

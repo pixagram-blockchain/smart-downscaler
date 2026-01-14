@@ -17,8 +17,7 @@ use crate::slic::SlicConfig;
 /// Initialize panic hook for better error messages in browser console
 #[wasm_bindgen(start)]
 pub fn init() {
-    #[cfg(feature = "console_error_panic_hook")]
-    console_error_panic_hook::set_once();
+    // Panic hook initialization removed to avoid extra dependencies
 }
 
 /// Configuration options for the downscaler (JavaScript-compatible)
@@ -356,15 +355,16 @@ pub fn quantize_to_palette(
         .map(|chunk| Rgb::new(chunk[0], chunk[1], chunk[2]))
         .collect();
 
+    // Use fast palette construction (includes spatial lookup)
     let palette = Palette::new_fast(palette_colors);
 
-    // Convert all pixels to Lab at once (fast batch conversion)
-    let pixel_labs = crate::fast::batch_rgb_to_lab(&pixels);
+    // Convert all pixels to LabFixed at once
+    let pixel_labs = crate::fast::batch_rgb_to_lab_fixed(&pixels);
 
-    // Quantize each pixel using pre-computed Labs
+    // Quantize each pixel using optimized spatial lookup
     let indices: Vec<u8> = pixel_labs
         .iter()
-        .map(|lab| crate::fast::find_nearest_lab(&palette.lab_colors, lab) as u8)
+        .map(|lab| palette.find_nearest_fixed_spatial(*lab) as u8)
         .collect();
 
     let quantized: Vec<Rgb> = indices
