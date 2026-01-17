@@ -196,7 +196,7 @@ pub fn compute_edge_map_scharr(pixels: &[Rgb], width: usize, height: usize) -> E
 pub fn compute_color_gradient(pixels: &[Rgb], width: usize, height: usize) -> EdgeMap {
     use crate::color::Lab;
 
-    let labs: Vec<Lab> = crate::fast::batch_rgb_to_lab(pixels);
+    let labs: Vec<Lab> = pixels.iter().map(|p| p.to_lab()).collect();
 
     let mut edges = vec![0.0f32; width * height];
     let mut max_value: f32 = 0.0;

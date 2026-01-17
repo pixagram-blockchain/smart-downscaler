@@ -115,7 +115,7 @@ impl Segmentation {
 
     /// Merge small segments into their most similar neighbor
     pub fn merge_small_segments(&mut self, min_size: usize, pixels: &[Rgb]) {
-        let labs: Vec<Lab> = crate::fast::batch_rgb_to_lab(pixels);
+        let labs: Vec<Lab> = pixels.iter().map(|p| p.to_lab()).collect();
 
         loop {
             let mut merged_any = false;
@@ -223,7 +223,7 @@ pub fn slic_segment(
     height: usize,
     config: &SlicConfig,
 ) -> Segmentation {
-    let labs: Vec<Lab> = crate::fast::batch_rgb_to_lab(pixels);
+    let labs: Vec<Lab> = pixels.iter().map(|p| p.to_lab()).collect();
 
     // Initialize cluster centers on a grid
     let num_pixels = width * height;
@@ -490,7 +490,7 @@ pub fn flood_fill_segment(
     height: usize,
     color_threshold: f32,
 ) -> Segmentation {
-    let labs: Vec<Lab> = crate::fast::batch_rgb_to_lab(pixels);
+    let labs: Vec<Lab> = pixels.iter().map(|p| p.to_lab()).collect();
     let mut labels = vec![usize::MAX; pixels.len()];
     let mut current_label = 0;
 

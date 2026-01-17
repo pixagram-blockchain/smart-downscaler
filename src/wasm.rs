@@ -17,7 +17,8 @@ use crate::slic::SlicConfig;
 /// Initialize panic hook for better error messages in browser console
 #[wasm_bindgen(start)]
 pub fn init() {
-    // Panic hook initialization removed to avoid extra dependencies
+    #[cfg(feature = "console_error_panic_hook")]
+    console_error_panic_hook::set_once();
 }
 
 /// Configuration options for the downscaler (JavaScript-compatible)
@@ -339,8 +340,6 @@ pub fn quantize_to_palette(
     height: u32,
     palette_data: &Uint8Array,
 ) -> Result<WasmDownscaleResult, JsValue> {
-    crate::fast::init_luts();
-    
     let data = image_data.to_vec();
     let pixels = rgba_to_rgb(&data)?;
 
@@ -355,25 +354,28 @@ pub fn quantize_to_palette(
         .map(|chunk| Rgb::new(chunk[0], chunk[1], chunk[2]))
         .collect();
 
-    // Use fast palette construction (includes spatial lookup)
-    let palette = Palette::new_fast(palette_colors);
+    let palette = Palette::new(palette_colors);
 
-    // Convert all pixels to LabFixed at once
-    let pixel_labs = crate::fast::batch_rgb_to_lab_fixed(&pixels);
-
-    // Quantize each pixel using optimized spatial lookup
-    let indices: Vec<u8> = pixel_labs
+    // Quantize each pixel
+    let quantized: Vec<Rgb> = pixels
         .iter()
-        .map(|lab| palette.find_nearest_fixed_spatial(*lab) as u8)
+        .map(|p| {
+            let lab = p.to_lab();
+            let idx = palette.find_nearest(&lab);
+            palette.colors[idx]
+        })
         .collect();
 
-    let quantized: Vec<Rgb> = indices
+    let indices: Vec<u8> = pixels
         .iter()
-        .map(|&idx| palette.colors[idx as usize])
+        .map(|p| {
+            let lab = p.to_lab();
+            palette.find_nearest(&lab) as u8
+        })
         .collect();
 
     let rgba_data = rgb_to_rgba(&quantized);
-    let palette_out: Vec<u8> = palette.colors
+    let palette_data: Vec<u8> = palette.colors
         .iter()
         .flat_map(|c| [c.r, c.g, c.b])
         .collect();
@@ -382,7 +384,7 @@ pub fn quantize_to_palette(
         width,
         height,
         data: rgba_data,
-        palette: palette_out,
+        palette: palette_data,
         indices,
     })
 }
@@ -413,7 +415,7 @@ pub fn downscale_with_palette(
         .map(|chunk| Rgb::new(chunk[0], chunk[1], chunk[2]))
         .collect();
 
-    let palette = Palette::new_fast(palette_colors);
+    let palette = Palette::new(palette_colors);
 
     // Run downscaler with provided palette
     let internal_config = config.to_internal();
@@ -467,9 +469,7 @@ pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
-// =============================================================================
 // Helper functions
-// =============================================================================
 
 fn rgba_to_rgb(data: &[u8]) -> Result<Vec<Rgb>, JsValue> {
     if data.len() % 4 != 0 {

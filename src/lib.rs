@@ -63,7 +63,6 @@
 pub mod color;
 pub mod downscale;
 pub mod edge;
-pub mod fast;
 pub mod hierarchy;
 pub mod palette;
 pub mod slic;
@@ -74,19 +73,13 @@ pub mod wasm;
 // Re-export main types and functions for convenience
 pub use color::{Lab, Rgb};
 pub use downscale::{
-    smart_downscale, smart_downscale_with_palette,
+    graph_cut_refinement, smart_downscale, smart_downscale_with_palette,
     DownscaleConfig, DownscaleResult, SegmentationMethod,
 };
 pub use edge::{compute_combined_edges, compute_edge_map, EdgeMap};
 pub use hierarchy::{hierarchical_cluster, hierarchical_cluster_fast, Hierarchy, HierarchyConfig};
-pub use palette::{extract_palette, extract_palette_with_labs, Palette};
+pub use palette::{extract_palette, Palette};
 pub use slic::{flood_fill_segment, slic_segment, Segmentation, SlicConfig};
-
-// Optimized internal functions (exposed for advanced users)
-pub use fast::{
-    init_luts, batch_rgb_to_lab, rgb_to_lab_fast,
-    lab_distance_sq, find_nearest_lab, compute_edges_from_labs,
-};
 
 // Native-only exports
 #[cfg(feature = "native")]

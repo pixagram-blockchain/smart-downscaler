@@ -1,283 +1,482 @@
 //! Palette extraction using Median Cut and K-Means++ refinement.
 //!
-//! Implements optimized palette extraction:
-//! 1. Histogram-based pre-quantization (deduplication)
-//! 2. Weighted Median Cut for initialization
-//! 3. Integer K-Means++ refinement (LabFixed)
-//! 4. Spatial Voxel Grid for O(1) color lookups
+//! Implements a two-stage palette extraction:
+//! 1. Median Cut for initial centroid selection (good spatial distribution)
+//! 2. K-Means++ refinement for perceptual optimization
 
-use crate::color::{Lab, Rgb, LabFixed};
-use crate::fast::{build_color_histogram, spatial_hash};
+use crate::color::{Lab, Rgb};
+use std::collections::HashMap;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
+/// A color palette with precomputed Lab values for fast matching
 #[derive(Clone, Debug)]
 pub struct Palette {
+    /// RGB colors in the palette
     pub colors: Vec<Rgb>,
+    /// Precomputed Lab values for each color
     pub lab_colors: Vec<Lab>,
-    pub fixed_colors: Vec<LabFixed>,
-    pub spatial_lookup: Vec<Vec<u8>>,
-}
-
-impl Default for Palette {
-    fn default() -> Self {
-        Self {
-            colors: Vec::new(),
-            lab_colors: Vec::new(),
-            fixed_colors: Vec::new(),
-            spatial_lookup: Vec::new(),
-        }
-    }
 }
 
 impl Palette {
+    /// Create a new palette from RGB colors
     pub fn new(colors: Vec<Rgb>) -> Self {
-        crate::fast::init_luts();
-        let lab_colors: Vec<Lab> = colors.iter().map(|&c| c.to_lab()).collect();
-        let fixed_colors: Vec<LabFixed> = colors.iter().map(|&c| crate::fast::rgb_to_lab_fixed(c)).collect();
-        
-        let mut palette = Self { 
-            colors, 
-            lab_colors, 
-            fixed_colors,
-            spatial_lookup: Vec::new() 
-        };
-        
-        palette.build_spatial_lookup();
-        palette
+        let lab_colors = colors.iter().map(|&c| c.to_lab()).collect();
+        Self { colors, lab_colors }
     }
 
-    pub fn new_fast(colors: Vec<Rgb>) -> Self {
-        Self::new(colors)
+    /// Number of colors in the palette
+    pub fn len(&self) -> usize {
+        self.colors.len()
     }
 
-    fn build_spatial_lookup(&mut self) {
-        self.spatial_lookup = Vec::with_capacity(4096);
-        for i in 0..4096 {
-            let center_lab = crate::fast::get_cell_center_lab(i as u16);
-            let mut candidates: Vec<(i32, u8)> = self.fixed_colors
-                .iter()
-                .enumerate()
-                .map(|(idx, &p)| (center_lab.distance_squared(p), idx as u8))
-                .collect();
-            
-            candidates.sort_unstable_by_key(|&(dist, _)| dist);
-            let keep_count = if self.fixed_colors.len() < 8 { self.fixed_colors.len() } else { 4 };
-            let best_indices: Vec<u8> = candidates.iter().take(keep_count).map(|&(_, idx)| idx).collect();
-            self.spatial_lookup.push(best_indices);
-        }
+    /// Check if palette is empty
+    pub fn is_empty(&self) -> bool {
+        self.colors.is_empty()
     }
 
-    #[inline(always)]
-    pub fn find_nearest_fixed_spatial(&self, lab: LabFixed) -> usize {
-        let hash = spatial_hash(lab) as usize;
-        let candidates = unsafe { self.spatial_lookup.get_unchecked(hash) };
-        let mut best_idx = 0;
-        let mut best_dist = i32::MAX;
-        for &idx in candidates {
-            let p = unsafe { self.fixed_colors.get_unchecked(idx as usize) };
-            let dist = lab.distance_squared(*p);
-            if dist < best_dist {
-                best_dist = dist;
-                best_idx = idx;
-            }
-        }
-        best_idx as usize
+    /// Find the index of the nearest palette color to the given Lab color
+    pub fn find_nearest(&self, lab: &Lab) -> usize {
+        self.lab_colors
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                lab.distance_squared(**a)
+                    .partial_cmp(&lab.distance_squared(**b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0)
     }
 
-    #[inline]
-    pub fn find_nearest_biased_fixed(
+    /// Find nearest color with bias toward neighbor colors
+    /// 
+    /// This creates spatial coherence by preferring colors already used nearby
+    pub fn find_nearest_biased(
         &self,
-        lab: LabFixed,
+        lab: &Lab,
         neighbor_indices: &[usize],
         neighbor_weight: f32,
     ) -> usize {
-        let hash = spatial_hash(lab) as usize;
-        let candidates = unsafe { self.spatial_lookup.get_unchecked(hash) };
-        let weight_i = (neighbor_weight * 256.0) as i32;
-        let max_n = neighbor_indices.len().max(1) as i32;
-        let mut best_idx = 0;
-        let mut best_score = i32::MAX;
-
-        // Check candidates from spatial grid
-        for &idx in candidates {
-            let p = unsafe { self.fixed_colors.get_unchecked(idx as usize) };
-            let dist = lab.distance_squared(*p);
-            let mut count = 0;
-            for &n_idx in neighbor_indices { if n_idx == idx as usize { count += 1; } }
-            let bias_factor = (count * weight_i) / max_n;
-            let score = dist - (dist * bias_factor) / 256;
-            if score < best_score { best_score = score; best_idx = idx; }
+        if neighbor_indices.is_empty() {
+            return self.find_nearest(lab);
         }
-        
-        // Explicitly check neighbors (they might be spatially far)
+
+        // Count neighbor color frequencies
+        let mut neighbor_counts = vec![0usize; self.colors.len()];
         for &idx in neighbor_indices {
-            let mut processed = false;
-            for &c in candidates { if c as usize == idx { processed = true; break; } }
-            if processed { continue; }
-
-            let p = unsafe { self.fixed_colors.get_unchecked(idx) };
-            let dist = lab.distance_squared(*p);
-            let mut count = 0;
-            for &n_idx in neighbor_indices { if n_idx == idx { count += 1; } }
-            let bias_factor = (count as i32 * weight_i) / max_n;
-            let score = dist - (dist * bias_factor) / 256;
-            if score < best_score { best_score = score; best_idx = idx as u8; }
+            if idx < neighbor_counts.len() {
+                neighbor_counts[idx] += 1;
+            }
         }
-        best_idx as usize
+
+        let max_count = neighbor_indices.len() as f32;
+
+        self.lab_colors
+            .iter()
+            .enumerate()
+            .min_by(|(i, a), (j, b)| {
+                let dist_a = lab.distance_squared(**a);
+                let dist_b = lab.distance_squared(**b);
+
+                // Bias formula: reduce distance for colors used by neighbors
+                let bias_a = (neighbor_counts[*i] as f32 / max_count) * neighbor_weight;
+                let bias_b = (neighbor_counts[*j] as f32 / max_count) * neighbor_weight;
+
+                // Multiply distance by (1 - bias) to favor neighbor colors
+                let score_a = dist_a * (1.0 - bias_a * 0.5);
+                let score_b = dist_b * (1.0 - bias_b * 0.5);
+
+                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0)
     }
-    
-    // Legacy support
-    pub fn len(&self) -> usize { self.colors.len() }
-    pub fn is_empty(&self) -> bool { self.colors.is_empty() }
-    pub fn find_nearest(&self, lab: &Lab) -> usize {
-        self.find_nearest_fixed_spatial(crate::fast::rgb_to_lab_fixed(lab.to_rgb()))
-    }
-    pub fn find_nearest_region_aware(&self, lab: &Lab, n: &[usize], _r: &[usize], nw: f32, rw: f32) -> usize {
-        // Fallback to biased fixed for now, combining weights
-        self.find_nearest_biased_fixed(crate::fast::rgb_to_lab_fixed(lab.to_rgb()), n, (nw + rw).min(1.0))
-    }
-    pub fn find_nearest_biased(&self, lab: &Lab, n: &[usize], nw: f32) -> usize {
-        self.find_nearest_biased_fixed(crate::fast::rgb_to_lab_fixed(lab.to_rgb()), n, nw)
+
+    /// Find nearest color considering region membership
+    pub fn find_nearest_region_aware(
+        &self,
+        lab: &Lab,
+        neighbor_indices: &[usize],
+        same_region_indices: &[usize],
+        neighbor_weight: f32,
+        region_weight: f32,
+    ) -> usize {
+        if neighbor_indices.is_empty() && same_region_indices.is_empty() {
+            return self.find_nearest(lab);
+        }
+
+        let mut neighbor_counts = vec![0usize; self.colors.len()];
+        let mut region_counts = vec![0usize; self.colors.len()];
+
+        for &idx in neighbor_indices {
+            if idx < neighbor_counts.len() {
+                neighbor_counts[idx] += 1;
+            }
+        }
+        for &idx in same_region_indices {
+            if idx < region_counts.len() {
+                region_counts[idx] += 1;
+            }
+        }
+
+        let max_neighbor = neighbor_indices.len().max(1) as f32;
+        let max_region = same_region_indices.len().max(1) as f32;
+
+        self.lab_colors
+            .iter()
+            .enumerate()
+            .min_by(|(i, a), (j, b)| {
+                let dist_a = lab.distance_squared(**a);
+                let dist_b = lab.distance_squared(**b);
+
+                let neighbor_bias_a = (neighbor_counts[*i] as f32 / max_neighbor) * neighbor_weight;
+                let neighbor_bias_b = (neighbor_counts[*j] as f32 / max_neighbor) * neighbor_weight;
+
+                let region_bias_a = (region_counts[*i] as f32 / max_region) * region_weight;
+                let region_bias_b = (region_counts[*j] as f32 / max_region) * region_weight;
+
+                let total_bias_a = (neighbor_bias_a + region_bias_a).min(0.9);
+                let total_bias_b = (neighbor_bias_b + region_bias_b).min(0.9);
+
+                let score_a = dist_a * (1.0 - total_bias_a);
+                let score_b = dist_b * (1.0 - total_bias_b);
+
+                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0)
     }
 }
 
+/// Weighted color for histogram-based operations
+#[derive(Clone, Copy, Debug)]
+struct WeightedColor {
+    rgb: [u8; 3],
+    count: usize,
+}
+
+/// Extract a palette from an image using Median Cut + K-Means++ refinement
 pub fn extract_palette(
     pixels: &[Rgb],
     target_colors: usize,
     kmeans_iterations: usize,
 ) -> Palette {
-    let histogram = build_color_histogram(pixels);
-    if histogram.is_empty() { return Palette::default(); }
-    
-    let (unique_labs, weights): (Vec<LabFixed>, Vec<u32>) = histogram.into_iter().unzip();
-    let initial_centroids = weighted_median_cut(&unique_labs, &weights, target_colors);
-    let refined_fixed = kmeans_refine_fixed(&unique_labs, &weights, initial_centroids, kmeans_iterations);
-    
-    let colors = refined_fixed.iter().map(|l| l.to_lab().to_rgb()).collect();
-    Palette::new(colors)
+    // Build color histogram
+    let mut color_counts: HashMap<[u8; 3], usize> = HashMap::new();
+    for pixel in pixels {
+        *color_counts.entry(pixel.to_array()).or_insert(0) += 1;
+    }
+
+    let weighted_colors: Vec<WeightedColor> = color_counts
+        .into_iter()
+        .map(|(rgb, count)| WeightedColor { rgb, count })
+        .collect();
+
+    // Stage 1: Median Cut for initial centroids
+    let initial_centroids = median_cut(&weighted_colors, target_colors);
+
+    // Stage 2: K-Means++ refinement
+    let refined = kmeans_refine(pixels, initial_centroids, kmeans_iterations);
+
+    Palette::new(refined)
 }
 
-// Adapted Weighted Median Cut for LabFixed
-fn weighted_median_cut(colors: &[LabFixed], weights: &[u32], target: usize) -> Vec<LabFixed> {
-    if colors.is_empty() { return vec![]; }
-    
-    // Convert to structure with tracking indices for sorting
-    struct Item { lab: LabFixed, weight: u32 }
-    let mut buckets = vec![colors.iter().zip(weights.iter()).map(|(&l, &w)| Item { lab: l, weight: w }).collect::<Vec<_>>()];
+/// Median Cut algorithm for initial palette selection
+fn median_cut(colors: &[WeightedColor], target: usize) -> Vec<Rgb> {
+    if colors.is_empty() {
+        return vec![];
+    }
+
+    let mut buckets = vec![colors.to_vec()];
 
     while buckets.len() < target {
-        let split_result = buckets.iter().enumerate().filter(|(_, b)| b.len() > 1)
+        // Find bucket with largest color range to split
+        let split_result = buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.len() > 1)
             .map(|(i, bucket)| {
-                // Find largest range
-                let mut min_l = i16::MAX; let mut max_l = i16::MIN;
-                let mut min_a = i16::MAX; let mut max_a = i16::MIN;
-                let mut min_b = i16::MAX; let mut max_b = i16::MIN;
-                for item in bucket {
-                    min_l = min_l.min(item.lab.l); max_l = max_l.max(item.lab.l);
-                    min_a = min_a.min(item.lab.a); max_a = max_a.max(item.lab.a);
-                    min_b = min_b.min(item.lab.b); max_b = max_b.max(item.lab.b);
-                }
-                let range_l = max_l - min_l;
-                let range_a = max_a - min_a;
-                let range_b = max_b - min_b;
-                let max_range = range_l.max(range_a).max(range_b);
-                let axis = if max_range == range_l { 0 } else if max_range == range_a { 1 } else { 2 };
-                (i, axis, max_range)
+                let (axis, range) = find_largest_axis(bucket);
+                (i, axis, range)
             })
-            .max_by_key(|&(_, _, range)| range);
+            .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
-        match split_result {
-            Some((i, axis, _)) => {
-                let mut bucket = buckets.remove(i);
-                bucket.sort_by_key(|item| match axis { 0 => item.lab.l, 1 => item.lab.a, _ => item.lab.b });
-                
-                let total_weight: u32 = bucket.iter().map(|item| item.weight).sum();
-                let half_weight = total_weight / 2;
-                let mut cur_weight = 0;
-                let mut split_idx = bucket.len() / 2;
-                
-                for (idx, item) in bucket.iter().enumerate() {
-                    cur_weight += item.weight;
-                    if cur_weight >= half_weight {
-                        split_idx = (idx + 1).min(bucket.len() - 1);
-                        break;
-                    }
-                }
-                split_idx = split_idx.clamp(1, bucket.len() - 1);
-                
-                let right = bucket.split_off(split_idx);
-                buckets.push(bucket);
-                buckets.push(right);
-            },
-            None => break,
+        let (split_idx, axis) = match split_result {
+            Some((i, axis, _)) => (i, axis),
+            None => break, // No more splittable buckets
+        };
+
+        let bucket = buckets.remove(split_idx);
+        let (left, right) = split_bucket(bucket, axis);
+
+        if !left.is_empty() {
+            buckets.push(left);
+        }
+        if !right.is_empty() {
+            buckets.push(right);
         }
     }
 
-    buckets.iter().map(|bucket| {
-        let mut sum_l = 0i64; let mut sum_a = 0i64; let mut sum_b = 0i64; let mut sum_w = 0i64;
-        for item in bucket {
-            let w = item.weight as i64;
-            sum_l += item.lab.l as i64 * w;
-            sum_a += item.lab.a as i64 * w;
-            sum_b += item.lab.b as i64 * w;
-            sum_w += w;
-        }
-        if sum_w > 0 {
-            LabFixed { l: (sum_l / sum_w) as i16, a: (sum_a / sum_w) as i16, b: (sum_b / sum_w) as i16 }
-        } else { LabFixed::default() }
-    }).collect()
+    // Compute weighted average color for each bucket
+    buckets
+        .iter()
+        .map(|bucket| {
+            let (sum, count) = bucket.iter().fold(([0u64; 3], 0u64), |(mut sum, count), wc| {
+                sum[0] += wc.rgb[0] as u64 * wc.count as u64;
+                sum[1] += wc.rgb[1] as u64 * wc.count as u64;
+                sum[2] += wc.rgb[2] as u64 * wc.count as u64;
+                (sum, count + wc.count as u64)
+            });
+
+            let count = count.max(1);
+            Rgb::new(
+                (sum[0] / count) as u8,
+                (sum[1] / count) as u8,
+                (sum[2] / count) as u8,
+            )
+        })
+        .collect()
 }
 
-fn kmeans_refine_fixed(
-    unique_labs: &[LabFixed],
-    weights: &[u32],
-    mut centroids: Vec<LabFixed>,
-    iterations: usize
-) -> Vec<LabFixed> {
-    if centroids.is_empty() { return centroids; }
-    let k = centroids.len();
-    
-    for _ in 0..iterations {
-        let mut sum_l = vec![0i64; k];
-        let mut sum_a = vec![0i64; k];
-        let mut sum_b = vec![0i64; k];
-        let mut counts = vec![0u32; k];
-        let mut converged = true;
+/// Find the color axis (R=0, G=1, B=2) with the largest range
+fn find_largest_axis(colors: &[WeightedColor]) -> (usize, f32) {
+    (0..3)
+        .map(|axis| {
+            let min = colors.iter().map(|wc| wc.rgb[axis]).min().unwrap_or(0);
+            let max = colors.iter().map(|wc| wc.rgb[axis]).max().unwrap_or(0);
+            (axis, (max - min) as f32)
+        })
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or((0, 0.0))
+}
 
-        for (i, lab) in unique_labs.iter().enumerate() {
-            let weight = weights[i];
-            let mut best_dist = i32::MAX;
-            let mut best_idx = 0;
-            for (c_idx, c) in centroids.iter().enumerate() {
-                let d = lab.distance_squared(*c);
-                if d < best_dist { best_dist = d; best_idx = c_idx; }
-            }
-            let w = weight as i64;
-            sum_l[best_idx] += (lab.l as i64) * w;
-            sum_a[best_idx] += (lab.a as i64) * w;
-            sum_b[best_idx] += (lab.b as i64) * w;
-            counts[best_idx] += weight;
+/// Split a bucket at the median along the given axis
+fn split_bucket(mut colors: Vec<WeightedColor>, axis: usize) -> (Vec<WeightedColor>, Vec<WeightedColor>) {
+    colors.sort_by_key(|wc| wc.rgb[axis]);
+    
+    // Find the median by pixel count, not just color count
+    let total_count: usize = colors.iter().map(|wc| wc.count).sum();
+    let half = total_count / 2;
+    
+    let mut cumulative = 0;
+    let mut split_idx = colors.len() / 2;
+    
+    for (i, wc) in colors.iter().enumerate() {
+        cumulative += wc.count;
+        if cumulative >= half {
+            split_idx = (i + 1).min(colors.len() - 1);
+            break;
+        }
+    }
+    
+    // Ensure at least one element on each side
+    split_idx = split_idx.clamp(1, colors.len() - 1);
+    
+    let right = colors.split_off(split_idx);
+    (colors, right)
+}
+
+/// K-Means refinement with K-Means++ initialization awareness
+fn kmeans_refine(pixels: &[Rgb], centroids: Vec<Rgb>, iterations: usize) -> Vec<Rgb> {
+    if centroids.is_empty() || pixels.is_empty() {
+        return centroids;
+    }
+
+    // Convert to Lab for perceptual clustering
+    let pixel_labs: Vec<Lab> = pixels.iter().map(|p| p.to_lab()).collect();
+    let mut centroid_labs: Vec<Lab> = centroids.iter().map(|c| c.to_lab()).collect();
+
+    for _ in 0..iterations {
+        // Assign pixels to nearest centroid
+        #[cfg(feature = "parallel")]
+        let assignments: Vec<usize> = pixel_labs
+            .par_iter()
+            .map(|pixel| find_nearest_centroid(pixel, &centroid_labs))
+            .collect();
+
+        #[cfg(not(feature = "parallel"))]
+        let assignments: Vec<usize> = pixel_labs
+            .iter()
+            .map(|pixel| find_nearest_centroid(pixel, &centroid_labs))
+            .collect();
+
+        // Recompute centroids
+        let k = centroid_labs.len();
+        let mut sums = vec![Lab::new(0.0, 0.0, 0.0); k];
+        let mut counts = vec![0usize; k];
+
+        for (pixel, &cluster) in pixel_labs.iter().zip(assignments.iter()) {
+            sums[cluster] = sums[cluster] + *pixel;
+            counts[cluster] += 1;
         }
 
+        let mut converged = true;
         for i in 0..k {
             if counts[i] > 0 {
-                let w = counts[i] as i64;
-                let new_c = LabFixed { 
-                    l: (sum_l[i] / w) as i16, 
-                    a: (sum_a[i] / w) as i16, 
-                    b: (sum_b[i] / w) as i16 
-                };
-                if new_c.distance_squared(centroids[i]) > 4 { converged = false; }
-                centroids[i] = new_c;
+                let new_centroid = sums[i] / counts[i] as f32;
+                if new_centroid.distance_squared(centroid_labs[i]) > 0.01 {
+                    converged = false;
+                }
+                centroid_labs[i] = new_centroid;
             }
         }
-        if converged { break; }
+
+        if converged {
+            break;
+        }
     }
+
+    // Convert back to RGB
+    centroid_labs.iter().map(|lab| lab.to_rgb()).collect()
+}
+
+fn find_nearest_centroid(pixel: &Lab, centroids: &[Lab]) -> usize {
+    centroids
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            pixel
+                .distance_squared(**a)
+                .partial_cmp(&pixel.distance_squared(**b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+/// K-Means++ initialization for better starting centroids (requires 'native' feature for full randomization)
+#[cfg(any(feature = "native", feature = "wasm"))]
+pub fn kmeans_plus_plus_init(pixels: &[Lab], k: usize) -> Vec<Lab> {
+    if pixels.is_empty() || k == 0 {
+        return vec![];
+    }
+
+    #[cfg(feature = "native")]
+    use rand::Rng;
+
+    #[cfg(feature = "native")]
+    let mut rng = rand::thread_rng();
+
+    let mut centroids = Vec::with_capacity(k);
+
+    // First centroid: random pixel (or first pixel if no rand)
+    #[cfg(feature = "native")]
+    {
+        centroids.push(pixels[rng.gen_range(0..pixels.len())]);
+    }
+    #[cfg(all(feature = "wasm", not(feature = "native")))]
+    {
+        // Use getrandom for WASM
+        let mut buf = [0u8; 4];
+        getrandom::getrandom(&mut buf).unwrap_or_default();
+        let idx = u32::from_le_bytes(buf) as usize % pixels.len();
+        centroids.push(pixels[idx]);
+    }
+
+    // Remaining centroids: weighted by squared distance to nearest existing centroid
+    for _ in 1..k {
+        let distances: Vec<f32> = pixels
+            .iter()
+            .map(|p| {
+                centroids
+                    .iter()
+                    .map(|c| p.distance_squared(*c))
+                    .min_by(|a, b| a.partial_cmp(b).unwrap())
+                    .unwrap_or(f32::MAX)
+            })
+            .collect();
+
+        let total: f32 = distances.iter().sum();
+        if total <= 0.0 {
+            break;
+        }
+
+        // Weighted random selection
+        #[cfg(feature = "native")]
+        let threshold = rng.gen::<f32>() * total;
+        
+        #[cfg(all(feature = "wasm", not(feature = "native")))]
+        let threshold = {
+            let mut buf = [0u8; 4];
+            getrandom::getrandom(&mut buf).unwrap_or_default();
+            (u32::from_le_bytes(buf) as f32 / u32::MAX as f32) * total
+        };
+
+        let mut cumulative = 0.0;
+        let mut selected_idx = 0;
+
+        for (i, &d) in distances.iter().enumerate() {
+            cumulative += d;
+            if cumulative >= threshold {
+                selected_idx = i;
+                break;
+            }
+        }
+
+        centroids.push(pixels[selected_idx]);
+    }
+
     centroids
 }
 
-// Deprecated / Legacy
-pub fn extract_palette_with_labs(_: &[Rgb], _: &[Lab], _k: usize, _i: usize) -> Palette {
-    // Redirect to optimized version, ignoring passed Labs
-    // This is safe because optimized version re-generates fixed labs from Rgb efficiently
-    panic!("Use standard extract_palette; this path is deprecated in optimized build");
+/// K-Means++ initialization fallback (deterministic, for when no randomness is available)
+#[cfg(not(any(feature = "native", feature = "wasm")))]
+pub fn kmeans_plus_plus_init(pixels: &[Lab], k: usize) -> Vec<Lab> {
+    if pixels.is_empty() || k == 0 {
+        return vec![];
+    }
+
+    let mut centroids = Vec::with_capacity(k);
+    
+    // Deterministic selection: spread evenly through pixel array
+    let step = pixels.len() / k;
+    for i in 0..k {
+        centroids.push(pixels[(i * step) % pixels.len()]);
+    }
+
+    centroids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_palette_creation() {
+        let colors = vec![
+            Rgb::new(255, 0, 0),
+            Rgb::new(0, 255, 0),
+            Rgb::new(0, 0, 255),
+        ];
+        let palette = Palette::new(colors);
+        assert_eq!(palette.len(), 3);
+    }
+
+    #[test]
+    fn test_find_nearest() {
+        let colors = vec![
+            Rgb::new(255, 0, 0),   // Red
+            Rgb::new(0, 255, 0),   // Green
+            Rgb::new(0, 0, 255),   // Blue
+        ];
+        let palette = Palette::new(colors);
+
+        let test_red = Rgb::new(200, 50, 50).to_lab();
+        let nearest = palette.find_nearest(&test_red);
+        assert_eq!(nearest, 0); // Should match red
+    }
+
+    #[test]
+    fn test_extract_palette() {
+        let pixels = vec![
+            Rgb::new(255, 0, 0),
+            Rgb::new(255, 10, 10),
+            Rgb::new(0, 255, 0),
+            Rgb::new(10, 255, 10),
+        ];
+        let palette = extract_palette(&pixels, 2, 3);
+        assert_eq!(palette.len(), 2);
+    }
 }

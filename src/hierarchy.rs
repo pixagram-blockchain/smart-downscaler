@@ -230,7 +230,7 @@ pub fn hierarchical_cluster(
     height: usize,
     config: &HierarchyConfig,
 ) -> Hierarchy {
-    let labs: Vec<Lab> = crate::fast::batch_rgb_to_lab(pixels);
+    let labs: Vec<Lab> = pixels.iter().map(|p| p.to_lab()).collect();
     let num_pixels = width * height;
 
     // Initialize: each pixel is its own region
@@ -529,7 +529,7 @@ pub fn hierarchical_cluster_fast(
     height: usize,
     color_threshold: f32,
 ) -> Hierarchy {
-    let labs: Vec<Lab> = crate::fast::batch_rgb_to_lab(pixels);
+    let labs: Vec<Lab> = pixels.iter().map(|p| p.to_lab()).collect();
     let num_pixels = width * height;
 
     // Union-Find structure
