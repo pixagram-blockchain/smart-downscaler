@@ -3,6 +3,7 @@
 //! Usage: smart-downscaler [OPTIONS] <INPUT> <OUTPUT>
 
 use smart_downscaler::prelude::*;
+use smart_downscaler::palette::PaletteStrategy;
 use std::path::PathBuf;
 
 fn main() {
@@ -23,6 +24,7 @@ fn main() {
     let mut segmentation = "hierarchy";
     let mut refinement = true;
     let mut scale: Option<f32> = None;
+    let mut palette_strategy = "oklab";
 
     let mut i = 1;
     while i < args.len() {
@@ -53,7 +55,11 @@ fn main() {
             }
             "--segmentation" => {
                 i += 1;
-                segmentation = args[i].as_str();
+                segmentation = &args[i];
+            }
+            "--palette-strategy" => {
+                i += 1;
+                palette_strategy = &args[i];
             }
             "--no-refinement" => {
                 refinement = false;
@@ -107,12 +113,12 @@ fn main() {
         source_width, source_height, target_width, target_height, palette_size
     );
 
-    // Configure downscaler
+    // Configure segmentation
     let seg_method = match segmentation {
         "none" => SegmentationMethod::None,
         "slic" => SegmentationMethod::Slic(SlicConfig::default()),
         "hierarchy" => SegmentationMethod::Hierarchy(HierarchyConfig::default()),
-        "hierarchy-fast" => SegmentationMethod::HierarchyFast {
+        "hierarchy-fast" | "hierarchy_fast" => SegmentationMethod::HierarchyFast {
             color_threshold: 15.0,
         },
         _ => {
@@ -121,12 +127,29 @@ fn main() {
         }
     };
 
+    // Configure palette strategy
+    let pal_strategy = match palette_strategy {
+        "oklab" | "oklab-median-cut" => PaletteStrategy::OklabMedianCut,
+        "saturation" | "saturation-weighted" => PaletteStrategy::SaturationWeighted,
+        "medoid" => PaletteStrategy::Medoid,
+        "kmeans" | "kmeans++" => PaletteStrategy::KMeansPlusPlus,
+        "legacy" | "rgb" => PaletteStrategy::LegacyRgb,
+        _ => {
+            eprintln!("Unknown palette strategy: {}", palette_strategy);
+            eprintln!("Valid options: oklab, saturation, medoid, kmeans, legacy");
+            std::process::exit(1);
+        }
+    };
+
+    println!("Using palette strategy: {:?}", pal_strategy);
+
     let config = DownscaleConfig {
         palette_size,
         neighbor_weight,
         region_weight,
         two_pass_refinement: refinement,
         segmentation: seg_method,
+        palette_strategy: pal_strategy,
         ..Default::default()
     };
 
@@ -148,6 +171,16 @@ fn main() {
     println!("Downscaling completed in {:?}", elapsed);
     println!("Palette: {} colors", result.palette.len());
 
+    // Print palette colors
+    println!("Palette colors:");
+    for (i, color) in result.palette.colors.iter().enumerate() {
+        let oklab = color.to_oklab();
+        println!(
+            "  {:2}: RGB({:3}, {:3}, {:3}) - Oklab(L={:.3}, a={:.3}, b={:.3}) chroma={:.3}",
+            i, color.r, color.g, color.b, oklab.l, oklab.a, oklab.b, oklab.chroma()
+        );
+    }
+
     // Save output
     let output_img = result.to_image();
     output_img
@@ -168,22 +201,29 @@ Arguments:
   <OUTPUT>  Output image path
 
 Options:
-  -w, --width <WIDTH>         Output width in pixels
-  -h, --height <HEIGHT>       Output height in pixels
-  -s, --scale <SCALE>         Scale factor (e.g., 0.25 for quarter size)
-  -p, --palette <SIZE>        Palette size (default: 16)
-  -n, --neighbor-weight <W>   Neighbor coherence weight (default: 0.3)
-  -r, --region-weight <W>     Region coherence weight (default: 0.2)
-  --segmentation <METHOD>     Segmentation method: none, slic, hierarchy, hierarchy-fast
-                              (default: hierarchy)
-  --no-refinement             Disable two-pass refinement
-  --help                      Show this help message
+  -w, --width <WIDTH>           Output width in pixels
+  -h, --height <HEIGHT>         Output height in pixels
+  -s, --scale <SCALE>           Scale factor (e.g., 0.25 for quarter size)
+  -p, --palette <SIZE>          Palette size (default: 16)
+  -n, --neighbor-weight <W>     Neighbor coherence weight (default: 0.3)
+  -r, --region-weight <W>       Region coherence weight (default: 0.2)
+  --segmentation <METHOD>       Segmentation method: none, slic, hierarchy, hierarchy-fast
+                                (default: hierarchy)
+  --palette-strategy <STRATEGY> Palette extraction strategy:
+                                  oklab      - Oklab median cut (default, best quality)
+                                  saturation - Preserve saturated colors
+                                  medoid     - Use exact image colors only
+                                  kmeans     - K-Means++ only
+                                  legacy     - RGB median cut (causes desaturation)
+  --no-refinement               Disable two-pass refinement
+  --help                        Show this help message
 
 Examples:
   {} input.png output.png -w 64 -h 64 -p 32
   {} input.png output.png -s 0.125 --segmentation slic
   {} large.jpg pixel.png -w 128 -h 128 -p 16 --neighbor-weight 0.5
+  {} input.png output.png -w 64 -h 64 --palette-strategy saturation
 "#,
-        program, program, program, program
+        program, program, program, program, program
     );
 }

@@ -1,16 +1,16 @@
 //! Smart pixel art downscaler with region-aware color quantization.
 //!
 //! This is the main downscaling algorithm that combines:
-//! - Global palette extraction (Median Cut + K-Means++)
+//! - Global palette extraction (Median Cut + K-Means++ in Oklab space)
 //! - Edge detection for boundary awareness
 //! - SLIC superpixel segmentation OR VTracer-style hierarchical clustering
 //! - Neighbor-coherent color assignment
 //! - Two-pass refinement for optimal results
 
-use crate::color::{Lab, LabAccumulator, Rgb};
+use crate::color::{Lab, Oklab, OklabAccumulator, Rgb};
 use crate::edge::{compute_combined_edges, EdgeMap};
 use crate::hierarchy::{hierarchical_cluster, hierarchical_cluster_fast, HierarchyConfig};
-use crate::palette::{extract_palette, Palette};
+use crate::palette::{extract_palette_with_strategy, Palette, PaletteStrategy};
 use crate::slic::{slic_segment, Segmentation, SlicConfig};
 
 #[cfg(feature = "parallel")]
@@ -36,6 +36,8 @@ pub struct DownscaleConfig {
     pub segmentation: SegmentationMethod,
     /// Edge weight in tile color computation
     pub edge_weight: f32,
+    /// Palette extraction strategy
+    pub palette_strategy: PaletteStrategy,
 }
 
 impl Default for DownscaleConfig {
@@ -49,6 +51,7 @@ impl Default for DownscaleConfig {
             refinement_iterations: 3,
             segmentation: SegmentationMethod::Hierarchy(HierarchyConfig::default()),
             edge_weight: 0.5,
+            palette_strategy: PaletteStrategy::OklabMedianCut,
         }
     }
 }
@@ -122,8 +125,13 @@ pub fn smart_downscale(
     target_height: u32,
     config: &DownscaleConfig,
 ) -> DownscaleResult {
-    // Step 1: Extract global palette
-    let palette = extract_palette(source_pixels, config.palette_size, config.kmeans_iterations);
+    // Step 1: Extract global palette using configured strategy
+    let palette = extract_palette_with_strategy(
+        source_pixels,
+        config.palette_size,
+        config.kmeans_iterations,
+        config.palette_strategy,
+    );
 
     // Step 2: Compute edge map for boundary awareness
     let edge_map = compute_combined_edges(
@@ -146,7 +154,7 @@ pub fn smart_downscale(
     let scale_x = source_width as f32 / target_width as f32;
     let scale_y = source_height as f32 / target_height as f32;
 
-    let (mut assignments, tile_labs) = initial_assignment(
+    let (mut assignments, tile_oklabs) = initial_assignment_oklab(
         source_pixels,
         source_width,
         source_height,
@@ -163,9 +171,9 @@ pub fn smart_downscale(
     // Step 5: Two-pass refinement
     if config.two_pass_refinement {
         for _ in 0..config.refinement_iterations {
-            let changed = refinement_pass(
+            let changed = refinement_pass_oklab(
                 &mut assignments,
-                &tile_labs,
+                &tile_oklabs,
                 target_width as usize,
                 target_height as usize,
                 &palette,
@@ -213,8 +221,8 @@ fn perform_segmentation(
     }
 }
 
-/// Initial assignment pass with neighbor and region coherence
-fn initial_assignment(
+/// Initial assignment pass using Oklab color space for perceptually accurate averaging
+fn initial_assignment_oklab(
     source_pixels: &[Rgb],
     source_width: usize,
     source_height: usize,
@@ -226,13 +234,13 @@ fn initial_assignment(
     config: &DownscaleConfig,
     scale_x: f32,
     scale_y: f32,
-) -> (Vec<usize>, Vec<Lab>) {
-    let source_labs: Vec<Lab> = source_pixels.iter().map(|p| p.to_lab()).collect();
+) -> (Vec<usize>, Vec<Oklab>) {
+    let source_oklabs: Vec<Oklab> = source_pixels.iter().map(|p| p.to_oklab()).collect();
     let tw = target_width as usize;
     let th = target_height as usize;
 
     let mut assignments = vec![0usize; tw * th];
-    let mut tile_labs = vec![Lab::default(); tw * th];
+    let mut tile_oklabs = vec![Oklab::default(); tw * th];
 
     // Process in scanline order for neighbor access
     for ty in 0..th {
@@ -245,8 +253,8 @@ fn initial_assignment(
             let tile_w = (scale_x.ceil() as usize).max(1);
             let tile_h = (scale_y.ceil() as usize).max(1);
 
-            // Compute weighted average color for tile
-            let mut acc = LabAccumulator::new();
+            // Compute weighted average color for tile in Oklab space
+            let mut acc = OklabAccumulator::new();
             let mut dominant_segment = None;
             let mut segment_counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
 
@@ -256,12 +264,12 @@ fn initial_assignment(
                     let py = (src_y + dy).min(source_height - 1);
                     let pidx = py * source_width + px;
 
-                    let pixel_lab = source_labs[pidx];
+                    let pixel_oklab = source_oklabs[pidx];
                     let edge_strength = edge_map.get(px, py);
 
                     // Lower weight for edge pixels (transitional)
                     let weight = 1.0 / (1.0 + edge_strength * config.edge_weight * 5.0);
-                    acc.add(pixel_lab, weight);
+                    acc.add(pixel_oklab, weight);
 
                     // Track segment membership
                     if let Some(seg) = segmentation {
@@ -279,8 +287,8 @@ fn initial_assignment(
                     .map(|(&seg, _)| seg);
             }
 
-            let avg_lab = acc.mean();
-            tile_labs[tidx] = avg_lab;
+            let avg_oklab = acc.mean();
+            tile_oklabs[tidx] = avg_oklab;
 
             // Collect neighbor assignments
             let mut neighbor_indices = Vec::new();
@@ -319,32 +327,83 @@ fn initial_assignment(
                 }
             }
 
-            // Find best palette color
-            let best_idx = if !same_region_indices.is_empty() && config.region_weight > 0.0 {
-                palette.find_nearest_region_aware(
-                    &avg_lab,
-                    &neighbor_indices,
-                    &same_region_indices,
-                    config.neighbor_weight,
-                    config.region_weight,
-                )
-            } else if !neighbor_indices.is_empty() && config.neighbor_weight > 0.0 {
-                palette.find_nearest_biased(&avg_lab, &neighbor_indices, config.neighbor_weight)
-            } else {
-                palette.find_nearest(&avg_lab)
-            };
+            // Find best palette color using Oklab matching
+            let best_idx = find_best_palette_match_oklab(
+                &avg_oklab,
+                palette,
+                &neighbor_indices,
+                &same_region_indices,
+                config.neighbor_weight,
+                config.region_weight,
+            );
 
             assignments[tidx] = best_idx;
         }
     }
 
-    (assignments, tile_labs)
+    (assignments, tile_oklabs)
 }
 
-/// Two-pass refinement: re-evaluate each pixel considering all neighbors
-fn refinement_pass(
+/// Find best palette match using Oklab distance with neighbor/region bias
+fn find_best_palette_match_oklab(
+    target: &Oklab,
+    palette: &Palette,
+    neighbor_indices: &[usize],
+    same_region_indices: &[usize],
+    neighbor_weight: f32,
+    region_weight: f32,
+) -> usize {
+    if neighbor_indices.is_empty() && same_region_indices.is_empty() {
+        // Simple nearest match
+        return palette.find_nearest_oklab(target);
+    }
+
+    let mut neighbor_counts = vec![0usize; palette.colors.len()];
+    let mut region_counts = vec![0usize; palette.colors.len()];
+
+    for &idx in neighbor_indices {
+        if idx < neighbor_counts.len() {
+            neighbor_counts[idx] += 1;
+        }
+    }
+    for &idx in same_region_indices {
+        if idx < region_counts.len() {
+            region_counts[idx] += 1;
+        }
+    }
+
+    let max_neighbor = neighbor_indices.len().max(1) as f32;
+    let max_region = same_region_indices.len().max(1) as f32;
+
+    palette.oklab_colors
+        .iter()
+        .enumerate()
+        .min_by(|(i, a), (j, b)| {
+            let dist_a = target.distance_squared(**a);
+            let dist_b = target.distance_squared(**b);
+
+            let neighbor_bias_a = (neighbor_counts[*i] as f32 / max_neighbor) * neighbor_weight;
+            let neighbor_bias_b = (neighbor_counts[*j] as f32 / max_neighbor) * neighbor_weight;
+
+            let region_bias_a = (region_counts[*i] as f32 / max_region) * region_weight;
+            let region_bias_b = (region_counts[*j] as f32 / max_region) * region_weight;
+
+            let total_bias_a = (neighbor_bias_a + region_bias_a).min(0.9);
+            let total_bias_b = (neighbor_bias_b + region_bias_b).min(0.9);
+
+            let score_a = dist_a * (1.0 - total_bias_a);
+            let score_b = dist_b * (1.0 - total_bias_b);
+
+            score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+/// Two-pass refinement using Oklab color space
+fn refinement_pass_oklab(
     assignments: &mut [usize],
-    tile_labs: &[Lab],
+    tile_oklabs: &[Oklab],
     width: usize,
     height: usize,
     palette: &Palette,
@@ -356,7 +415,7 @@ fn refinement_pass(
     for y in 0..height {
         for x in 0..width {
             let idx = y * width + x;
-            let tile_lab = tile_labs[idx];
+            let tile_oklab = tile_oklabs[idx];
 
             // Gather all 8 neighbors
             let mut neighbor_indices = Vec::with_capacity(8);
@@ -377,8 +436,15 @@ fn refinement_pass(
                 }
             }
 
-            // Re-evaluate assignment
-            let new_idx = palette.find_nearest_biased(&tile_lab, &neighbor_indices, neighbor_weight);
+            // Re-evaluate assignment using Oklab
+            let new_idx = find_best_palette_match_oklab(
+                &tile_oklab,
+                palette,
+                &neighbor_indices,
+                &[],  // No region info in refinement pass
+                neighbor_weight,
+                0.0,
+            );
 
             if new_idx != assignments[idx] {
                 assignments[idx] = new_idx;
@@ -393,7 +459,7 @@ fn refinement_pass(
 /// Advanced refinement using graph-cut optimization (MRF energy minimization)
 pub fn graph_cut_refinement(
     assignments: &mut [usize],
-    tile_labs: &[Lab],
+    tile_oklabs: &[Oklab],
     width: usize,
     height: usize,
     palette: &Palette,
@@ -410,13 +476,13 @@ pub fn graph_cut_refinement(
         for y in 0..height {
             for x in 0..width {
                 let idx = y * width + x;
-                let tile_lab = tile_labs[idx];
+                let tile_oklab = tile_oklabs[idx];
                 let current_label = assignments[idx];
 
                 // Compute current energy
-                let current_energy = compute_pixel_energy(
+                let current_energy = compute_pixel_energy_oklab(
                     current_label,
-                    &tile_lab,
+                    &tile_oklab,
                     x,
                     y,
                     width,
@@ -436,9 +502,9 @@ pub fn graph_cut_refinement(
                         continue;
                     }
 
-                    let energy = compute_pixel_energy(
+                    let energy = compute_pixel_energy_oklab(
                         label,
-                        &tile_lab,
+                        &tile_oklab,
                         x,
                         y,
                         width,
@@ -471,10 +537,10 @@ pub fn graph_cut_refinement(
     changed
 }
 
-/// Compute energy for a single pixel assignment
-fn compute_pixel_energy(
+/// Compute energy for a single pixel assignment using Oklab
+fn compute_pixel_energy_oklab(
     label: usize,
-    tile_lab: &Lab,
+    tile_oklab: &Oklab,
     x: usize,
     y: usize,
     width: usize,
@@ -484,9 +550,9 @@ fn compute_pixel_energy(
     data_weight: f32,
     smoothness_weight: f32,
 ) -> f32 {
-    // Data term: color distance
-    let palette_lab = palette.lab_colors[label];
-    let data_energy = tile_lab.distance_squared(palette_lab) * data_weight;
+    // Data term: color distance in Oklab space
+    let palette_oklab = palette.oklab_colors[label];
+    let data_energy = tile_oklab.distance_squared(palette_oklab) * data_weight;
 
     // Smoothness term: penalty for different labels with neighbors
     let mut smoothness_energy = 0.0;
@@ -497,10 +563,9 @@ fn compute_pixel_energy(
             let neighbor_label = assignments[nidx];
 
             if neighbor_label != label {
-                // Potts model: constant penalty for different labels
-                // Could use color distance between labels for smoother transitions
-                let label_dist = palette.lab_colors[label]
-                    .distance(palette.lab_colors[neighbor_label]);
+                // Use Oklab distance between labels for smoother transitions
+                let label_dist = palette.oklab_colors[label]
+                    .distance(palette.oklab_colors[neighbor_label]);
                 label_dist * 0.1 + 1.0 // Bias toward keeping same label
             } else {
                 0.0
@@ -546,7 +611,7 @@ pub fn smart_downscale_with_palette(
     let scale_x = source_width as f32 / target_width as f32;
     let scale_y = source_height as f32 / target_height as f32;
 
-    let (mut assignments, tile_labs) = initial_assignment(
+    let (mut assignments, tile_oklabs) = initial_assignment_oklab(
         source_pixels,
         source_width,
         source_height,
@@ -562,9 +627,9 @@ pub fn smart_downscale_with_palette(
 
     if config.two_pass_refinement {
         for _ in 0..config.refinement_iterations {
-            let changed = refinement_pass(
+            let changed = refinement_pass_oklab(
                 &mut assignments,
-                &tile_labs,
+                &tile_oklabs,
                 target_width as usize,
                 target_height as usize,
                 &palette,
@@ -623,7 +688,7 @@ mod tests {
     fn test_basic_downscale() {
         // Create a simple test image
         let mut pixels = Vec::new();
-        for y in 0..100 {
+        for _y in 0..100 {
             for x in 0..100 {
                 let r = if x < 50 { 255 } else { 0 };
                 let b = if x >= 50 { 255 } else { 0 };
@@ -641,6 +706,35 @@ mod tests {
         assert_eq!(result.width, 10);
         assert_eq!(result.height, 10);
         assert_eq!(result.pixels.len(), 100);
+    }
+
+    #[test]
+    fn test_palette_strategy() {
+        let pixels: Vec<Rgb> = (0..100)
+            .map(|i| {
+                if i < 50 {
+                    Rgb::new(255, 0, 0)
+                } else {
+                    Rgb::new(0, 0, 255)
+                }
+            })
+            .collect();
+
+        // Test with different strategies
+        for strategy in [
+            PaletteStrategy::OklabMedianCut,
+            PaletteStrategy::SaturationWeighted,
+            PaletteStrategy::Medoid,
+        ] {
+            let config = DownscaleConfig {
+                palette_size: 2,
+                palette_strategy: strategy,
+                ..Default::default()
+            };
+
+            let result = smart_downscale(&pixels, 10, 10, 5, 5, &config);
+            assert_eq!(result.palette.len(), 2);
+        }
     }
 
     #[test]

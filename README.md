@@ -4,9 +4,39 @@ A sophisticated Rust library for intelligent image downscaling with focus on pix
 
 **Available as both a native Rust library and a WebAssembly module for browser/Node.js usage.**
 
+## What's New in v0.2
+
+### 🎨 Oklab Color Space
+
+Version 0.2 introduces **Oklab color space** for all color operations, solving the common problem of desaturated, muddy colors:
+
+| Before (RGB Median Cut) | After (Oklab Median Cut) |
+|-------------------------|--------------------------|
+| Colors appear tanned/darkened | True color preservation |
+| Saturated colors become muddy | Vibrant colors maintained |
+| RGB averaging loses chroma | Perceptually uniform blending |
+
+### Palette Strategies
+
+Choose the best strategy for your use case:
+
+```javascript
+const config = new WasmDownscaleConfig();
+config.palette_strategy = 'saturation'; // For vibrant pixel art
+```
+
+| Strategy | Best For | Description |
+|----------|----------|-------------|
+| `oklab` | General use | Default, best overall quality |
+| `saturation` | Vibrant art | Preserves highly saturated colors |
+| `medoid` | Exact colors | Only uses colors from source image |
+| `kmeans` | Small palettes | K-Means++ clustering |
+| `legacy` | Comparison | Original RGB (not recommended) |
+
 ## Features
 
-- **Global Palette Extraction**: Median Cut + K-Means++ refinement in Lab color space for perceptually optimal palettes
+- **Oklab Color Space**: Modern perceptual color space with superior hue linearity
+- **Global Palette Extraction**: Median Cut + K-Means++ refinement
 - **Multiple Segmentation Methods**:
   - SLIC superpixels for fast, balanced regions
   - VTracer-style hierarchical clustering for content-aware boundaries
@@ -14,7 +44,6 @@ A sophisticated Rust library for intelligent image downscaling with focus on pix
 - **Edge-Aware Processing**: Sobel/Scharr edge detection to preserve boundaries
 - **Neighbor-Coherent Assignment**: Spatial coherence through neighbor and region voting
 - **Two-Pass Refinement**: Iterative optimization for smooth results
-- **Graph-Cut Optimization**: Optional MRF energy minimization for advanced refinement
 - **WebAssembly Support**: Run in browsers with full performance
 
 ## Installation
@@ -25,7 +54,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-smart-downscaler = "0.1"
+smart-downscaler = "0.2"
 ```
 
 ### WebAssembly (npm)
@@ -49,11 +78,24 @@ Or use directly in browser:
 
 ```rust
 use smart_downscaler::prelude::*;
+use smart_downscaler::palette::PaletteStrategy;
 
 fn main() {
     let img = image::open("input.png").unwrap().to_rgb8();
+    
+    // Simple usage
     let result = downscale(&img, 64, 64, 16);
     result.save("output.png").unwrap();
+    
+    // Advanced: preserve vibrant colors
+    let config = DownscaleConfig {
+        palette_size: 24,
+        palette_strategy: PaletteStrategy::SaturationWeighted,
+        ..Default::default()
+    };
+    
+    let pixels: Vec<Rgb> = img.pixels().map(|&p| p.into()).collect();
+    let result = smart_downscale(&pixels, img.width() as usize, img.height() as usize, 64, 64, &config);
 }
 ```
 
@@ -62,111 +104,128 @@ fn main() {
 ```javascript
 import init, { WasmDownscaleConfig, downscale_rgba } from 'smart-downscaler';
 
-// Initialize WASM
 await init();
 
-// Get image data from canvas
 const ctx = canvas.getContext('2d');
 const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
-// Configure
-const config = new WasmDownscaleConfig();
+// Use vibrant preset for saturated colors
+const config = WasmDownscaleConfig.vibrant();
 config.palette_size = 16;
-config.neighbor_weight = 0.3;
-config.segmentation_method = 'hierarchy_fast';
 
-// Downscale
+// Or configure manually
+const config2 = new WasmDownscaleConfig();
+config2.palette_size = 16;
+config2.palette_strategy = 'saturation';
+config2.neighbor_weight = 0.3;
+
 const result = downscale_rgba(
   imageData.data,
   canvas.width,
   canvas.height,
-  64, 64,  // target size
+  64, 64,
   config
 );
 
-// Use result
 const outputData = new ImageData(result.data, result.width, result.height);
 outputCtx.putImageData(outputData, 0, 0);
-
-// Access palette
-console.log(`Used ${result.palette_size} colors`);
 ```
 
-### Using the JavaScript Wrapper
-
-For an even simpler API, use the included JavaScript wrapper:
+### Configuration Presets
 
 ```javascript
-import { init, downscale, extractPalette, getPresetPalette } from './smart-downscaler.js';
+// Speed optimized
+const fast = WasmDownscaleConfig.fast();
 
-await init();
+// Best quality
+const quality = WasmDownscaleConfig.quality();
 
-// Simple downscale
-const result = downscale(canvas, 64, 64, {
-  paletteSize: 16,
-  segmentation: 'hierarchy_fast'
-});
+// Preserve vibrant colors
+const vibrant = WasmDownscaleConfig.vibrant();
 
-// With preset palette (Game Boy, NES, PICO-8, CGA)
-const gbPalette = getPresetPalette('gameboy');
-const gbResult = downscaleWithPalette(canvas, 64, 64, gbPalette);
-
-// Extract palette only
-const palette = extractPalette(canvas, 16);
+// Use only exact source colors
+const exact = WasmDownscaleConfig.exact_colors();
 ```
 
-## Building WebAssembly
+## Why Oklab?
 
-Requirements: [wasm-pack](https://rustwasm.github.io/wasm-pack/)
+Traditional RGB-based palette extraction has fundamental problems:
 
-```bash
-# Install wasm-pack
-cargo install wasm-pack
+### The Problem: RGB Averaging Desaturates Colors
 
-# Build all targets
-./build-wasm.sh
-
-# Or manually:
-wasm-pack build --target web --features wasm --no-default-features --out-dir pkg/web
+```
+Red [255, 0, 0] + Cyan [0, 255, 255] 
+  RGB Average → Gray [127, 127, 127] ❌
 ```
 
-## WASM API Reference
+When you average colors in RGB space, saturated colors get pulled toward gray. This is why downscaled images often look "washed out" or "tanned."
 
-### Functions
+### The Solution: Oklab Color Space
 
-| Function | Description |
-|----------|-------------|
-| `downscale(data, w, h, tw, th, config?)` | Downscale RGBA image data |
-| `downscale_rgba(data, w, h, tw, th, config?)` | Same, for Uint8ClampedArray |
-| `downscale_simple(data, w, h, tw, th, colors)` | Simple API with color count |
-| `downscale_with_palette(data, w, h, tw, th, palette, config?)` | Use custom palette |
-| `extract_palette_from_image(data, w, h, colors, iters)` | Extract palette only |
-| `quantize_to_palette(data, w, h, palette)` | Quantize without resizing |
+Oklab is a **perceptually uniform** color space where:
+- Euclidean distance = perceived color difference
+- Averaging preserves hue and saturation
+- Interpolations look natural
+
+```
+Red (Oklab) + Cyan (Oklab)
+  Oklab Average → Preserves colorfulness ✓
+```
+
+### Visual Comparison
+
+| Issue | RGB Median Cut | Oklab Median Cut |
+|-------|----------------|------------------|
+| Saturated colors | Become muddy | Stay vibrant |
+| Gradients | Shift in hue | Stay consistent |
+| Dark colors | Get darker | Accurate lightness |
+| Overall look | Desaturated | True to source |
+
+## API Reference
 
 ### WasmDownscaleConfig
 
 ```javascript
 const config = new WasmDownscaleConfig();
-config.palette_size = 16;           // Output colors
-config.kmeans_iterations = 5;       // Palette refinement
-config.neighbor_weight = 0.3;       // Spatial coherence [0-1]
-config.region_weight = 0.2;         // Region coherence [0-1]
-config.two_pass_refinement = true;  // Enable refinement
-config.refinement_iterations = 3;   // Refinement passes
-config.edge_weight = 0.5;           // Edge detection weight
-config.segmentation_method = 'hierarchy_fast'; // 'none'|'slic'|'hierarchy'|'hierarchy_fast'
 
-// Presets
-const fast = WasmDownscaleConfig.fast();
-const quality = WasmDownscaleConfig.quality();
+// Palette settings
+config.palette_size = 16;           // Number of output colors
+config.palette_strategy = 'oklab';  // 'oklab', 'saturation', 'medoid', 'kmeans', 'legacy'
+config.kmeans_iterations = 5;       // Refinement iterations
+
+// Spatial coherence
+config.neighbor_weight = 0.3;       // [0-1] Prefer neighbor colors
+config.region_weight = 0.2;         // [0-1] Prefer region colors
+
+// Refinement
+config.two_pass_refinement = true;
+config.refinement_iterations = 3;
+
+// Edge detection
+config.edge_weight = 0.5;
+
+// Segmentation
+config.segmentation_method = 'hierarchy_fast'; // 'none', 'slic', 'hierarchy', 'hierarchy_fast'
 ```
+
+### Available Functions
+
+| Function | Description |
+|----------|-------------|
+| `downscale(data, w, h, tw, th, config?)` | Main downscale function |
+| `downscale_rgba(data, w, h, tw, th, config?)` | For Uint8ClampedArray input |
+| `downscale_simple(data, w, h, tw, th, colors)` | Simple API |
+| `downscale_with_palette(...)` | Use custom palette |
+| `extract_palette_from_image(data, w, h, colors, iters, strategy?)` | Extract palette only |
+| `quantize_to_palette(data, w, h, palette)` | Quantize without resizing |
+| `get_palette_strategies()` | List available strategies |
 
 ### WasmDownscaleResult
 
 ```javascript
 result.width          // Output width
-result.height         // Output height
-result.data           // Uint8ClampedArray (RGBA for ImageData)
+result.height         // Output height  
+result.data           // Uint8ClampedArray (RGBA)
 result.rgb_data()     // Uint8Array (RGB only)
 result.palette        // Uint8Array (RGB, 3 bytes per color)
 result.indices        // Uint8Array (palette index per pixel)
@@ -179,143 +238,129 @@ result.palette_size   // Number of colors
 # Basic usage
 smart-downscaler input.png output.png -w 64 -h 64
 
-# With custom palette size
-smart-downscaler input.png output.png -w 128 -h 128 -p 32
+# With saturation preservation
+smart-downscaler input.png output.png -w 64 -h 64 --palette-strategy saturation
 
-# Using scale factor
-smart-downscaler input.png output.png -s 0.125 -p 16
+# Using exact source colors only
+smart-downscaler input.png output.png -w 64 -h 64 --palette-strategy medoid -p 24
 
-# With SLIC segmentation
-smart-downscaler input.png output.png -w 64 -h 64 --segmentation slic
+# Full options
+smart-downscaler input.png output.png \
+  -w 128 -h 128 \
+  -p 32 \
+  --palette-strategy saturation \
+  --segmentation hierarchy-fast \
+  --neighbor-weight 0.4
 ```
 
 ## Algorithm Details
 
-### 1. Global Palette Extraction
+### 1. Palette Extraction (Oklab Median Cut)
 
-The traditional per-tile k-means approach causes color drift across the image. We instead:
+1. Convert all pixels to Oklab color space
+2. Build weighted color histogram
+3. Apply Median Cut to partition Oklab space
+4. For each bucket, compute centroid in Oklab
+5. Convert centroids back to RGB
+6. Refine with K-Means++ in Oklab space
 
-1. Build a weighted color histogram from all source pixels
-2. Apply Median Cut to partition the color space, finding initial centroids with good distribution
-3. Refine centroids using K-Means++ in CIE Lab space for perceptual accuracy
+### 2. Saturation-Weighted Strategy
 
-### 2. Region Pre-Segmentation
-
-Before downscaling, we identify coherent regions to preserve:
-
-**SLIC Superpixels:**
-- Iteratively clusters pixels by color and spatial proximity
-- Produces compact, regular regions
-- Fast and predictable
-
-**Hierarchical Clustering (VTracer-style):**
-- Bottom-up merging of similar adjacent pixels
-- Content-aware boundaries that follow natural edges
-- Configurable merge threshold and minimum region size
-
-**Fast Hierarchical (Union-Find):**
-- O(α(n)) per operation using union by rank + path compression
-- Best for large images where full hierarchical is too slow
-
-### 3. Edge-Aware Tile Computation
-
-Each output tile's color is computed as a weighted average of source pixels:
-
+When using `saturation` strategy:
 ```
-weight(pixel) = 1 / (1 + edge_strength * edge_weight)
+effective_weight = pixel_count × (1 + chroma × 2)
 ```
 
-This reduces the influence of transitional edge pixels, avoiding muddy colors from averaging across boundaries.
+This boosts the influence of highly saturated colors during Median Cut partitioning.
 
-### 4. Neighbor-Coherent Assignment
+### 3. Medoid Strategy
 
-When assigning each tile to a palette color, we consider:
+Instead of computing centroids (averages), selects the actual image color closest to the centroid. Guarantees output palette contains only exact source colors.
 
-- **Color distance** to the tile's weighted average (primary factor)
-- **Neighbor votes**: already-assigned neighbors bias toward their colors
-- **Region membership**: tiles in the same source region prefer consistent colors
+### 4. Region Pre-Segmentation
 
-The scoring function:
+Before downscaling, identifies coherent regions:
+- **SLIC**: Fast, regular superpixels
+- **Hierarchy**: Content-aware boundaries
+- **Hierarchy Fast**: O(α(n)) union-find
+
+### 5. Edge-Aware Tile Computation
+
 ```
-score(color) = distance(color, tile_avg) * (1 - neighbor_bias - region_bias)
+weight(pixel) = 1 / (1 + edge_strength × edge_weight)
 ```
 
-### 5. Two-Pass Refinement
+Reduces influence of transitional edge pixels.
 
-After initial assignment, we iteratively refine:
+### 6. Neighbor-Coherent Assignment
 
-1. For each pixel, gather all 8 neighbors
-2. Re-evaluate the best palette color considering neighbor votes
-3. Update if a better assignment is found
-4. Repeat until convergence or max iterations
-
-This smooths isolated outliers while preserving intentional edges.
-
-### 6. Graph-Cut Optimization (Optional)
-
-For highest quality, we offer MRF energy minimization:
-
-- **Data term**: color distance between tile and palette color
-- **Smoothness term**: penalty for different labels between neighbors
-- **Alpha-expansion**: iteratively try changing each pixel to each label
-
-## Comparison with Existing Tools
-
-| Feature | Smart Downscaler | Per-Tile K-Means | Simple Resize |
-|---------|------------------|------------------|---------------|
-| Global color consistency | ✓ | ✗ | ✗ |
-| Edge preservation | ✓ | Partial | ✗ |
-| Region awareness | ✓ | ✗ | ✗ |
-| Spatial coherence | ✓ | ✗ | ✗ |
-| Two-pass refinement | ✓ | ✗ | ✗ |
-| Custom palette support | ✓ | ✓ | ✗ |
-| Perceptual color space | ✓ (Lab) | Often RGB | N/A |
+```
+score(color) = oklab_distance(color, tile_avg) × (1 - neighbor_bias - region_bias)
+```
 
 ## Performance
 
-Typical performance on a modern CPU (single-threaded):
+Typical performance (single-threaded):
 
 | Image Size | Target Size | Palette | Time |
 |------------|-------------|---------|------|
 | 256×256 | 32×32 | 16 | ~50ms |
 | 512×512 | 64×64 | 32 | ~200ms |
 | 1024×1024 | 128×128 | 32 | ~800ms |
-| 2048×2048 | 256×256 | 64 | ~3s |
 
-Enable the `parallel` feature for multi-threaded processing on large images.
+Enable `parallel` feature for multi-threaded processing.
 
 ## Configuration Reference
 
-### DownscaleConfig
+### DownscaleConfig (Rust)
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `palette_size` | usize | 16 | Number of colors in output palette |
-| `kmeans_iterations` | usize | 5 | K-Means refinement iterations |
-| `neighbor_weight` | f32 | 0.3 | Weight for neighbor coherence [0-1] |
-| `region_weight` | f32 | 0.2 | Weight for region coherence [0-1] |
-| `two_pass_refinement` | bool | true | Enable iterative refinement |
-| `refinement_iterations` | usize | 3 | Max refinement iterations |
-| `segmentation` | SegmentationMethod | Hierarchy | Pre-segmentation method |
-| `edge_weight` | f32 | 0.5 | Edge influence in tile averaging |
+| `palette_size` | usize | 16 | Output colors |
+| `palette_strategy` | PaletteStrategy | OklabMedianCut | Extraction method |
+| `kmeans_iterations` | usize | 5 | Refinement iterations |
+| `neighbor_weight` | f32 | 0.3 | Neighbor coherence |
+| `region_weight` | f32 | 0.2 | Region coherence |
+| `two_pass_refinement` | bool | true | Enable refinement |
+| `refinement_iterations` | usize | 3 | Max iterations |
+| `segmentation` | SegmentationMethod | Hierarchy | Pre-segmentation |
+| `edge_weight` | f32 | 0.5 | Edge influence |
 
-### HierarchyConfig
+### PaletteStrategy
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `merge_threshold` | f32 | 15.0 | Max color distance for merging |
-| `min_region_size` | usize | 4 | Minimum pixels per region |
-| `max_regions` | usize | 0 | Max regions (0 = unlimited) |
-| `spatial_weight` | f32 | 0.1 | Spatial proximity influence |
+| Value | Description |
+|-------|-------------|
+| `OklabMedianCut` | Default, best general quality |
+| `SaturationWeighted` | Preserves vibrant colors |
+| `Medoid` | Exact source colors only |
+| `KMeansPlusPlus` | K-Means++ clustering |
+| `LegacyRgb` | Original RGB (not recommended) |
 
-### SlicConfig
+## Troubleshooting
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `num_superpixels` | usize | 100 | Approximate superpixel count |
-| `compactness` | f32 | 10.0 | Shape regularity (higher = more compact) |
-| `max_iterations` | usize | 10 | SLIC iterations |
-| `convergence_threshold` | f32 | 1.0 | Early termination threshold |
+### Colors still look desaturated
+
+Try increasing palette size or using `saturation` strategy:
+```javascript
+config.palette_size = 24;  // Up from 16
+config.palette_strategy = 'saturation';
+```
+
+### Want exact source colors
+
+Use medoid strategy with no K-Means refinement:
+```javascript
+config.palette_strategy = 'medoid';
+config.kmeans_iterations = 0;
+```
+
+### Output looks noisy
+
+Increase neighbor weight for smoother results:
+```javascript
+config.neighbor_weight = 0.5;  // Up from 0.3
+config.two_pass_refinement = true;
+```
 
 ## License
 
@@ -323,8 +368,7 @@ MIT
 
 ## Credits
 
-Inspired by:
-- VTracer's hierarchical clustering approach
+- Oklab color space by Björn Ottosson
 - SLIC superpixel algorithm
 - K-Means++ initialization
-- CIE Lab perceptual color space
+- VTracer hierarchical clustering approach
