@@ -1,6 +1,6 @@
 [package]
 name = "smart-downscaler"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 authors = ["Pixagram"]
 description = "Intelligent pixel art downscaler with region-aware color quantization"
@@ -49,11 +49,6 @@ opt-level = 3
 inherits = "release"
 opt-level = "s"
 lto = true
-
-[[bench]]
-name = "downscale_bench"
-harness = false
-required-features = ["native"]
 
 [[bin]]
 name = "smart-downscaler"

@@ -89,6 +89,7 @@ pub mod downscale;
 pub mod edge;
 pub mod hierarchy;
 pub mod palette;
+pub mod preprocess;
 pub mod slic;
 
 #[cfg(feature = "wasm")]
@@ -103,6 +104,7 @@ pub use downscale::{
 pub use edge::{compute_combined_edges, compute_edge_map, EdgeMap};
 pub use hierarchy::{hierarchical_cluster, hierarchical_cluster_fast, Hierarchy, HierarchyConfig};
 pub use palette::{extract_palette, extract_palette_with_strategy, Palette, PaletteStrategy};
+pub use preprocess::{preprocess_image, PreprocessConfig, PreprocessResult};
 pub use slic::{flood_fill_segment, slic_segment, Segmentation, SlicConfig};
 
 // Native-only exports

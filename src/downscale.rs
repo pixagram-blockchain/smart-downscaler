@@ -6,11 +6,17 @@
 //! - SLIC superpixel segmentation OR VTracer-style hierarchical clustering
 //! - Neighbor-coherent color assignment
 //! - Two-pass refinement for optimal results
+//!
+//! Performance optimizations (v0.3):
+//! - Resolution capping: Large images are pre-downscaled using nearest neighbor
+//! - Color pre-quantization: Reduces unique colors for faster palette extraction
+//! - Integer-based edge detection: Uses fast integer arithmetic
 
-use crate::color::{Lab, Oklab, OklabAccumulator, Rgb};
+use crate::color::{Oklab, OklabAccumulator, Rgb};
 use crate::edge::{compute_combined_edges, EdgeMap};
 use crate::hierarchy::{hierarchical_cluster, hierarchical_cluster_fast, HierarchyConfig};
 use crate::palette::{extract_palette_with_strategy, Palette, PaletteStrategy};
+use crate::preprocess::{preprocess_image, PreprocessConfig, fast_edge_detect};
 use crate::slic::{slic_segment, Segmentation, SlicConfig};
 
 #[cfg(feature = "parallel")]
@@ -38,6 +44,10 @@ pub struct DownscaleConfig {
     pub edge_weight: f32,
     /// Palette extraction strategy
     pub palette_strategy: PaletteStrategy,
+    /// Maximum resolution in megapixels for preprocessing (0 = disabled)
+    pub max_resolution_mp: f32,
+    /// Maximum unique colors for preprocessing (0 = disabled)
+    pub max_color_preprocess: usize,
 }
 
 impl Default for DownscaleConfig {
@@ -52,6 +62,8 @@ impl Default for DownscaleConfig {
             segmentation: SegmentationMethod::Hierarchy(HierarchyConfig::default()),
             edge_weight: 0.5,
             palette_strategy: PaletteStrategy::OklabMedianCut,
+            max_resolution_mp: 1.6,
+            max_color_preprocess: 16384,
         }
     }
 }
@@ -125,39 +137,70 @@ pub fn smart_downscale(
     target_height: u32,
     config: &DownscaleConfig,
 ) -> DownscaleResult {
+    // Step 0: Apply preprocessing optimizations (resolution capping + color reduction)
+    let preprocess_config = PreprocessConfig {
+        max_resolution_mp: config.max_resolution_mp,
+        max_color_preprocess: config.max_color_preprocess,
+        enabled: config.max_resolution_mp > 0.0 || config.max_color_preprocess > 0,
+    };
+    
+    let preprocessed = preprocess_image(
+        source_pixels,
+        source_width,
+        source_height,
+        &preprocess_config,
+    );
+    
+    // Use preprocessed data for further processing
+    let working_pixels = &preprocessed.pixels;
+    let working_width = preprocessed.width;
+    let working_height = preprocessed.height;
+    
     // Step 1: Extract global palette using configured strategy
     let palette = extract_palette_with_strategy(
-        source_pixels,
+        working_pixels,
         config.palette_size,
         config.kmeans_iterations,
         config.palette_strategy,
     );
 
     // Step 2: Compute edge map for boundary awareness
-    let edge_map = compute_combined_edges(
-        source_pixels,
-        source_width,
-        source_height,
-        1.0,
-        config.edge_weight,
-    );
+    // Use fast integer-based edge detection for preprocessed images
+    let edge_map = if preprocessed.resolution_capped || preprocessed.colors_reduced {
+        // Use optimized fast edge detection
+        let fast_edges = fast_edge_detect(working_pixels, working_width, working_height);
+        EdgeMap {
+            width: working_width,
+            height: working_height,
+            data: fast_edges.iter().map(|&e| e as f32 / 65535.0).collect(),
+            max_value: 1.0,
+        }
+    } else {
+        compute_combined_edges(
+            working_pixels,
+            working_width,
+            working_height,
+            1.0,
+            config.edge_weight,
+        )
+    };
 
     // Step 3: Pre-segment source image (optional)
     let segmentation = perform_segmentation(
-        source_pixels,
-        source_width,
-        source_height,
+        working_pixels,
+        working_width,
+        working_height,
         &config.segmentation,
     );
 
     // Step 4: Initial assignment with neighbor and region coherence
-    let scale_x = source_width as f32 / target_width as f32;
-    let scale_y = source_height as f32 / target_height as f32;
+    let scale_x = working_width as f32 / target_width as f32;
+    let scale_y = working_height as f32 / target_height as f32;
 
-    let (mut assignments, tile_oklabs) = initial_assignment_oklab(
-        source_pixels,
-        source_width,
-        source_height,
+    let (mut assignments, tile_oklabs) = initial_assignment_oklab_optimized(
+        working_pixels,
+        working_width,
+        working_height,
         target_width,
         target_height,
         &palette,
@@ -342,6 +385,227 @@ fn initial_assignment_oklab(
     }
 
     (assignments, tile_oklabs)
+}
+
+/// Optimized initial assignment pass with reduced allocations
+/// 
+/// Key optimizations:
+/// - Pre-compute all Oklab conversions once
+/// - Use pre-allocated array for segment counts instead of HashMap
+/// - Avoid repeated allocations in inner loops
+fn initial_assignment_oklab_optimized(
+    source_pixels: &[Rgb],
+    source_width: usize,
+    source_height: usize,
+    target_width: u32,
+    target_height: u32,
+    palette: &Palette,
+    edge_map: &EdgeMap,
+    segmentation: Option<&Segmentation>,
+    config: &DownscaleConfig,
+    scale_x: f32,
+    scale_y: f32,
+) -> (Vec<usize>, Vec<Oklab>) {
+    // Pre-compute ALL Oklab conversions once (major optimization)
+    let source_oklabs: Vec<Oklab> = crate::preprocess::batch_rgb_to_oklab_fast(source_pixels);
+    let tw = target_width as usize;
+    let th = target_height as usize;
+
+    let mut assignments = vec![0usize; tw * th];
+    let mut tile_oklabs = vec![Oklab::default(); tw * th];
+    
+    // Pre-allocate segment count array (avoids HashMap allocation per tile)
+    let max_segments = segmentation.map(|s| s.num_segments).unwrap_or(0);
+    let mut segment_counts = vec![0usize; max_segments.max(1)];
+    
+    // Pre-allocate neighbor buffer (max 4 neighbors)
+    let mut neighbor_indices = Vec::with_capacity(4);
+
+    // Process in scanline order for neighbor access
+    for ty in 0..th {
+        for tx in 0..tw {
+            let tidx = ty * tw + tx;
+
+            // Compute tile bounds in source image
+            let src_x = (tx as f32 * scale_x) as usize;
+            let src_y = (ty as f32 * scale_y) as usize;
+            let tile_w = (scale_x.ceil() as usize).max(1);
+            let tile_h = (scale_y.ceil() as usize).max(1);
+
+            // Reset segment counts for this tile
+            if max_segments > 0 {
+                segment_counts.iter_mut().for_each(|c| *c = 0);
+            }
+
+            // Compute weighted average color for tile in Oklab space
+            let mut acc = OklabAccumulator::new();
+            let mut dominant_segment: Option<usize> = None;
+
+            for dy in 0..tile_h {
+                let py = (src_y + dy).min(source_height - 1);
+                let row_offset = py * source_width;
+                
+                for dx in 0..tile_w {
+                    let px = (src_x + dx).min(source_width - 1);
+                    let pidx = row_offset + px;
+
+                    let pixel_oklab = source_oklabs[pidx];
+                    let edge_strength = edge_map.get(px, py);
+
+                    // Lower weight for edge pixels (transitional)
+                    let weight = 1.0 / (1.0 + edge_strength * config.edge_weight * 5.0);
+                    acc.add(pixel_oklab, weight);
+
+                    // Track segment membership using array instead of HashMap
+                    if let Some(seg) = segmentation {
+                        let seg_label = seg.get_label(px, py);
+                        if seg_label < segment_counts.len() {
+                            segment_counts[seg_label] += 1;
+                        }
+                    }
+                }
+            }
+
+            // Find dominant segment in tile (using array)
+            if max_segments > 0 {
+                let mut max_count = 0;
+                let mut max_idx = 0;
+                for (idx, &count) in segment_counts.iter().enumerate() {
+                    if count > max_count {
+                        max_count = count;
+                        max_idx = idx;
+                    }
+                }
+                if max_count > 0 {
+                    dominant_segment = Some(max_idx);
+                }
+            }
+
+            let avg_oklab = acc.mean();
+            tile_oklabs[tidx] = avg_oklab;
+
+            // Collect neighbor assignments (reuse buffer)
+            neighbor_indices.clear();
+            if tx > 0 {
+                neighbor_indices.push(assignments[ty * tw + (tx - 1)]);
+            }
+            if ty > 0 {
+                neighbor_indices.push(assignments[(ty - 1) * tw + tx]);
+            }
+            if tx > 0 && ty > 0 {
+                neighbor_indices.push(assignments[(ty - 1) * tw + (tx - 1)]);
+            }
+            if tx + 1 < tw && ty > 0 {
+                neighbor_indices.push(assignments[(ty - 1) * tw + (tx + 1)]);
+            }
+
+            // Simplified same-region handling for performance
+            // Only check immediate neighbors instead of all previous tiles
+            let same_region_count = if let (Some(_seg), Some(_dom_seg)) = (segmentation, dominant_segment) {
+                // Count how many neighbors share the same dominant segment
+                neighbor_indices.iter().filter(|&&n_idx| {
+                    // Approximate: assume neighbors in same region have similar indices
+                    n_idx == assignments.get(tidx.saturating_sub(1)).copied().unwrap_or(0)
+                }).count()
+            } else {
+                0
+            };
+
+            // Find best palette color using optimized Oklab matching
+            let best_idx = find_best_palette_match_oklab_fast(
+                &avg_oklab,
+                palette,
+                &neighbor_indices,
+                same_region_count,
+                config.neighbor_weight,
+                config.region_weight,
+            );
+
+            assignments[tidx] = best_idx;
+        }
+    }
+
+    (assignments, tile_oklabs)
+}
+
+/// Optimized palette matching with reduced allocations
+#[inline]
+fn find_best_palette_match_oklab_fast(
+    target: &Oklab,
+    palette: &Palette,
+    neighbor_indices: &[usize],
+    same_region_count: usize,
+    neighbor_weight: f32,
+    region_weight: f32,
+) -> usize {
+    // Fast path: no neighbors, just find nearest
+    if neighbor_indices.is_empty() {
+        return palette.find_nearest_oklab(target);
+    }
+
+    let palette_len = palette.colors.len();
+    
+    // Use stack-allocated array for small palettes (common case)
+    if palette_len <= 64 {
+        let mut neighbor_counts = [0u8; 64];
+        for &idx in neighbor_indices {
+            if idx < 64 {
+                neighbor_counts[idx] = neighbor_counts[idx].saturating_add(1);
+            }
+        }
+        
+        let max_neighbor = neighbor_indices.len().max(1) as f32;
+        let region_bonus = if same_region_count > 0 { region_weight * 0.5 } else { 0.0 };
+        
+        let mut best_idx = 0;
+        let mut best_score = f32::MAX;
+        
+        for (i, oklab) in palette.oklab_colors.iter().enumerate() {
+            let dist = target.distance_squared(*oklab);
+            let neighbor_bias = (neighbor_counts[i] as f32 / max_neighbor) * neighbor_weight;
+            let total_bias = (neighbor_bias + region_bonus).min(0.9);
+            let score = dist * (1.0 - total_bias);
+            
+            if score < best_score {
+                best_score = score;
+                best_idx = i;
+            }
+        }
+        
+        return best_idx;
+    }
+    
+    // Fall back to heap allocation for large palettes
+    let mut neighbor_counts = vec![0usize; palette_len];
+    for &idx in neighbor_indices {
+        if idx < neighbor_counts.len() {
+            neighbor_counts[idx] += 1;
+        }
+    }
+
+    let max_neighbor = neighbor_indices.len().max(1) as f32;
+    let region_bonus = if same_region_count > 0 { region_weight * 0.5 } else { 0.0 };
+
+    palette.oklab_colors
+        .iter()
+        .enumerate()
+        .min_by(|(i, a), (j, b)| {
+            let dist_a = target.distance_squared(**a);
+            let dist_b = target.distance_squared(**b);
+
+            let neighbor_bias_a = (neighbor_counts[*i] as f32 / max_neighbor) * neighbor_weight;
+            let neighbor_bias_b = (neighbor_counts[*j] as f32 / max_neighbor) * neighbor_weight;
+
+            let total_bias_a = (neighbor_bias_a + region_bonus).min(0.9);
+            let total_bias_b = (neighbor_bias_b + region_bonus).min(0.9);
+
+            let score_a = dist_a * (1.0 - total_bias_a);
+            let score_b = dist_b * (1.0 - total_bias_b);
+
+            score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0)
 }
 
 /// Find best palette match using Oklab distance with neighbor/region bias

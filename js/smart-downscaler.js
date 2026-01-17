@@ -2,6 +2,8 @@
  * Smart Pixel Art Downscaler - JavaScript API
  * 
  * High-level wrapper around the WebAssembly module for easy browser usage.
+ * 
+ * Version 0.3 - Performance optimizations with preprocessing
  */
 
 let wasm = null;
@@ -35,6 +37,8 @@ export async function init(input) {
  * @property {number} [slicCompactness=10] - SLIC compactness
  * @property {number} [hierarchyThreshold=15] - Hierarchy merge threshold
  * @property {number} [hierarchyMinSize=4] - Minimum region size
+ * @property {number} [maxResolutionMp=1.5] - Max megapixels before downscale preprocessing (0 = disabled)
+ * @property {number} [maxColorPreprocess=16384] - Max unique colors before quantize preprocessing (0 = disabled)
  */
 
 /**
@@ -68,6 +72,10 @@ function createConfig(options = {}) {
   if (options.slicCompactness !== undefined) config.slic_compactness = options.slicCompactness;
   if (options.hierarchyThreshold !== undefined) config.hierarchy_threshold = options.hierarchyThreshold;
   if (options.hierarchyMinSize !== undefined) config.hierarchy_min_size = options.hierarchyMinSize;
+  
+  // New preprocessing options
+  if (options.maxResolutionMp !== undefined) config.max_resolution_mp = options.maxResolutionMp;
+  if (options.maxColorPreprocess !== undefined) config.max_color_preprocess = options.maxColorPreprocess;
   
   return config;
 }
@@ -122,7 +130,7 @@ export function downscaleSimple(source, targetWidth, targetHeight, numColors) {
  * @param {ImageData|HTMLCanvasElement|HTMLImageElement} source
  * @param {number} targetWidth
  * @param {number} targetHeight
- * @param {'fast'|'quality'} preset
+ * @param {'fast'|'quality'|'vibrant'|'exact_colors'} preset
  * @param {number} [paletteSize]
  * @returns {DownscaleResult}
  */
@@ -130,9 +138,24 @@ export function downscalePreset(source, targetWidth, targetHeight, preset, palet
   if (!wasm) throw new Error('WASM module not initialized. Call init() first.');
   
   const imageData = getImageData(source);
-  const config = preset === 'fast' 
-    ? wasm.WasmDownscaleConfig.fast()
-    : wasm.WasmDownscaleConfig.quality();
+  let config;
+  
+  switch (preset) {
+    case 'fast':
+      config = wasm.WasmDownscaleConfig.fast();
+      break;
+    case 'quality':
+      config = wasm.WasmDownscaleConfig.quality();
+      break;
+    case 'vibrant':
+      config = wasm.WasmDownscaleConfig.vibrant();
+      break;
+    case 'exact_colors':
+      config = wasm.WasmDownscaleConfig.exact_colors();
+      break;
+    default:
+      config = new wasm.WasmDownscaleConfig();
+  }
   
   if (paletteSize !== undefined) {
     config.palette_size = paletteSize;

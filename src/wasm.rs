@@ -17,8 +17,7 @@ use crate::slic::SlicConfig;
 /// Initialize panic hook for better error messages in browser console
 #[wasm_bindgen(start)]
 pub fn init() {
-    #[cfg(feature = "console_error_panic_hook")]
-    console_error_panic_hook::set_once();
+    // Panic hook initialization would go here if console_error_panic_hook was enabled
 }
 
 /// Configuration options for the downscaler (JavaScript-compatible)
@@ -51,6 +50,10 @@ pub struct WasmDownscaleConfig {
     pub hierarchy_threshold: f32,
     /// For hierarchy: minimum region size (default: 4)
     pub hierarchy_min_size: usize,
+    /// Maximum resolution in megapixels for preprocessing (default: 1.5, 0 = disabled)
+    pub max_resolution_mp: f32,
+    /// Maximum unique colors for preprocessing (default: 16384, 0 = disabled)
+    pub max_color_preprocess: usize,
 }
 
 #[wasm_bindgen]
@@ -102,6 +105,8 @@ impl WasmDownscaleConfig {
             slic_compactness: 10.0,
             hierarchy_threshold: 20.0,
             hierarchy_min_size: 4,
+            max_resolution_mp: 1.0,  // Aggressive resolution cap for speed
+            max_color_preprocess: 8192,
         }
     }
 
@@ -122,6 +127,8 @@ impl WasmDownscaleConfig {
             slic_compactness: 10.0,
             hierarchy_threshold: 15.0,
             hierarchy_min_size: 8,
+            max_resolution_mp: 2.0,  // Higher resolution for quality
+            max_color_preprocess: 32768,
         }
     }
 
@@ -142,6 +149,8 @@ impl WasmDownscaleConfig {
             slic_compactness: 10.0,
             hierarchy_threshold: 15.0,
             hierarchy_min_size: 4,
+            max_resolution_mp: 1.6,
+            max_color_preprocess: 16384,
         }
     }
 
@@ -162,6 +171,8 @@ impl WasmDownscaleConfig {
             slic_compactness: 10.0,
             hierarchy_threshold: 15.0,
             hierarchy_min_size: 4,
+            max_resolution_mp: 1.6,
+            max_color_preprocess: 16384,
         }
     }
 }
@@ -182,6 +193,8 @@ impl Default for WasmDownscaleConfig {
             slic_compactness: 10.0,
             hierarchy_threshold: 15.0,
             hierarchy_min_size: 4,
+            max_resolution_mp: 1.5,
+            max_color_preprocess: 16384,
         }
     }
 }
@@ -226,6 +239,8 @@ impl WasmDownscaleConfig {
             segmentation,
             edge_weight: self.edge_weight,
             palette_strategy,
+            max_resolution_mp: self.max_resolution_mp,
+            max_color_preprocess: self.max_color_preprocess,
         }
     }
 }
