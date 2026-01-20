@@ -48,6 +48,10 @@ pub struct DownscaleConfig {
     pub max_resolution_mp: f32,
     /// Maximum unique colors for preprocessing (0 = disabled)
     pub max_color_preprocess: usize,
+    /// Number of K-Means clusters for local tile refinement (0 or 1 = disabled, average only)
+    pub tile_kmeans_clusters: usize,
+    /// Number of K-Means iterations for local tile refinement
+    pub tile_kmeans_iterations: usize,
 }
 
 impl Default for DownscaleConfig {
@@ -64,6 +68,8 @@ impl Default for DownscaleConfig {
             palette_strategy: PaletteStrategy::OklabMedianCut,
             max_resolution_mp: 1.6,
             max_color_preprocess: 16384,
+            tile_kmeans_clusters: 0,
+            tile_kmeans_iterations: 0,
         }
     }
 }
@@ -264,6 +270,75 @@ fn perform_segmentation(
     }
 }
 
+/// Optimized tile color extraction using local K-Means
+fn get_tile_dominant_color_kmeans(
+    pixels: &[Oklab],
+    k: usize,
+    iterations: usize,
+) -> Oklab {
+    if pixels.is_empty() { return Oklab::default(); }
+    if k <= 1 {
+        // Fallback to simple average
+        let mut acc = OklabAccumulator::new();
+        for p in pixels { acc.add(*p, 1.0); }
+        return acc.mean();
+    }
+
+    // 1. Init centroids (simple deterministic selection)
+    let mut centroids = Vec::with_capacity(k);
+    centroids.push(pixels[0]);
+    for p in pixels.iter().skip(1) {
+        if centroids.len() >= k { break; }
+        if centroids.iter().all(|c| c.distance_squared(*p) > 0.001) {
+            centroids.push(*p);
+        }
+    }
+    // Pad if needed
+    while centroids.len() < k { centroids.push(pixels[0]); }
+
+    let mut cluster_sums = vec![Oklab::default(); k];
+    let mut cluster_counts = vec![0usize; k];
+
+    // 2. K-Means Loop
+    for _ in 0..iterations {
+        cluster_sums.fill(Oklab::default());
+        cluster_counts.fill(0);
+
+        for p in pixels {
+            let mut best_idx = 0;
+            let mut min_dist = f32::MAX;
+            for (i, c) in centroids.iter().enumerate() {
+                let dist = p.distance_squared(*c);
+                if dist < min_dist {
+                    min_dist = dist;
+                    best_idx = i;
+                }
+            }
+            cluster_sums[best_idx] = cluster_sums[best_idx] + *p;
+            cluster_counts[best_idx] += 1;
+        }
+
+        let mut changed = false;
+        for i in 0..k {
+            if cluster_counts[i] > 0 {
+                let new_c = cluster_sums[i] / (cluster_counts[i] as f32);
+                if new_c.distance_squared(centroids[i]) > 1e-4 {
+                    centroids[i] = new_c;
+                    changed = true;
+                }
+            }
+        }
+        if !changed { break; }
+    }
+
+    // 3. Return centroid of largest cluster
+    let (best_idx, _) = cluster_counts.iter().enumerate()
+        .max_by_key(|(_, &c)| c)
+        .unwrap_or((0, &0));
+        
+    centroids[best_idx]
+}
+
 /// Initial assignment pass using Oklab color space for perceptually accurate averaging
 fn initial_assignment_oklab(
     source_pixels: &[Rgb],
@@ -278,113 +353,21 @@ fn initial_assignment_oklab(
     scale_x: f32,
     scale_y: f32,
 ) -> (Vec<usize>, Vec<Oklab>) {
-    let source_oklabs: Vec<Oklab> = source_pixels.iter().map(|p| p.to_oklab()).collect();
-    let tw = target_width as usize;
-    let th = target_height as usize;
-
-    let mut assignments = vec![0usize; tw * th];
-    let mut tile_oklabs = vec![Oklab::default(); tw * th];
-
-    // Process in scanline order for neighbor access
-    for ty in 0..th {
-        for tx in 0..tw {
-            let tidx = ty * tw + tx;
-
-            // Compute tile bounds in source image
-            let src_x = (tx as f32 * scale_x) as usize;
-            let src_y = (ty as f32 * scale_y) as usize;
-            let tile_w = (scale_x.ceil() as usize).max(1);
-            let tile_h = (scale_y.ceil() as usize).max(1);
-
-            // Compute weighted average color for tile in Oklab space
-            let mut acc = OklabAccumulator::new();
-            let mut dominant_segment = None;
-            let mut segment_counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-
-            for dy in 0..tile_h {
-                for dx in 0..tile_w {
-                    let px = (src_x + dx).min(source_width - 1);
-                    let py = (src_y + dy).min(source_height - 1);
-                    let pidx = py * source_width + px;
-
-                    let pixel_oklab = source_oklabs[pidx];
-                    let edge_strength = edge_map.get(px, py);
-
-                    // Lower weight for edge pixels (transitional)
-                    let weight = 1.0 / (1.0 + edge_strength * config.edge_weight * 5.0);
-                    acc.add(pixel_oklab, weight);
-
-                    // Track segment membership
-                    if let Some(seg) = segmentation {
-                        let seg_label = seg.get_label(px, py);
-                        *segment_counts.entry(seg_label).or_insert(0) += 1;
-                    }
-                }
-            }
-
-            // Find dominant segment in tile
-            if !segment_counts.is_empty() {
-                dominant_segment = segment_counts
-                    .iter()
-                    .max_by_key(|(_, count)| *count)
-                    .map(|(&seg, _)| seg);
-            }
-
-            let avg_oklab = acc.mean();
-            tile_oklabs[tidx] = avg_oklab;
-
-            // Collect neighbor assignments
-            let mut neighbor_indices = Vec::new();
-            if tx > 0 {
-                neighbor_indices.push(assignments[ty * tw + (tx - 1)]);
-            }
-            if ty > 0 {
-                neighbor_indices.push(assignments[(ty - 1) * tw + tx]);
-            }
-            if tx > 0 && ty > 0 {
-                neighbor_indices.push(assignments[(ty - 1) * tw + (tx - 1)]);
-            }
-            if tx + 1 < tw && ty > 0 {
-                neighbor_indices.push(assignments[(ty - 1) * tw + (tx + 1)]);
-            }
-
-            // Collect same-region assignments
-            let mut same_region_indices = Vec::new();
-            if let (Some(seg), Some(dom_seg)) = (segmentation, dominant_segment) {
-                // Look at all previously assigned tiles in the same region
-                for prev_ty in 0..=ty {
-                    let max_tx = if prev_ty == ty { tx } else { tw };
-                    for prev_tx in 0..max_tx {
-                        let prev_tidx = prev_ty * tw + prev_tx;
-
-                        // Check if previous tile is in same segment
-                        let prev_src_x = (prev_tx as f32 * scale_x) as usize;
-                        let prev_src_y = (prev_ty as f32 * scale_y) as usize;
-                        let prev_center_x = (prev_src_x + (scale_x as usize / 2)).min(source_width - 1);
-                        let prev_center_y = (prev_src_y + (scale_y as usize / 2)).min(source_height - 1);
-
-                        if seg.get_label(prev_center_x, prev_center_y) == dom_seg {
-                            same_region_indices.push(assignments[prev_tidx]);
-                        }
-                    }
-                }
-            }
-
-            // Find best palette color using Oklab matching
-            let best_idx = find_best_palette_match_oklab(
-                &avg_oklab,
-                palette,
-                &neighbor_indices,
-                &same_region_indices,
-                config.neighbor_weight,
-                config.region_weight,
-            );
-
-            assignments[tidx] = best_idx;
-        }
-    }
-
-    (assignments, tile_oklabs)
+    // This function is effectively replaced by the optimized version below,
+    // which now includes the K-Means tile logic requested.
+    initial_assignment_oklab_optimized(
+        source_pixels,
+        source_width,
+        source_height,
+        target_width,
+        target_height,
+        palette,
+        edge_map,
+        segmentation,
+        config,
+        scale_x,
+        scale_y
+    )
 }
 
 /// Optimized initial assignment pass with reduced allocations
@@ -421,6 +404,10 @@ fn initial_assignment_oklab_optimized(
     // Pre-allocate neighbor buffer (max 4 neighbors)
     let mut neighbor_indices = Vec::with_capacity(4);
 
+    // Pre-allocate tile pixel buffer to avoid re-allocation in loop
+    // Assumes max tile size won't exceed a reasonable limit, but will grow if needed
+    let mut tile_pixels = Vec::with_capacity(64); 
+
     // Process in scanline order for neighbor access
     for ty in 0..th {
         for tx in 0..tw {
@@ -437,8 +424,8 @@ fn initial_assignment_oklab_optimized(
                 segment_counts.iter_mut().for_each(|c| *c = 0);
             }
 
-            // Compute weighted average color for tile in Oklab space
-            let mut acc = OklabAccumulator::new();
+            // Collect pixels for this tile
+            tile_pixels.clear();
             let mut dominant_segment: Option<usize> = None;
 
             for dy in 0..tile_h {
@@ -450,12 +437,8 @@ fn initial_assignment_oklab_optimized(
                     let pidx = row_offset + px;
 
                     let pixel_oklab = source_oklabs[pidx];
-                    let edge_strength = edge_map.get(px, py);
-
-                    // Lower weight for edge pixels (transitional)
-                    let weight = 1.0 / (1.0 + edge_strength * config.edge_weight * 5.0);
-                    acc.add(pixel_oklab, weight);
-
+                    tile_pixels.push(pixel_oklab);
+                    
                     // Track segment membership using array instead of HashMap
                     if let Some(seg) = segmentation {
                         let seg_label = seg.get_label(px, py);
@@ -481,7 +464,12 @@ fn initial_assignment_oklab_optimized(
                 }
             }
 
-            let avg_oklab = acc.mean();
+            // Calculate tile color: either simple average or K-Means centroid
+            let avg_oklab = get_tile_dominant_color_kmeans(
+                &tile_pixels,
+                config.tile_kmeans_clusters,
+                config.tile_kmeans_iterations
+            );
             tile_oklabs[tidx] = avg_oklab;
 
             // Collect neighbor assignments (reuse buffer)

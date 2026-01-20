@@ -1,6 +1,6 @@
 [package]
 name = "smart-downscaler"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 authors = ["Pixagram"]
 description = "Intelligent pixel art downscaler with region-aware color quantization"

@@ -30,6 +30,8 @@ pub enum PaletteStrategy {
     KMeansPlusPlus,
     /// Legacy RGB-space Median Cut (for comparison, not recommended)
     LegacyRgb,
+    /// Bit-masked RGB Median Cut (fast, precise for high color counts)
+    RgbBitmask,
 }
 
 /// A color palette with precomputed Lab/Oklab values for fast matching
@@ -267,6 +269,9 @@ pub fn extract_palette_with_strategy(
         }
         PaletteStrategy::LegacyRgb => {
             median_cut_legacy(&weighted_colors, target_colors)
+        }
+        PaletteStrategy::RgbBitmask => {
+            median_cut_rgb_bitmask(&weighted_colors, target_colors)
         }
     };
 
@@ -596,6 +601,74 @@ fn split_bucket_rgb(mut colors: Vec<WeightedColor>, axis: usize) -> (Vec<Weighte
     let right = colors.split_off(split_idx);
     (colors, right)
 }
+
+// =============================================================================
+// RGB Bitmask Median Cut (for precise color clustering)
+// =============================================================================
+
+/// Median Cut using RGB bit-masking for clustering
+/// Preserves dominant colors by masking lower bits, preventing subtle blends
+fn median_cut_rgb_bitmask(colors: &[WeightedColor], target: usize) -> Vec<Rgb> {
+    if colors.is_empty() { return vec![]; }
+    
+    // Mask to use for clustering decisions (e.g., 5 bits = 32 levels)
+    // This groups "similar" colors without averaging them into new tints immediately
+    let mask = 0xF8; 
+
+    // Helper to get masked component
+    let get_masked = |wc: &WeightedColor, axis: usize| -> u8 {
+        match axis {
+            0 => wc.rgb.r & mask,
+            1 => wc.rgb.g & mask,
+            _ => wc.rgb.b & mask,
+        }
+    };
+
+    let mut buckets = vec![colors.to_vec()];
+
+    while buckets.len() < target {
+        // Find split axis based on MASKED range
+        let split_req = buckets.iter().enumerate()
+            .filter(|(_, b)| b.len() > 1)
+            .map(|(i, b)| {
+                let ranges: Vec<u8> = (0..3).map(|axis| {
+                    let min = b.iter().map(|c| get_masked(c, axis)).min().unwrap_or(0);
+                    let max = b.iter().map(|c| get_masked(c, axis)).max().unwrap_or(0);
+                    max - min
+                }).collect();
+                let (axis, range) = ranges.iter().enumerate().max_by_key(|(_, r)| *r).unwrap();
+                (i, axis, *range)
+            })
+            .max_by_key(|(_, _, range)| *range);
+
+        if let Some((i, axis, range)) = split_req {
+            if range == 0 { break; } // Cannot split further with this mask
+            
+            let mut bucket = buckets.remove(i);
+            // Sort by MASKED value
+            bucket.sort_by_key(|c| get_masked(c, axis));
+            
+            // Split at median
+            let split_idx = bucket.len() / 2;
+            let right = bucket.split_off(split_idx);
+            buckets.push(bucket);
+            buckets.push(right);
+        } else {
+            break;
+        }
+    }
+
+    // Final centroid calculation: Use simple average of the bucket
+    // Since we clustered by bitmask, the average will be "safe"
+    buckets.iter().map(|b| {
+        let (r, g, b, count) = b.iter().fold((0u64,0u64,0u64,0u64), |acc, c| {
+            (acc.0 + c.rgb.r as u64, acc.1 + c.rgb.g as u64, acc.2 + c.rgb.b as u64, acc.3 + 1)
+        });
+        if count == 0 { return Rgb::default(); }
+        Rgb::new((r/count) as u8, (g/count) as u8, (b/count) as u8)
+    }).collect()
+}
+
 
 // =============================================================================
 // K-Means refinement

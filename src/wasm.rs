@@ -40,7 +40,7 @@ pub struct WasmDownscaleConfig {
     pub edge_weight: f32,
     /// Segmentation method: "none", "slic", "hierarchy", "hierarchy_fast" (default: "hierarchy_fast")
     segmentation_method: String,
-    /// Palette strategy: "oklab", "saturation", "medoid", "kmeans", "legacy" (default: "oklab")
+    /// Palette strategy: "oklab", "saturation", "medoid", "kmeans", "legacy", "bitmask" (default: "oklab")
     palette_strategy: String,
     /// For SLIC: approximate number of superpixels (default: 100)
     pub slic_superpixels: usize,
@@ -54,6 +54,10 @@ pub struct WasmDownscaleConfig {
     pub max_resolution_mp: f32,
     /// Maximum unique colors for preprocessing (default: 16384, 0 = disabled)
     pub max_color_preprocess: usize,
+    /// Number of K-Means clusters for local tile refinement (0 or 1 = disabled, average only)
+    pub tile_kmeans_clusters: usize,
+    /// Number of K-Means iterations for local tile refinement
+    pub tile_kmeans_iterations: usize,
 }
 
 #[wasm_bindgen]
@@ -107,6 +111,8 @@ impl WasmDownscaleConfig {
             hierarchy_min_size: 4,
             max_resolution_mp: 1.0,  // Aggressive resolution cap for speed
             max_color_preprocess: 8192,
+            tile_kmeans_clusters: 0,
+            tile_kmeans_iterations: 0,
         }
     }
 
@@ -129,6 +135,8 @@ impl WasmDownscaleConfig {
             hierarchy_min_size: 8,
             max_resolution_mp: 2.0,  // Higher resolution for quality
             max_color_preprocess: 32768,
+            tile_kmeans_clusters: 2, // Enable local clustering for cleaner edges
+            tile_kmeans_iterations: 3,
         }
     }
 
@@ -151,6 +159,8 @@ impl WasmDownscaleConfig {
             hierarchy_min_size: 4,
             max_resolution_mp: 1.6,
             max_color_preprocess: 16384,
+            tile_kmeans_clusters: 2,
+            tile_kmeans_iterations: 2,
         }
     }
 
@@ -173,6 +183,8 @@ impl WasmDownscaleConfig {
             hierarchy_min_size: 4,
             max_resolution_mp: 1.6,
             max_color_preprocess: 16384,
+            tile_kmeans_clusters: 0,
+            tile_kmeans_iterations: 0,
         }
     }
 }
@@ -195,6 +207,8 @@ impl Default for WasmDownscaleConfig {
             hierarchy_min_size: 4,
             max_resolution_mp: 1.5,
             max_color_preprocess: 16384,
+            tile_kmeans_clusters: 0,
+            tile_kmeans_iterations: 0,
         }
     }
 }
@@ -226,6 +240,7 @@ impl WasmDownscaleConfig {
             "medoid" => PaletteStrategy::Medoid,
             "kmeans" | "kmeans_plus_plus" => PaletteStrategy::KMeansPlusPlus,
             "legacy" | "rgb" => PaletteStrategy::LegacyRgb,
+            "rgb_bitmask" | "bitmask" => PaletteStrategy::RgbBitmask,
             _ => PaletteStrategy::OklabMedianCut,
         };
 
@@ -241,6 +256,8 @@ impl WasmDownscaleConfig {
             palette_strategy,
             max_resolution_mp: self.max_resolution_mp,
             max_color_preprocess: self.max_color_preprocess,
+            tile_kmeans_clusters: self.tile_kmeans_clusters,
+            tile_kmeans_iterations: self.tile_kmeans_iterations,
         }
     }
 }
@@ -411,6 +428,7 @@ pub fn extract_palette_from_image(
         Some("medoid") => PaletteStrategy::Medoid,
         Some("kmeans") => PaletteStrategy::KMeansPlusPlus,
         Some("legacy") => PaletteStrategy::LegacyRgb,
+        Some("bitmask") | Some("rgb_bitmask") => PaletteStrategy::RgbBitmask,
         Some(_) => PaletteStrategy::OklabMedianCut,
     };
 
@@ -570,6 +588,7 @@ pub fn get_palette_strategies() -> js_sys::Array {
     arr.push(&JsValue::from_str("medoid"));
     arr.push(&JsValue::from_str("kmeans"));
     arr.push(&JsValue::from_str("legacy"));
+    arr.push(&JsValue::from_str("bitmask"));
     arr
 }
 
