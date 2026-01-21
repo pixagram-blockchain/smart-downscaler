@@ -270,11 +270,30 @@ fn perform_segmentation(
     }
 }
 
+/// Scratch buffer to reuse memory across tiles for K-Means
+struct KMeansScratch {
+    centroids: Vec<Oklab>,
+    cluster_sums: Vec<Oklab>,
+    cluster_counts: Vec<usize>,
+}
+
+impl KMeansScratch {
+    fn new(k: usize) -> Self {
+        Self {
+            centroids: Vec::with_capacity(k),
+            cluster_sums: vec![Oklab::default(); k],
+            cluster_counts: vec![0usize; k],
+        }
+    }
+}
+
 /// Optimized tile color extraction using local K-Means
+/// Uses a reusable scratch buffer to avoid heap allocations in the inner loop
 fn get_tile_dominant_color_kmeans(
     pixels: &[Oklab],
     k: usize,
     iterations: usize,
+    scratch: &mut KMeansScratch,
 ) -> Oklab {
     if pixels.is_empty() { return Oklab::default(); }
     if k <= 1 {
@@ -285,45 +304,45 @@ fn get_tile_dominant_color_kmeans(
     }
 
     // 1. Init centroids (simple deterministic selection)
-    let mut centroids = Vec::with_capacity(k);
-    centroids.push(pixels[0]);
+    // Reuse the vector capacity
+    scratch.centroids.clear();
+    scratch.centroids.push(pixels[0]);
+    
     for p in pixels.iter().skip(1) {
-        if centroids.len() >= k { break; }
-        if centroids.iter().all(|c| c.distance_squared(*p) > 0.001) {
-            centroids.push(*p);
+        if scratch.centroids.len() >= k { break; }
+        if scratch.centroids.iter().all(|c| c.distance_squared(*p) > 0.001) {
+            scratch.centroids.push(*p);
         }
     }
     // Pad if needed
-    while centroids.len() < k { centroids.push(pixels[0]); }
-
-    let mut cluster_sums = vec![Oklab::default(); k];
-    let mut cluster_counts = vec![0usize; k];
+    while scratch.centroids.len() < k { scratch.centroids.push(pixels[0]); }
 
     // 2. K-Means Loop
     for _ in 0..iterations {
-        cluster_sums.fill(Oklab::default());
-        cluster_counts.fill(0);
+        // Reset accumulators (using fill is faster than re-allocation)
+        scratch.cluster_sums.fill(Oklab::default());
+        scratch.cluster_counts.fill(0);
 
         for p in pixels {
             let mut best_idx = 0;
             let mut min_dist = f32::MAX;
-            for (i, c) in centroids.iter().enumerate() {
+            for (i, c) in scratch.centroids.iter().enumerate() {
                 let dist = p.distance_squared(*c);
                 if dist < min_dist {
                     min_dist = dist;
                     best_idx = i;
                 }
             }
-            cluster_sums[best_idx] = cluster_sums[best_idx] + *p;
-            cluster_counts[best_idx] += 1;
+            scratch.cluster_sums[best_idx] = scratch.cluster_sums[best_idx] + *p;
+            scratch.cluster_counts[best_idx] += 1;
         }
 
         let mut changed = false;
         for i in 0..k {
-            if cluster_counts[i] > 0 {
-                let new_c = cluster_sums[i] / (cluster_counts[i] as f32);
-                if new_c.distance_squared(centroids[i]) > 1e-4 {
-                    centroids[i] = new_c;
+            if scratch.cluster_counts[i] > 0 {
+                let new_c = scratch.cluster_sums[i] / (scratch.cluster_counts[i] as f32);
+                if new_c.distance_squared(scratch.centroids[i]) > 1e-4 {
+                    scratch.centroids[i] = new_c;
                     changed = true;
                 }
             }
@@ -332,11 +351,11 @@ fn get_tile_dominant_color_kmeans(
     }
 
     // 3. Return centroid of largest cluster
-    let (best_idx, _) = cluster_counts.iter().enumerate()
+    let (best_idx, _) = scratch.cluster_counts.iter().enumerate()
         .max_by_key(|(_, &c)| c)
         .unwrap_or((0, &0));
         
-    centroids[best_idx]
+    scratch.centroids[best_idx]
 }
 
 /// Initial assignment pass using Oklab color space for perceptually accurate averaging
@@ -353,8 +372,6 @@ fn initial_assignment_oklab(
     scale_x: f32,
     scale_y: f32,
 ) -> (Vec<usize>, Vec<Oklab>) {
-    // This function is effectively replaced by the optimized version below,
-    // which now includes the K-Means tile logic requested.
     initial_assignment_oklab_optimized(
         source_pixels,
         source_width,
@@ -371,11 +388,6 @@ fn initial_assignment_oklab(
 }
 
 /// Optimized initial assignment pass with reduced allocations
-/// 
-/// Key optimizations:
-/// - Pre-compute all Oklab conversions once
-/// - Use pre-allocated array for segment counts instead of HashMap
-/// - Avoid repeated allocations in inner loops
 fn initial_assignment_oklab_optimized(
     source_pixels: &[Rgb],
     source_width: usize,
@@ -389,24 +401,26 @@ fn initial_assignment_oklab_optimized(
     scale_x: f32,
     scale_y: f32,
 ) -> (Vec<usize>, Vec<Oklab>) {
-    // Pre-compute ALL Oklab conversions once (major optimization)
-    let source_oklabs: Vec<Oklab> = crate::preprocess::batch_rgb_to_oklab_fast(source_pixels);
+    // Pre-compute ALL Oklab conversions once
+    let source_oklabs: Vec<Oklab> = source_pixels.iter().map(|p| p.to_oklab()).collect();
     let tw = target_width as usize;
     let th = target_height as usize;
 
     let mut assignments = vec![0usize; tw * th];
     let mut tile_oklabs = vec![Oklab::default(); tw * th];
     
-    // Pre-allocate segment count array (avoids HashMap allocation per tile)
+    // Pre-allocate segment count array
     let max_segments = segmentation.map(|s| s.num_segments).unwrap_or(0);
     let mut segment_counts = vec![0usize; max_segments.max(1)];
     
-    // Pre-allocate neighbor buffer (max 4 neighbors)
+    // Pre-allocate neighbor buffer
     let mut neighbor_indices = Vec::with_capacity(4);
 
-    // Pre-allocate tile pixel buffer to avoid re-allocation in loop
-    // Assumes max tile size won't exceed a reasonable limit, but will grow if needed
+    // Pre-allocate tile pixel buffer
     let mut tile_pixels = Vec::with_capacity(64); 
+
+    // ALLOCATE SCRATCH BUFFER ONCE HERE (The Fix)
+    let mut kmeans_scratch = KMeansScratch::new(config.tile_kmeans_clusters.max(1));
 
     // Process in scanline order for neighbor access
     for ty in 0..th {
@@ -419,12 +433,12 @@ fn initial_assignment_oklab_optimized(
             let tile_w = (scale_x.ceil() as usize).max(1);
             let tile_h = (scale_y.ceil() as usize).max(1);
 
-            // Reset segment counts for this tile
+            // Reset segment counts
             if max_segments > 0 {
                 segment_counts.iter_mut().for_each(|c| *c = 0);
             }
 
-            // Collect pixels for this tile
+            // Collect pixels
             tile_pixels.clear();
             let mut dominant_segment: Option<usize> = None;
 
@@ -439,7 +453,6 @@ fn initial_assignment_oklab_optimized(
                     let pixel_oklab = source_oklabs[pidx];
                     tile_pixels.push(pixel_oklab);
                     
-                    // Track segment membership using array instead of HashMap
                     if let Some(seg) = segmentation {
                         let seg_label = seg.get_label(px, py);
                         if seg_label < segment_counts.len() {
@@ -449,7 +462,7 @@ fn initial_assignment_oklab_optimized(
                 }
             }
 
-            // Find dominant segment in tile (using array)
+            // Find dominant segment
             if max_segments > 0 {
                 let mut max_count = 0;
                 let mut max_idx = 0;
@@ -464,15 +477,16 @@ fn initial_assignment_oklab_optimized(
                 }
             }
 
-            // Calculate tile color: either simple average or K-Means centroid
+            // Calculate tile color using Scratch Buffer
             let avg_oklab = get_tile_dominant_color_kmeans(
                 &tile_pixels,
                 config.tile_kmeans_clusters,
-                config.tile_kmeans_iterations
+                config.tile_kmeans_iterations,
+                &mut kmeans_scratch // Pass reusable buffer
             );
             tile_oklabs[tidx] = avg_oklab;
 
-            // Collect neighbor assignments (reuse buffer)
+            // Collect neighbor assignments
             neighbor_indices.clear();
             if tx > 0 {
                 neighbor_indices.push(assignments[ty * tw + (tx - 1)]);
@@ -487,19 +501,16 @@ fn initial_assignment_oklab_optimized(
                 neighbor_indices.push(assignments[(ty - 1) * tw + (tx + 1)]);
             }
 
-            // Simplified same-region handling for performance
-            // Only check immediate neighbors instead of all previous tiles
+            // Simplified same-region handling
             let same_region_count = if let (Some(_seg), Some(_dom_seg)) = (segmentation, dominant_segment) {
-                // Count how many neighbors share the same dominant segment
                 neighbor_indices.iter().filter(|&&n_idx| {
-                    // Approximate: assume neighbors in same region have similar indices
                     n_idx == assignments.get(tidx.saturating_sub(1)).copied().unwrap_or(0)
                 }).count()
             } else {
                 0
             };
 
-            // Find best palette color using optimized Oklab matching
+            // Find best palette color
             let best_idx = find_best_palette_match_oklab_fast(
                 &avg_oklab,
                 palette,
