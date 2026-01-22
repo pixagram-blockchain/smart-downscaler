@@ -25,6 +25,10 @@ fn main() {
     let mut refinement = true;
     let mut scale: Option<f32> = None;
     let mut palette_strategy = "oklab";
+    
+    // New config defaults
+    let mut k_centroid = 1usize;
+    let mut k_centroid_iterations = 0usize;
 
     let mut i = 1;
     while i < args.len() {
@@ -61,6 +65,14 @@ fn main() {
                 i += 1;
                 palette_strategy = &args[i];
             }
+            "--k-centroid" => {
+                i += 1;
+                k_centroid = args[i].parse().expect("Invalid k-centroid");
+            }
+            "--k-centroid-iterations" => {
+                i += 1;
+                k_centroid_iterations = args[i].parse().expect("Invalid iterations");
+            }
             "--no-refinement" => {
                 refinement = false;
             }
@@ -86,16 +98,12 @@ fn main() {
     let input_path = input_path.expect("Input path required");
     let output_path = output_path.expect("Output path required");
 
-    // Load image
     println!("Loading {}...", input_path.display());
-    let img = image::open(&input_path)
-        .expect("Failed to open input image")
-        .to_rgb8();
+    let img = image::open(&input_path).expect("Failed to open input image").to_rgb8();
 
     let source_width = img.width();
     let source_height = img.height();
 
-    // Determine output dimensions
     let (target_width, target_height) = if let Some(s) = scale {
         (
             ((source_width as f32) * s) as u32,
@@ -108,40 +116,24 @@ fn main() {
         )
     };
 
-    println!(
-        "Downscaling {}x{} -> {}x{} with {} colors",
-        source_width, source_height, target_width, target_height, palette_size
-    );
+    println!("Downscaling {}x{} -> {}x{} with {} colors", source_width, source_height, target_width, target_height, palette_size);
 
-    // Configure segmentation
     let seg_method = match segmentation {
         "none" => SegmentationMethod::None,
         "slic" => SegmentationMethod::Slic(SlicConfig::default()),
         "hierarchy" => SegmentationMethod::Hierarchy(HierarchyConfig::default()),
-        "hierarchy-fast" | "hierarchy_fast" => SegmentationMethod::HierarchyFast {
-            color_threshold: 15.0,
-        },
-        _ => {
-            eprintln!("Unknown segmentation method: {}", segmentation);
-            std::process::exit(1);
-        }
+        "hierarchy-fast" | "hierarchy_fast" => SegmentationMethod::HierarchyFast { color_threshold: 15.0 },
+        _ => { eprintln!("Unknown segmentation method: {}", segmentation); std::process::exit(1); }
     };
 
-    // Configure palette strategy
     let pal_strategy = match palette_strategy {
         "oklab" | "oklab-median-cut" => PaletteStrategy::OklabMedianCut,
         "saturation" | "saturation-weighted" => PaletteStrategy::SaturationWeighted,
         "medoid" => PaletteStrategy::Medoid,
         "kmeans" | "kmeans++" => PaletteStrategy::KMeansPlusPlus,
         "legacy" | "rgb" => PaletteStrategy::LegacyRgb,
-        _ => {
-            eprintln!("Unknown palette strategy: {}", palette_strategy);
-            eprintln!("Valid options: oklab, saturation, medoid, kmeans, legacy");
-            std::process::exit(1);
-        }
+        _ => { eprintln!("Unknown palette strategy: {}", palette_strategy); std::process::exit(1); }
     };
-
-    println!("Using palette strategy: {:?}", pal_strategy);
 
     let config = DownscaleConfig {
         palette_size,
@@ -150,43 +142,21 @@ fn main() {
         two_pass_refinement: refinement,
         segmentation: seg_method,
         palette_strategy: pal_strategy,
+        k_centroid,
+        k_centroid_iterations,
         ..Default::default()
     };
 
-    // Convert pixels
     let pixels: Vec<Rgb> = img.pixels().map(|&p| p.into()).collect();
-
-    // Downscale
     let start = std::time::Instant::now();
-    let result = smart_downscale(
-        &pixels,
-        source_width as usize,
-        source_height as usize,
-        target_width,
-        target_height,
-        &config,
-    );
+    let result = smart_downscale(&pixels, source_width as usize, source_height as usize, target_width, target_height, &config);
     let elapsed = start.elapsed();
 
     println!("Downscaling completed in {:?}", elapsed);
     println!("Palette: {} colors", result.palette.len());
 
-    // Print palette colors
-    println!("Palette colors:");
-    for (i, color) in result.palette.colors.iter().enumerate() {
-        let oklab = color.to_oklab();
-        println!(
-            "  {:2}: RGB({:3}, {:3}, {:3}) - Oklab(L={:.3}, a={:.3}, b={:.3}) chroma={:.3}",
-            i, color.r, color.g, color.b, oklab.l, oklab.a, oklab.b, oklab.chroma()
-        );
-    }
-
-    // Save output
     let output_img = result.to_image();
-    output_img
-        .save(&output_path)
-        .expect("Failed to save output image");
-
+    output_img.save(&output_path).expect("Failed to save output image");
     println!("Saved to {}", output_path.display());
 }
 
@@ -196,34 +166,17 @@ fn print_usage(program: &str) {
 
 Usage: {} [OPTIONS] <INPUT> <OUTPUT>
 
-Arguments:
-  <INPUT>   Input image path
-  <OUTPUT>  Output image path
-
 Options:
   -w, --width <WIDTH>           Output width in pixels
   -h, --height <HEIGHT>         Output height in pixels
-  -s, --scale <SCALE>           Scale factor (e.g., 0.25 for quarter size)
+  -s, --scale <SCALE>           Scale factor
   -p, --palette <SIZE>          Palette size (default: 16)
   -n, --neighbor-weight <W>     Neighbor coherence weight (default: 0.3)
-  -r, --region-weight <W>       Region coherence weight (default: 0.2)
-  --segmentation <METHOD>       Segmentation method: none, slic, hierarchy, hierarchy-fast
-                                (default: hierarchy)
-  --palette-strategy <STRATEGY> Palette extraction strategy:
-                                  oklab      - Oklab median cut (default, best quality)
-                                  saturation - Preserve saturated colors
-                                  medoid     - Use exact image colors only
-                                  kmeans     - K-Means++ only
-                                  legacy     - RGB median cut (causes desaturation)
+  --segmentation <METHOD>       none, slic, hierarchy, hierarchy-fast
+  --palette-strategy <STRATEGY> oklab, saturation, medoid, kmeans
+  --k-centroid <MODE>           1=Avg, 2=Dominant, 3=Foremost (default: 1)
+  --k-centroid-iterations <N>   Iterations for k-centroid (default: 0)
   --no-refinement               Disable two-pass refinement
   --help                        Show this help message
-
-Examples:
-  {} input.png output.png -w 64 -h 64 -p 32
-  {} input.png output.png -s 0.125 --segmentation slic
-  {} large.jpg pixel.png -w 128 -h 128 -p 16 --neighbor-weight 0.5
-  {} input.png output.png -w 64 -h 64 --palette-strategy saturation
-"#,
-        program, program, program, program, program
-    );
+"#, program);
 }

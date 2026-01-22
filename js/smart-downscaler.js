@@ -1,9 +1,7 @@
 /**
  * Smart Pixel Art Downscaler - JavaScript API
- * 
- * High-level wrapper around the WebAssembly module for easy browser usage.
- * 
- * Version 0.3 - Performance optimizations with preprocessing
+ * * High-level wrapper around the WebAssembly module for easy browser usage.
+ * * Version 0.3.1 - Performance optimizations with Direct LUT Preprocessing
  */
 
 let wasm = null;
@@ -38,7 +36,9 @@ export async function init(input) {
  * @property {number} [hierarchyThreshold=15] - Hierarchy merge threshold
  * @property {number} [hierarchyMinSize=4] - Minimum region size
  * @property {number} [maxResolutionMp=1.5] - Max megapixels before downscale preprocessing (0 = disabled)
- * @property {number} [maxColorPreprocess=16384] - Max unique colors before quantize preprocessing (0 = disabled)
+ * @property {number} [maxColorPreprocess=16384] - Max unique colors before LUT quantization (0 = disabled)
+ * @property {number} [kCentroid=1] - Tile centroid mode: 1=Avg, 2=Dominant, 3=Foremost
+ * @property {number} [kCentroidIterations=0] - Iterations for tile centroid refinement
  */
 
 /**
@@ -73,9 +73,13 @@ function createConfig(options = {}) {
   if (options.hierarchyThreshold !== undefined) config.hierarchy_threshold = options.hierarchyThreshold;
   if (options.hierarchyMinSize !== undefined) config.hierarchy_min_size = options.hierarchyMinSize;
   
-  // New preprocessing options
+  // Preprocessing options
   if (options.maxResolutionMp !== undefined) config.max_resolution_mp = options.maxResolutionMp;
   if (options.maxColorPreprocess !== undefined) config.max_color_preprocess = options.maxColorPreprocess;
+
+  // K-Centroid options
+  if (options.kCentroid !== undefined) config.k_centroid = options.kCentroid;
+  if (options.kCentroidIterations !== undefined) config.k_centroid_iterations = options.kCentroidIterations;
   
   return config;
 }

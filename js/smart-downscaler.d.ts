@@ -1,7 +1,6 @@
 /**
  * Smart Pixel Art Downscaler - TypeScript Definitions
- * 
- * Version 0.3 - Performance optimizations with preprocessing
+ * * Version 0.3.1 - Performance optimizations with Direct LUT Preprocessing
  * - Resolution capping (max_resolution_mp: 1.5)
  * - Color pre-quantization (max_color_preprocess: 16384)
  */
@@ -23,8 +22,7 @@ export interface DownscaleOptions {
   edgeWeight?: number;
   /** Segmentation method (default: 'hierarchy_fast') */
   segmentation?: 'none' | 'slic' | 'hierarchy' | 'hierarchy_fast';
-  /** 
-   * Palette extraction strategy (default: 'oklab')
+  /** * Palette extraction strategy (default: 'oklab')
    * - 'oklab': Best general quality, uses Oklab color space
    * - 'saturation': Preserves vibrant/saturated colors
    * - 'medoid': Uses only exact colors from the source image
@@ -47,16 +45,24 @@ export interface DownscaleOptions {
    */
   maxResolutionMp?: number;
   /**
-   * Maximum unique colors for preprocessing (default: 16384)
-   * Images with more unique colors will be pre-quantized before processing.
-   * Set higher for better quality, lower for faster processing.
-   */
-  maxColorPreprocess?: number;
-  /**
    * Maximum unique colors for preprocessing (default: 16384, 0 = disabled)
-   * Reduces color count before processing for faster palette extraction.
+   * Images with more unique colors will be pre-quantized using a Direct LUT.
+   * This drastically speeds up processing by reducing the number of Oklab conversions.
    */
   maxColorPreprocess?: number;
+  
+  /**
+   * K-Means centroid mode for tile color extraction (default: 1)
+   * - 1: Average (Disabled) - Simple average of all pixels in tile
+   * - 2: Dominant - Average of the dominant color cluster
+   * - 3: Foremost - Average of the foremost dominant part
+   */
+  kCentroid?: number;
+  
+  /** * Iterations for k-centroid tile refinement (default: 0) 
+   * Higher values give cleaner colors but are slower.
+   */
+  kCentroidIterations?: number;
 }
 
 export interface DownscaleResult {
@@ -82,8 +88,7 @@ export type DownscalePreset = 'fast' | 'quality' | 'vibrant' | 'exact_colors';
 
 /**
  * Palette extraction strategy
- * 
- * - 'oklab': Median cut in Oklab color space (default, best quality)
+ * * - 'oklab': Median cut in Oklab color space (default, best quality)
  * - 'saturation': Weighted to preserve saturated/vibrant colors
  * - 'medoid': Returns only exact colors from the source image
  * - 'kmeans': K-Means++ clustering only
@@ -132,10 +137,10 @@ export function downscaleSimple(
  * @param targetWidth Output width
  * @param targetHeight Output height
  * @param preset Configuration preset:
- *   - 'fast': Speed optimized (maxResolutionMp: 1.0, maxColorPreprocess: 8192)
- *   - 'quality': Best results (maxResolutionMp: 2.0, maxColorPreprocess: 32768)
- *   - 'vibrant': Preserves saturated colors (maxResolutionMp: 1.5, maxColorPreprocess: 16384)
- *   - 'exact_colors': Uses only source image colors
+ * - 'fast': Speed optimized (maxResolutionMp: 1.0, maxColorPreprocess: 8192)
+ * - 'quality': Best results (maxResolutionMp: 2.0, maxColorPreprocess: 32768)
+ * - 'vibrant': Preserves saturated colors (maxResolutionMp: 1.5, maxColorPreprocess: 16384)
+ * - 'exact_colors': Uses only source image colors
  * @param paletteSize Optional palette size override
  */
 export function downscalePreset(
@@ -296,35 +301,29 @@ export interface ColorAnalysisResult {
 
 /**
  * Analyze colors in an image
- * 
- * Extracts unique colors with counts and percentages. Stops early if
+ * * Extracts unique colors with counts and percentages. Stops early if
  * unique colors exceed maxColors limit (returns success=false).
- * 
- * @param imageData - RGBA pixel data (Uint8Array or Uint8ClampedArray)
+ * * @param imageData - RGBA pixel data (Uint8Array or Uint8ClampedArray)
  * @param maxColors - Maximum unique colors to track (stops if exceeded)
  * @param sortMethod - How to sort the results:
- *   - 'frequency': Most common colors first
- *   - 'morton': Z-order curve (clusters similar colors)
- *   - 'hilbert': Hilbert curve (best color clustering)
- * 
- * @returns ColorAnalysisResult with color array if successful
- * 
- * @example
+ * - 'frequency': Most common colors first
+ * - 'morton': Z-order curve (clusters similar colors)
+ * - 'hilbert': Hilbert curve (best color clustering)
+ * * @returns ColorAnalysisResult with color array if successful
+ * * @example
  * ```javascript
  * // Analyze with limit of 256 colors, sorted by frequency
  * const result = analyzeColors(imageData.data, 256, 'frequency');
- * 
- * if (result.success) {
- *   console.log(`Found ${result.colorCount} unique colors`);
- *   const colors = result.toJson();
- *   colors.forEach(c => {
- *     console.log(`${c.hex}: ${c.percentage.toFixed(2)}%`);
- *   });
+ * * if (result.success) {
+ * console.log(`Found ${result.colorCount} unique colors`);
+ * const colors = result.toJson();
+ * colors.forEach(c => {
+ * console.log(`${c.hex}: ${c.percentage.toFixed(2)}%`);
+ * });
  * } else {
- *   console.log('Too many colors (> 256)');
+ * console.log('Too many colors (> 256)');
  * }
- * 
- * // For palette visualization, use Hilbert sorting
+ * * // For palette visualization, use Hilbert sorting
  * const sorted = analyzeColors(imageData.data, 64, 'hilbert');
  * ```
  */

@@ -98,7 +98,7 @@ pub mod wasm;
 // Re-export main types and functions for convenience
 pub use color::{Lab, LinearRgb, Oklab, Rgb};
 pub use downscale::{
-    graph_cut_refinement, smart_downscale, smart_downscale_with_palette,
+    smart_downscale, smart_downscale_with_palette,
     DownscaleConfig, DownscaleResult, SegmentationMethod,
 };
 pub use edge::{compute_combined_edges, compute_edge_map, EdgeMap};

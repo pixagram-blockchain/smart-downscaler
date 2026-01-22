@@ -1,6 +1,4 @@
 //! WebAssembly bindings for smart-downscaler.
-//!
-//! Provides a JavaScript-friendly API for browser and Node.js usage.
 
 #![cfg(feature = "wasm")]
 
@@ -9,90 +7,68 @@ use js_sys::{Uint8Array, Uint8ClampedArray};
 use serde::{Deserialize, Serialize};
 
 use crate::color::Rgb;
-use crate::downscale::{smart_downscale, DownscaleConfig, SegmentationMethod};
+use crate::downscale::{smart_downscale, DownscaleConfig, SegmentationMethod, smart_downscale_with_palette};
 use crate::hierarchy::HierarchyConfig;
 use crate::palette::{extract_palette_with_strategy, Palette, PaletteStrategy};
 use crate::slic::SlicConfig;
 
-/// Initialize panic hook for better error messages in browser console
 #[wasm_bindgen(start)]
-pub fn init() {
-    // Panic hook initialization would go here if console_error_panic_hook was enabled
-}
+pub fn init() {}
 
-/// Configuration options for the downscaler (JavaScript-compatible)
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[wasm_bindgen]
 pub struct WasmDownscaleConfig {
-    /// Number of colors in the output palette (default: 16)
     pub palette_size: usize,
-    /// K-Means iterations for palette refinement (default: 5)
     pub kmeans_iterations: usize,
-    /// Weight for neighbor color coherence [0.0, 1.0] (default: 0.3)
     pub neighbor_weight: f32,
-    /// Weight for region membership coherence [0.0, 1.0] (default: 0.2)
     pub region_weight: f32,
-    /// Enable two-pass refinement (default: true)
     pub two_pass_refinement: bool,
-    /// Maximum refinement iterations (default: 3)
     pub refinement_iterations: usize,
-    /// Edge weight in tile color computation (default: 0.5)
     pub edge_weight: f32,
-    /// Segmentation method: "none", "slic", "hierarchy", "hierarchy_fast" (default: "hierarchy_fast")
     segmentation_method: String,
-    /// Palette strategy: "oklab", "saturation", "medoid", "kmeans", "legacy", "bitmask" (default: "oklab")
     palette_strategy: String,
-    /// For SLIC: approximate number of superpixels (default: 100)
     pub slic_superpixels: usize,
-    /// For SLIC: compactness factor (default: 10.0)
     pub slic_compactness: f32,
-    /// For hierarchy: merge threshold (default: 15.0)
     pub hierarchy_threshold: f32,
-    /// For hierarchy: minimum region size (default: 4)
     pub hierarchy_min_size: usize,
-    /// Maximum resolution in megapixels for preprocessing (default: 1.5, 0 = disabled)
+    
+    // Performance settings
     pub max_resolution_mp: f32,
-    /// Maximum unique colors for preprocessing (default: 16384, 0 = disabled)
     pub max_color_preprocess: usize,
-    /// Number of K-Means clusters for local tile refinement (0 or 1 = disabled, average only)
-    pub tile_kmeans_clusters: usize,
-    /// Number of K-Means iterations for local tile refinement
-    pub tile_kmeans_iterations: usize,
+    
+    /// K-Means centroid mode (1=Avg, 2=Dom, 3=Foremost)
+    pub k_centroid: usize,
+    /// Iterations for tile centroid
+    pub k_centroid_iterations: usize,
 }
 
 #[wasm_bindgen]
 impl WasmDownscaleConfig {
-    /// Create a new configuration with default values
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Set the segmentation method
     #[wasm_bindgen(setter)]
     pub fn set_segmentation_method(&mut self, method: String) {
         self.segmentation_method = method;
     }
 
-    /// Get the segmentation method
     #[wasm_bindgen(getter)]
     pub fn segmentation_method(&self) -> String {
         self.segmentation_method.clone()
     }
 
-    /// Set the palette extraction strategy
     #[wasm_bindgen(setter)]
     pub fn set_palette_strategy(&mut self, strategy: String) {
         self.palette_strategy = strategy;
     }
 
-    /// Get the palette extraction strategy
     #[wasm_bindgen(getter)]
     pub fn palette_strategy(&self) -> String {
         self.palette_strategy.clone()
     }
 
-    /// Create configuration optimized for speed
     #[wasm_bindgen]
     pub fn fast() -> Self {
         Self {
@@ -109,14 +85,13 @@ impl WasmDownscaleConfig {
             slic_compactness: 10.0,
             hierarchy_threshold: 20.0,
             hierarchy_min_size: 4,
-            max_resolution_mp: 1.0,  // Aggressive resolution cap for speed
+            max_resolution_mp: 1.0, 
             max_color_preprocess: 8192,
-            tile_kmeans_clusters: 0,
-            tile_kmeans_iterations: 0,
+            k_centroid: 1, // Disabled (Avg)
+            k_centroid_iterations: 0,
         }
     }
 
-    /// Create configuration optimized for quality
     #[wasm_bindgen]
     pub fn quality() -> Self {
         Self {
@@ -133,14 +108,13 @@ impl WasmDownscaleConfig {
             slic_compactness: 10.0,
             hierarchy_threshold: 15.0,
             hierarchy_min_size: 8,
-            max_resolution_mp: 2.0,  // Higher resolution for quality
+            max_resolution_mp: 2.0,
             max_color_preprocess: 32768,
-            tile_kmeans_clusters: 2, // Enable local clustering for cleaner edges
-            tile_kmeans_iterations: 3,
+            k_centroid: 2, // Enabled (Dominant)
+            k_centroid_iterations: 3,
         }
     }
 
-    /// Create configuration optimized for vibrant colors
     #[wasm_bindgen]
     pub fn vibrant() -> Self {
         Self {
@@ -159,17 +133,16 @@ impl WasmDownscaleConfig {
             hierarchy_min_size: 4,
             max_resolution_mp: 1.6,
             max_color_preprocess: 16384,
-            tile_kmeans_clusters: 2,
-            tile_kmeans_iterations: 2,
+            k_centroid: 2,
+            k_centroid_iterations: 2,
         }
     }
 
-    /// Create configuration that uses only exact image colors (medoid)
     #[wasm_bindgen]
     pub fn exact_colors() -> Self {
         Self {
             palette_size: 16,
-            kmeans_iterations: 0,  // No refinement to keep exact colors
+            kmeans_iterations: 0,
             neighbor_weight: 0.3,
             region_weight: 0.2,
             two_pass_refinement: true,
@@ -183,8 +156,8 @@ impl WasmDownscaleConfig {
             hierarchy_min_size: 4,
             max_resolution_mp: 1.6,
             max_color_preprocess: 16384,
-            tile_kmeans_clusters: 0,
-            tile_kmeans_iterations: 0,
+            k_centroid: 1, // Disabled
+            k_centroid_iterations: 0,
         }
     }
 }
@@ -207,8 +180,8 @@ impl Default for WasmDownscaleConfig {
             hierarchy_min_size: 4,
             max_resolution_mp: 1.5,
             max_color_preprocess: 16384,
-            tile_kmeans_clusters: 0,
-            tile_kmeans_iterations: 0,
+            k_centroid: 1,
+            k_centroid_iterations: 0,
         }
     }
 }
@@ -256,99 +229,50 @@ impl WasmDownscaleConfig {
             palette_strategy,
             max_resolution_mp: self.max_resolution_mp,
             max_color_preprocess: self.max_color_preprocess,
-            tile_kmeans_clusters: self.tile_kmeans_clusters,
-            tile_kmeans_iterations: self.tile_kmeans_iterations,
+            k_centroid: self.k_centroid,
+            k_centroid_iterations: self.k_centroid_iterations,
         }
     }
 }
 
-/// Result of downscaling operation
 #[wasm_bindgen]
 pub struct WasmDownscaleResult {
-    /// Output width
     width: u32,
-    /// Output height
     height: u32,
-    /// RGBA pixel data
     data: Vec<u8>,
-    /// Palette colors (RGB, 3 bytes per color)
     palette: Vec<u8>,
-    /// Palette indices for each output pixel
     indices: Vec<u8>,
 }
 
 #[wasm_bindgen]
 impl WasmDownscaleResult {
-    /// Get output width
     #[wasm_bindgen(getter)]
-    pub fn width(&self) -> u32 {
-        self.width
-    }
+    pub fn width(&self) -> u32 { self.width }
 
-    /// Get output height
     #[wasm_bindgen(getter)]
-    pub fn height(&self) -> u32 {
-        self.height
-    }
+    pub fn height(&self) -> u32 { self.height }
 
-    /// Get RGBA pixel data as Uint8ClampedArray (for ImageData)
     #[wasm_bindgen(getter)]
     pub fn data(&self) -> Uint8ClampedArray {
         Uint8ClampedArray::from(&self.data[..])
     }
-
-    /// Get RGB pixel data as Uint8Array (without alpha)
+    
     #[wasm_bindgen]
     pub fn rgb_data(&self) -> Uint8Array {
-        let rgb: Vec<u8> = self.data
-            .chunks(4)
-            .flat_map(|chunk| [chunk[0], chunk[1], chunk[2]])
-            .collect();
+        let rgb: Vec<u8> = self.data.chunks(4).flat_map(|c| [c[0],c[1],c[2]]).collect();
         Uint8Array::from(&rgb[..])
     }
 
-    /// Get palette as Uint8Array (RGB, 3 bytes per color)
     #[wasm_bindgen(getter)]
-    pub fn palette(&self) -> Uint8Array {
-        Uint8Array::from(&self.palette[..])
-    }
+    pub fn palette(&self) -> Uint8Array { Uint8Array::from(&self.palette[..]) }
 
-    /// Get palette indices for each pixel
     #[wasm_bindgen(getter)]
-    pub fn indices(&self) -> Uint8Array {
-        Uint8Array::from(&self.indices[..])
-    }
-
-    /// Get number of colors in palette
+    pub fn indices(&self) -> Uint8Array { Uint8Array::from(&self.indices[..]) }
+    
     #[wasm_bindgen(getter)]
-    pub fn palette_size(&self) -> usize {
-        self.palette.len() / 3
-    }
-
-    /// Get palette color at index as [r, g, b]
-    #[wasm_bindgen]
-    pub fn get_palette_color(&self, index: usize) -> Uint8Array {
-        let start = index * 3;
-        if start + 3 <= self.palette.len() {
-            Uint8Array::from(&self.palette[start..start + 3])
-        } else {
-            Uint8Array::new_with_length(3)
-        }
-    }
+    pub fn palette_size(&self) -> usize { self.palette.len() / 3 }
 }
 
-/// Main downscaling function for WebAssembly
-///
-/// # Arguments
-/// * `image_data` - RGBA pixel data as Uint8Array or Uint8ClampedArray
-/// * `width` - Source image width
-/// * `height` - Source image height
-/// * `target_width` - Output image width
-/// * `target_height` - Output image height
-/// * `config` - Optional configuration (uses defaults if not provided)
-///
-/// # Returns
-/// WasmDownscaleResult containing the downscaled image data
 #[wasm_bindgen]
 pub fn downscale(
     image_data: &Uint8Array,
@@ -359,12 +283,12 @@ pub fn downscale(
     config: Option<WasmDownscaleConfig>,
 ) -> Result<WasmDownscaleResult, JsValue> {
     let config = config.unwrap_or_default();
-    
-    // Convert input data to RGB pixels
     let data = image_data.to_vec();
-    let pixels = rgba_to_rgb(&data)?;
+    
+    // Check RGBA
+    if data.len() % 4 != 0 { return Err(JsValue::from_str("Input must be RGBA")); }
+    let pixels: Vec<Rgb> = data.chunks(4).map(|c| Rgb::new(c[0],c[1],c[2])).collect();
 
-    // Run downscaler
     let internal_config = config.to_internal();
     let result = smart_downscale(
         &pixels,
@@ -375,16 +299,9 @@ pub fn downscale(
         &internal_config,
     );
 
-    // Convert output to RGBA
-    let rgba_data = rgb_to_rgba(&result.pixels);
-    let palette_data: Vec<u8> = result.palette.colors
-        .iter()
-        .flat_map(|c| [c.r, c.g, c.b])
-        .collect();
-    let indices: Vec<u8> = result.palette_indices
-        .iter()
-        .map(|&i| i as u8)
-        .collect();
+    let rgba_data = result.to_rgba_bytes();
+    let palette_data = result.to_rgb_bytes();
+    let indices: Vec<u8> = result.palette_indices.iter().map(|&i| i as u8).collect();
 
     Ok(WasmDownscaleResult {
         width: result.width,
@@ -395,7 +312,6 @@ pub fn downscale(
     })
 }
 
-/// Downscale with RGBA input directly from ImageData
 #[wasm_bindgen]
 pub fn downscale_rgba(
     image_data: &Uint8ClampedArray,
@@ -409,12 +325,58 @@ pub fn downscale_rgba(
     downscale(&data, width, height, target_width, target_height, config)
 }
 
+#[wasm_bindgen]
+pub fn downscale_with_palette(
+    image_data: &Uint8Array,
+    width: u32,
+    height: u32,
+    target_width: u32,
+    target_height: u32,
+    palette_data: &Uint8Array,
+    config: Option<WasmDownscaleConfig>,
+) -> Result<WasmDownscaleResult, JsValue> {
+    let config = config.unwrap_or_default();
+    let data = image_data.to_vec();
+    
+    if data.len() % 4 != 0 { return Err(JsValue::from_str("Input must be RGBA")); }
+    let pixels: Vec<Rgb> = data.chunks(4).map(|c| Rgb::new(c[0],c[1],c[2])).collect();
+
+    let pal_vec = palette_data.to_vec();
+    if pal_vec.len() % 3 != 0 { return Err(JsValue::from_str("Palette must be RGB")); }
+    let colors: Vec<Rgb> = pal_vec.chunks(3).map(|c| Rgb::new(c[0],c[1],c[2])).collect();
+    // CHANGED: Use Palette::new instead of Palette::from_colors
+    let palette = Palette::new(colors);
+
+    let internal_config = config.to_internal();
+    let result = smart_downscale_with_palette(
+        &pixels,
+        width as usize,
+        height as usize,
+        target_width,
+        target_height,
+        palette, // PASSING BY VALUE, NO REFERENCE
+        &internal_config,
+    );
+
+    let rgba_data = result.to_rgba_bytes();
+    let palette_data = result.to_rgb_bytes();
+    let indices: Vec<u8> = result.palette_indices.iter().map(|&i| i as u8).collect();
+
+    Ok(WasmDownscaleResult {
+        width: result.width,
+        height: result.height,
+        data: rgba_data,
+        palette: palette_data,
+        indices,
+    })
+}
+
 /// Extract a color palette from an image without downscaling
 #[wasm_bindgen]
 pub fn extract_palette_from_image(
     image_data: &Uint8Array,
-    _width: u32,
-    _height: u32,
+    _width: u32,  // Prefix with underscore
+    _height: u32, // Prefix with underscore
     num_colors: usize,
     kmeans_iterations: usize,
     strategy: Option<String>,
@@ -464,6 +426,7 @@ pub fn quantize_to_palette(
         .map(|chunk| Rgb::new(chunk[0], chunk[1], chunk[2]))
         .collect();
 
+    // CHANGED: Use Palette::new instead of Palette::from_colors
     let palette = Palette::new(palette_colors);
 
     // Quantize each pixel using Oklab for better perceptual matching
@@ -493,65 +456,6 @@ pub fn quantize_to_palette(
     Ok(WasmDownscaleResult {
         width,
         height,
-        data: rgba_data,
-        palette: palette_data,
-        indices,
-    })
-}
-
-/// Downscale with a pre-defined palette
-#[wasm_bindgen]
-pub fn downscale_with_palette(
-    image_data: &Uint8Array,
-    width: u32,
-    height: u32,
-    target_width: u32,
-    target_height: u32,
-    palette_data: &Uint8Array,
-    config: Option<WasmDownscaleConfig>,
-) -> Result<WasmDownscaleResult, JsValue> {
-    let config = config.unwrap_or_default();
-    let data = image_data.to_vec();
-    let pixels = rgba_to_rgb(&data)?;
-
-    // Parse palette
-    let palette_bytes = palette_data.to_vec();
-    if palette_bytes.len() % 3 != 0 {
-        return Err(JsValue::from_str("Palette data must be RGB (3 bytes per color)"));
-    }
-
-    let palette_colors: Vec<Rgb> = palette_bytes
-        .chunks(3)
-        .map(|chunk| Rgb::new(chunk[0], chunk[1], chunk[2]))
-        .collect();
-
-    let palette = Palette::new(palette_colors);
-
-    // Run downscaler with provided palette
-    let internal_config = config.to_internal();
-    let result = crate::downscale::smart_downscale_with_palette(
-        &pixels,
-        width as usize,
-        height as usize,
-        target_width,
-        target_height,
-        palette,
-        &internal_config,
-    );
-
-    let rgba_data = rgb_to_rgba(&result.pixels);
-    let palette_data: Vec<u8> = result.palette.colors
-        .iter()
-        .flat_map(|c| [c.r, c.g, c.b])
-        .collect();
-    let indices: Vec<u8> = result.palette_indices
-        .iter()
-        .map(|&i| i as u8)
-        .collect();
-
-    Ok(WasmDownscaleResult {
-        width: result.width,
-        height: result.height,
         data: rgba_data,
         palette: palette_data,
         indices,
