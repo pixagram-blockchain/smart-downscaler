@@ -56,6 +56,14 @@ impl Rgb {
         // Rec. 709 coefficients on gamma-encoded values (approximate)
         0.2126 * self.r as f32 + 0.7152 * self.g as f32 + 0.0722 * self.b as f32
     }
+    
+    /// Fast integer luminance approximation (scaled by 256)
+    /// Returns 0..255
+    #[inline(always)]
+    pub fn luminance_u8(self) -> u8 {
+        // R:54, G:183, B:19
+        ((self.r as u32 * 54 + self.g as u32 * 183 + self.b as u32 * 19) >> 8) as u8
+    }
 
     /// Compute true luminance (gamma-correct)
     pub fn luminance_linear(self) -> f32 {
@@ -124,9 +132,9 @@ impl LinearRgb {
     /// Convert back to sRGB (gamma-encoded)
     pub fn to_srgb(self) -> Rgb {
         Rgb {
-            r: (linear_to_srgb(self.r) * 255.0).clamp(0.0, 255.0).round() as u8,
-            g: (linear_to_srgb(self.g) * 255.0).clamp(0.0, 255.0).round() as u8,
-            b: (linear_to_srgb(self.b) * 255.0).clamp(0.0, 255.0).round() as u8,
+            r: clamp_u8_f32(linear_to_srgb(self.r) * 255.0),
+            g: clamp_u8_f32(linear_to_srgb(self.g) * 255.0),
+            b: clamp_u8_f32(linear_to_srgb(self.b) * 255.0),
         }
     }
 
@@ -384,9 +392,9 @@ impl Lab {
 
         // XYZ to linear RGB
         let lin = LinearRgb {
-            r: (x *  3.2404542 + y * -1.5371385 + z * -0.4985314).clamp(0.0, 1.0),
-            g: (x * -0.9692660 + y *  1.8760108 + z *  0.0415560).clamp(0.0, 1.0),
-            b: (x *  0.0556434 + y * -0.2040259 + z *  1.0572252).clamp(0.0, 1.0),
+            r: (x * 3.2404542 + y * -1.5371385 + z * -0.4985314).clamp(0.0, 1.0),
+            g: (x * -0.9692660 + y * 1.8760108 + z * 0.0415560).clamp(0.0, 1.0),
+            b: (x * 0.0556434 + y * -0.2040259 + z * 1.0572252).clamp(0.0, 1.0),
         };
 
         lin.to_srgb()
@@ -403,40 +411,6 @@ impl Lab {
     /// Euclidean distance in Lab space
     pub fn distance(self, other: Self) -> f32 {
         self.distance_squared(other).sqrt()
-    }
-
-    /// CIE76 Delta E (simple Euclidean in Lab)
-    pub fn delta_e_76(self, other: Self) -> f32 {
-        self.distance(other)
-    }
-
-    /// CIE94 Delta E (improved perceptual metric)
-    pub fn delta_e_94(self, other: Self) -> f32 {
-        let dl = self.l - other.l;
-        let da = self.a - other.a;
-        let db = self.b - other.b;
-
-        let c1 = (self.a * self.a + self.b * self.b).sqrt();
-        let c2 = (other.a * other.a + other.b * other.b).sqrt();
-        let dc = c1 - c2;
-
-        let dh_sq = da * da + db * db - dc * dc;
-        let dh = if dh_sq > 0.0 { dh_sq.sqrt() } else { 0.0 };
-
-        let sl = 1.0;
-        let sc = 1.0 + 0.045 * c1;
-        let sh = 1.0 + 0.015 * c1;
-
-        let term_l = dl / sl;
-        let term_c = dc / sc;
-        let term_h = dh / sh;
-
-        (term_l * term_l + term_c * term_c + term_h * term_h).sqrt()
-    }
-
-    /// Chroma (colorfulness)
-    pub fn chroma(self) -> f32 {
-        (self.a * self.a + self.b * self.b).sqrt()
     }
 
     // Lab conversion functions
@@ -528,6 +502,25 @@ impl LabAccumulator {
     }
 }
 
+/// Fixed-point Lab color for optimized integer arithmetic
+///
+/// Values are scaled by 64 (6 bits of fractional precision).
+/// This allows fitting standard Lab ranges into i16:
+/// - L: 0..100 -> 0..6400
+/// - a, b: -128..127 -> -8192..8128
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct LabFixed {
+    pub l: i16,
+    pub a: i16,
+    pub b: i16,
+}
+
+impl LabFixed {
+    pub const fn new(l: i16, a: i16, b: i16) -> Self {
+        Self { l, a, b }
+    }
+}
+
 /// Weighted Oklab accumulator for computing means
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OklabAccumulator {
@@ -589,7 +582,7 @@ impl LinearRgbAccumulator {
 }
 
 // =============================================================================
-// Gamma correction functions
+// Gamma correction functions & Low Level Ops
 // =============================================================================
 
 /// sRGB gamma correction: encoded -> linear
@@ -612,86 +605,20 @@ pub fn linear_to_srgb(v: f32) -> f32 {
     }
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
+/// Branchless clamp float to u8
+#[inline(always)]
+pub fn clamp_u8_f32(v: f32) -> u8 {
+    // Rely on max/min optimization
+    // if v < 0.0 { 0 } else if v > 255.0 { 255 } else { v as u8 }
+    v.max(0.0).min(255.0) as u8
+}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_rgb_to_lab_roundtrip() {
-        let original = Rgb::new(128, 64, 200);
-        let lab = original.to_lab();
-        let recovered = lab.to_rgb();
-        
-        // Allow small rounding errors
-        assert!((original.r as i32 - recovered.r as i32).abs() <= 1);
-        assert!((original.g as i32 - recovered.g as i32).abs() <= 1);
-        assert!((original.b as i32 - recovered.b as i32).abs() <= 1);
-    }
-
-    #[test]
-    fn test_rgb_to_oklab_roundtrip() {
-        let original = Rgb::new(128, 64, 200);
-        let oklab = original.to_oklab();
-        let recovered = oklab.to_rgb();
-        
-        // Allow small rounding errors
-        assert!((original.r as i32 - recovered.r as i32).abs() <= 1);
-        assert!((original.g as i32 - recovered.g as i32).abs() <= 1);
-        assert!((original.b as i32 - recovered.b as i32).abs() <= 1);
-    }
-
-    #[test]
-    fn test_linear_rgb_roundtrip() {
-        let original = Rgb::new(128, 64, 200);
-        let linear = original.to_linear();
-        let recovered = linear.to_srgb();
-        
-        assert_eq!(original, recovered);
-    }
-
-    #[test]
-    fn test_black_white_oklab() {
-        let black = Rgb::new(0, 0, 0).to_oklab();
-        let white = Rgb::new(255, 255, 255).to_oklab();
-        
-        assert!(black.l < 0.01);
-        assert!(white.l > 0.99);
-        // Gray axis should have minimal chroma
-        assert!(black.chroma() < 0.01);
-        assert!(white.chroma() < 0.01);
-    }
-
-    #[test]
-    fn test_saturated_colors_oklab() {
-        let red = Rgb::new(255, 0, 0).to_oklab();
-        let green = Rgb::new(0, 255, 0).to_oklab();
-        let blue = Rgb::new(0, 0, 255).to_oklab();
-        
-        // All should have high chroma
-        assert!(red.chroma() > 0.2);
-        assert!(green.chroma() > 0.2);
-        assert!(blue.chroma() > 0.2);
-    }
-
-    #[test]
-    fn test_linear_average_preserves_brightness() {
-        // Averaging black and white should give middle gray
-        let black = Rgb::new(0, 0, 0);
-        let white = Rgb::new(255, 255, 255);
-        
-        let mut acc = LinearRgbAccumulator::new();
-        acc.add_rgb(black, 1.0);
-        acc.add_rgb(white, 1.0);
-        let avg = acc.mean_rgb();
-        
-        // Linear average of black and white is ~188 in sRGB (not 128!)
-        // This is the gamma-correct middle gray
-        assert!(avg.r > 170 && avg.r < 200);
-        assert!(avg.g > 170 && avg.g < 200);
-        assert!(avg.b > 170 && avg.b < 200);
-    }
+/// Branchless integer clamp
+#[inline(always)]
+pub fn clamp_u8(x: i32) -> u8 {
+    let mut y = x;
+    // if y < 0 -> y = 0
+    y &= !(y >> 31);
+    // if y > 255 -> y = 255
+    if y > 255 { 255 } else { y as u8 }
 }

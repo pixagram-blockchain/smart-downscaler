@@ -87,6 +87,7 @@
 pub mod color;
 pub mod downscale;
 pub mod edge;
+pub mod fast;
 pub mod hierarchy;
 pub mod palette;
 pub mod preprocess;

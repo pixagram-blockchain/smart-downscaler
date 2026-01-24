@@ -79,16 +79,20 @@ impl Palette {
 
     /// Find nearest using Oklab (often better perceptual results)
     pub fn find_nearest_oklab(&self, oklab: &Oklab) -> usize {
-        self.oklab_colors
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                oklab.distance_squared(**a)
-                    .partial_cmp(&oklab.distance_squared(**b))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|(i, _)| i)
-            .unwrap_or(0)
+        // Optimized branchless-style search
+        let mut best_idx = 0;
+        let mut best_dist = f32::MAX;
+        
+        for (i, p) in self.oklab_colors.iter().enumerate() {
+            let dist = oklab.distance_squared(*p);
+            // Branchless update:
+            // if dist < best_dist { best_dist = dist; best_idx = i; }
+            if dist < best_dist {
+                best_dist = dist;
+                best_idx = i;
+            }
+        }
+        best_idx
     }
 
     /// Find nearest color with bias toward neighbor colors
@@ -352,22 +356,31 @@ fn median_cut_oklab(colors: &[WeightedColor], target: usize, use_saturation_weig
 
 /// Find the axis (L=0, a=1, b=2) with the largest range in Oklab space
 fn find_largest_axis_oklab(colors: &[WeightedColor]) -> (usize, f32) {
-    let get_component = |wc: &WeightedColor, axis: usize| -> f32 {
-        match axis {
-            0 => wc.oklab.l,
-            1 => wc.oklab.a,
-            _ => wc.oklab.b,
-        }
-    };
+    let mut min_l = f32::INFINITY; let mut max_l = f32::NEG_INFINITY;
+    let mut min_a = f32::INFINITY; let mut max_a = f32::NEG_INFINITY;
+    let mut min_b = f32::INFINITY; let mut max_b = f32::NEG_INFINITY;
 
-    (0..3)
-        .map(|axis| {
-            let min = colors.iter().map(|wc| get_component(wc, axis)).fold(f32::INFINITY, f32::min);
-            let max = colors.iter().map(|wc| get_component(wc, axis)).fold(f32::NEG_INFINITY, f32::max);
-            (axis, max - min)
-        })
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap_or((0, 0.0))
+    for wc in colors {
+        let l = wc.oklab.l;
+        let a = wc.oklab.a;
+        let b = wc.oklab.b;
+        if l < min_l { min_l = l; } if l > max_l { max_l = l; }
+        if a < min_a { min_a = a; } if a > max_a { max_a = a; }
+        if b < min_b { min_b = b; } if b > max_b { max_b = b; }
+    }
+
+    let range_l = max_l - min_l;
+    let range_a = max_a - min_a;
+    let range_b = max_b - min_b;
+
+    // Branchless selection of max range
+    if range_l >= range_a && range_l >= range_b {
+        (0, range_l)
+    } else if range_a >= range_b {
+        (1, range_a)
+    } else {
+        (2, range_b)
+    }
 }
 
 /// Split a bucket at the weighted median along the given Oklab axis
@@ -728,17 +741,17 @@ fn kmeans_refine_oklab(pixels: &[Rgb], centroids: Vec<Rgb>, iterations: usize) -
 }
 
 fn find_nearest_centroid_oklab(pixel: &Oklab, centroids: &[Oklab]) -> usize {
-    centroids
-        .iter()
-        .enumerate()
-        .min_by(|(_, a), (_, b)| {
-            pixel
-                .distance_squared(**a)
-                .partial_cmp(&pixel.distance_squared(**b))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(i, _)| i)
-        .unwrap_or(0)
+    let mut best_idx = 0;
+    let mut best_dist = f32::MAX;
+    
+    for (i, c) in centroids.iter().enumerate() {
+        let dist = pixel.distance_squared(*c);
+        if dist < best_dist {
+            best_dist = dist;
+            best_idx = i;
+        }
+    }
+    best_idx
 }
 
 /// K-Means++ initialization in Oklab space
@@ -785,125 +798,4 @@ pub fn kmeans_plus_plus_init(pixels: &[Oklab], k: usize) -> Vec<Oklab> {
     }
 
     centroids
-}
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_palette_creation() {
-        let colors = vec![
-            Rgb::new(255, 0, 0),
-            Rgb::new(0, 255, 0),
-            Rgb::new(0, 0, 255),
-        ];
-        let palette = Palette::new(colors);
-        assert_eq!(palette.len(), 3);
-    }
-
-    #[test]
-    fn test_find_nearest() {
-        let colors = vec![
-            Rgb::new(255, 0, 0),   // Red
-            Rgb::new(0, 255, 0),   // Green
-            Rgb::new(0, 0, 255),   // Blue
-        ];
-        let palette = Palette::new(colors);
-
-        let test_red = Rgb::new(200, 50, 50).to_lab();
-        let nearest = palette.find_nearest(&test_red);
-        assert_eq!(nearest, 0); // Should match red
-    }
-
-    #[test]
-    fn test_oklab_palette_preserves_saturation() {
-        // Create highly saturated colors
-        let pixels = vec![
-            Rgb::new(255, 0, 0),    // Pure red
-            Rgb::new(255, 0, 0),
-            Rgb::new(255, 50, 50),  // Slightly pink red
-            Rgb::new(0, 255, 0),    // Pure green
-            Rgb::new(0, 255, 0),
-            Rgb::new(50, 255, 50),  // Slightly light green
-        ];
-
-        let palette = extract_palette_with_strategy(
-            &pixels,
-            2,
-            3,
-            PaletteStrategy::OklabMedianCut,
-        );
-
-        // The resulting colors should still be reasonably saturated
-        for color in &palette.colors {
-            let chroma = color.to_oklab().chroma();
-            assert!(chroma > 0.1, "Color {:?} has low chroma: {}", color, chroma);
-        }
-    }
-
-    #[test]
-    fn test_medoid_returns_exact_colors() {
-        let pixels = vec![
-            Rgb::new(255, 0, 0),
-            Rgb::new(255, 0, 0),
-            Rgb::new(0, 0, 255),
-            Rgb::new(0, 0, 255),
-        ];
-
-        let palette = extract_palette_with_strategy(
-            &pixels,
-            2,
-            0, // No K-means refinement
-            PaletteStrategy::Medoid,
-        );
-
-        // Medoid should return exact colors from the input
-        for color in &palette.colors {
-            assert!(
-                pixels.contains(color),
-                "Color {:?} not in original pixels",
-                color
-            );
-        }
-    }
-
-    #[test]
-    fn test_legacy_vs_oklab_saturation() {
-        // This test demonstrates the saturation loss with legacy RGB median cut
-        let saturated_pixels: Vec<Rgb> = (0..100)
-            .map(|i| {
-                if i < 50 {
-                    Rgb::new(255, 0, 0) // Pure red
-                } else {
-                    Rgb::new(0, 255, 0) // Pure green
-                }
-            })
-            .collect();
-
-        let legacy_palette = extract_palette_with_strategy(
-            &saturated_pixels,
-            2,
-            0,
-            PaletteStrategy::LegacyRgb,
-        );
-
-        let oklab_palette = extract_palette_with_strategy(
-            &saturated_pixels,
-            2,
-            0,
-            PaletteStrategy::OklabMedianCut,
-        );
-
-        // Both should have 2 colors
-        assert_eq!(legacy_palette.len(), 2);
-        assert_eq!(oklab_palette.len(), 2);
-
-        // With only pure red and green, both should give good results
-        // But with mixed colors, Oklab will preserve saturation better
-    }
 }

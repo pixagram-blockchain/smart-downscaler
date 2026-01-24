@@ -301,7 +301,9 @@ pub fn downscale(
 
     let rgba_data = result.to_rgba_bytes();
     let palette_data = result.to_rgb_bytes();
-    let indices: Vec<u8> = result.palette_indices.iter().map(|&i| i as u8).collect();
+    
+    // Indices are already u8 in the optimized DownscaleResult
+    let indices = result.palette_indices;
 
     Ok(WasmDownscaleResult {
         width: result.width,
@@ -360,7 +362,8 @@ pub fn downscale_with_palette(
 
     let rgba_data = result.to_rgba_bytes();
     let palette_data = result.to_rgb_bytes();
-    let indices: Vec<u8> = result.palette_indices.iter().map(|&i| i as u8).collect();
+    // Indices are already u8
+    let indices = result.palette_indices;
 
     Ok(WasmDownscaleResult {
         width: result.width,
@@ -643,14 +646,8 @@ impl ColorAnalysisResult {
 /// Compute Morton code (Z-order) for a color
 /// Interleaves bits of R, G, B for space-filling curve ordering
 fn morton_code(r: u8, g: u8, b: u8) -> u32 {
-    fn spread_bits(mut x: u32) -> u32 {
-        x = (x | (x << 16)) & 0x030000FF;
-        x = (x | (x << 8)) & 0x0300F00F;
-        x = (x | (x << 4)) & 0x030C30C3;
-        x = (x | (x << 2)) & 0x09249249;
-        x
-    }
-    spread_bits(r as u32) | (spread_bits(g as u32) << 1) | (spread_bits(b as u32) << 2)
+    use crate::fast::morton_encode_rgb;
+    morton_encode_rgb(r, g, b)
 }
 
 /// Compute Hilbert curve index for a color (8-bit per channel = 256^3 space)

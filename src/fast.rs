@@ -6,15 +6,23 @@
 //! - Histogram-based pre-quantization
 //! - Spatial hashing (voxel grid) for color lookups
 //! - Integer Manhattan distance for edge detection
+//! - Low-level bit operations (Morton codes, Integer Sqrt approximation)
 
-use crate::color::{Lab, Rgb, LabFixed};
+use crate::color::{Rgb, LabFixed}; // FIXED: Removed unused `Lab` import
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 /// Lookup table for sRGB to linear conversion (256 entries)
-static SRGB_TO_LINEAR: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+static SRGB_TO_LINEAR: OnceLock<[f32; 256]> = OnceLock::new();
 
 /// Lookup table for Lab f() function (4096 entries)
-static LAB_F_LUT: std::sync::OnceLock<[f32; 4096]> = std::sync::OnceLock::new();
+static LAB_F_LUT: OnceLock<[f32; 4096]> = OnceLock::new();
+
+/// Lookup table for squared differences (256x256)
+static SQ_DIFF_LUT: OnceLock<[[u16; 256]; 256]> = OnceLock::new();
+
+/// Lookup table for u8 cube root (scaled to 16-bit fixed point)
+static CBRT_LUT: OnceLock<[u16; 256]> = OnceLock::new();
 
 /// D65 illuminant reference white
 pub const XN: f32 = 0.95047;
@@ -51,11 +59,31 @@ pub fn init_luts() {
         }
         lut
     });
+    
+    SQ_DIFF_LUT.get_or_init(|| {
+        let mut lut = [[0u16; 256]; 256];
+        for i in 0..256 {
+            for j in 0..256 {
+                let d = (i as i32 - j as i32).abs();
+                lut[i][j] = (d * d) as u16;
+            }
+        }
+        lut
+    });
+
+    CBRT_LUT.get_or_init(|| {
+        let mut lut = [0u16; 256];
+        for i in 0..256 {
+            // Scale by 256 (8-bit fractional part)
+            lut[i] = ((i as f32).powf(1.0/3.0) * 256.0) as u16;
+        }
+        lut
+    });
 }
 
 /// Fast Lab f() function using LUT
 #[inline(always)]
-fn lab_f_fast(t: f32) -> f32 {
+pub fn lab_f_fast(t: f32) -> f32 {
     let lut = unsafe { LAB_F_LUT.get().unwrap_unchecked() };
     let idx = ((t * 3723.0) as usize).min(4095);
     lut[idx]
@@ -90,33 +118,6 @@ pub fn rgb_to_lab_fixed(rgb: Rgb) -> LabFixed {
 pub fn batch_rgb_to_lab_fixed(pixels: &[Rgb]) -> Vec<LabFixed> {
     init_luts();
     pixels.iter().map(|&p| rgb_to_lab_fixed(p)).collect()
-}
-
-/// Legacy float conversion (kept for compatibility with some modules)
-#[inline]
-pub fn batch_rgb_to_lab(pixels: &[Rgb]) -> Vec<Lab> {
-    init_luts();
-    let lut = unsafe { SRGB_TO_LINEAR.get().unwrap_unchecked() };
-    
-    pixels.iter().map(|rgb| {
-        let r = lut[rgb.r as usize];
-        let g = lut[rgb.g as usize];
-        let b = lut[rgb.b as usize];
-
-        let x = r * 0.4124564 + g * 0.3575761 + b * 0.1804375;
-        let y = r * 0.2126729 + g * 0.7151522 + b * 0.0721750;
-        let z = r * 0.0193339 + g * 0.1191920 + b * 0.9503041;
-
-        let fx = lab_f_fast(x / XN);
-        let fy = lab_f_fast(y / YN);
-        let fz = lab_f_fast(z / ZN);
-
-        Lab {
-            l: 116.0 * fy - 16.0,
-            a: 500.0 * (fx - fy),
-            b: 200.0 * (fy - fz),
-        }
-    }).collect()
 }
 
 /// Deduplicate colors to massively reduce K-Means load
@@ -167,6 +168,80 @@ pub fn get_cell_center_lab(hash: u16) -> LabFixed {
         b: (b_idx as i16 * 1024 - 8192 + 512),
     }
 }
+
+// =============================================================================
+// Low Level Bit Operations
+// =============================================================================
+
+/// Morton Code (Z-Order Curve) Encoding
+/// Interleaves bits of R, G, B for better cache locality in 3D color space
+#[inline(always)]
+pub fn morton_encode_rgb(r: u8, g: u8, b: u8) -> u32 {
+    fn part1by2(mut n: u32) -> u32 {
+        n &= 0x000003ff;
+        n = (n ^ (n << 16)) & 0xff0000ff;
+        n = (n ^ (n <<  8)) & 0x0300f00f;
+        n = (n ^ (n <<  4)) & 0x030c30c3;
+        n = (n ^ (n <<  2)) & 0x09249249;
+        n
+    }
+    part1by2(r as u32) | (part1by2(g as u32) << 1) | (part1by2(b as u32) << 2)
+}
+
+/// Fast Integer Luminance (0..255)
+#[inline(always)]
+pub fn fast_luminance(r: u8, g: u8, b: u8) -> u8 {
+    // Coefficients scaled by 256: R:54, G:183, B:19
+    // Equivalent to 0.2126*R + 0.7152*G + 0.0722*B
+    ((r as u32 * 54 + g as u32 * 183 + b as u32 * 19) >> 8) as u8
+}
+
+/// Approximate 3D Magnitude using bit shifts
+/// |v| ≈ max(|x|,|y|,|z|) + (min1 + min2) / 4 (rough approx)
+/// OR better: max + (min1 + min2) >> 2
+#[inline(always)]
+pub fn approx_sq_mag(dx: i32, dy: i32, dz: i32) -> u32 {
+    let (ax, ay, az) = (dx.abs() as u32, dy.abs() as u32, dz.abs() as u32);
+    // FIXED: Removed unused `max` variable. 
+    // This function actually computes the exact squared sum, not the approximation from the comment.
+    let sum_sq = ax * ax + ay * ay + az * az;
+    sum_sq
+}
+
+/// Alpha Max Plus Beta Min Algorithm for Integer Hypotenuse
+/// |H| ≈ max + min/2
+#[inline(always)]
+pub fn fast_magnitude(gx: i32, gy: i32) -> i32 {
+    let abs_gx = gx.abs();
+    let abs_gy = gy.abs();
+    let min = abs_gx.min(abs_gy);
+    let max = abs_gx.max(abs_gy);
+    max + (min >> 1)
+}
+
+/// Squared difference from LUT
+#[inline(always)]
+pub fn sq_diff_lut(a: u8, b: u8) -> u16 {
+    // Safety: SQ_DIFF_LUT initialized in init_luts()
+    // Since this is critical path, we use unsafe get to skip OnceLock check if we trust initialization
+    unsafe {
+        let lut = SQ_DIFF_LUT.get().unwrap_unchecked();
+        lut[a as usize][b as usize]
+    }
+}
+
+/// Fast Cube Root for u8 using LUT
+#[inline(always)]
+pub fn fast_cbrt_u8(x: u8) -> u16 {
+     unsafe {
+        let lut = CBRT_LUT.get().unwrap_unchecked();
+        lut[x as usize]
+    }
+}
+
+// =============================================================================
+// Edge Detection Optimizations
+// =============================================================================
 
 /// INTEGER EDGE DETECTION: Computes gradient magnitude using Manhattan distance
 /// Avoids sqrt() and f32 entirely.
@@ -258,56 +333,4 @@ pub fn compute_tile_average_fixed(
     } else {
         LabFixed::default()
     }
-}
-
-// Deprecated float functions can be kept or removed
-// Keeping minimal set for compatibility if needed
-#[inline]
-pub fn rgb_to_lab_fast(rgb: Rgb) -> Lab {
-    rgb_to_lab_fixed(rgb).to_lab()
-}
-
-#[inline(always)]
-pub fn lab_distance_sq(a: &Lab, b: &Lab) -> f32 {
-    let dl = a.l - b.l;
-    let da = a.a - b.a;
-    let db = a.b - b.b;
-    dl * dl + da * da + db * db
-}
-
-#[inline]
-pub fn find_nearest_lab(palette_labs: &[Lab], target: &Lab) -> usize {
-    let mut best_idx = 0;
-    let mut best_dist = f32::MAX;
-    for (i, p) in palette_labs.iter().enumerate() {
-        let dist = lab_distance_sq(target, p);
-        if dist < best_dist {
-            best_dist = dist;
-            best_idx = i;
-        }
-    }
-    best_idx
-}
-
-pub fn compute_edges_from_labs(labs: &[Lab], width: usize, height: usize) -> Vec<f32> {
-    let mut edges = vec![0.0f32; width * height];
-    let mut max_value: f32 = 0.0;
-    for y in 1..height.saturating_sub(1) {
-        for x in 1..width.saturating_sub(1) {
-            let idx = y * width + x;
-            let center = &labs[idx];
-            let mut max_diff: f32 = 0.0;
-            let diff = lab_distance_sq(center, &labs[idx - 1]).sqrt(); max_diff = max_diff.max(diff);
-            let diff = lab_distance_sq(center, &labs[idx + 1]).sqrt(); max_diff = max_diff.max(diff);
-            let diff = lab_distance_sq(center, &labs[idx - width]).sqrt(); max_diff = max_diff.max(diff);
-            let diff = lab_distance_sq(center, &labs[idx + width]).sqrt(); max_diff = max_diff.max(diff);
-            edges[idx] = max_diff;
-            max_value = max_value.max(max_diff);
-        }
-    }
-    if max_value > 0.0 {
-        let inv = 1.0 / max_value;
-        for e in edges.iter_mut() { *e *= inv; }
-    }
-    edges
 }

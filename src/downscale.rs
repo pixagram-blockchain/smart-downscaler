@@ -94,7 +94,8 @@ pub struct DownscaleResult {
     /// Palette used
     pub palette: Palette,
     /// Palette indices for each output pixel
-    pub palette_indices: Vec<usize>,
+    /// Optimized to u8 (supports up to 256 colors)
+    pub palette_indices: Vec<u8>,
     /// Optional segmentation data from source image
     pub segmentation: Option<Segmentation>,
 }
@@ -278,7 +279,7 @@ fn smart_downscale_internal(
         }
     }
 
-    let pixels: Vec<Rgb> = assignments.iter().map(|&idx| palette.colors[idx]).collect();
+    let pixels: Vec<Rgb> = assignments.iter().map(|&idx| palette.colors[idx as usize]).collect();
 
     DownscaleResult {
         width: target_width,
@@ -429,7 +430,7 @@ fn initial_assignment_oklab_optimized(
     config: &DownscaleConfig,
     scale_x: f32,
     scale_y: f32,
-) -> (Vec<usize>, Vec<Oklab>) {
+) -> (Vec<u8>, Vec<Oklab>) {
     
     // === OPTIMIZATION: Cache Oklab conversions ===
     // If color reduction was enabled, we likely have ~16k unique colors.
@@ -449,7 +450,7 @@ fn initial_assignment_oklab_optimized(
     let tw = target_width as usize;
     let th = target_height as usize;
 
-    let mut assignments = vec![0usize; tw * th];
+    let mut assignments = vec![0u8; tw * th];
     let mut tile_oklabs = vec![Oklab::default(); tw * th];
     
     let max_segments = segmentation.map(|s| s.num_segments).unwrap_or(0);
@@ -521,14 +522,14 @@ fn initial_assignment_oklab_optimized(
             tile_oklabs[tidx] = avg_oklab;
 
             neighbor_indices.clear();
-            if tx > 0 { neighbor_indices.push(assignments[ty * tw + (tx - 1)]); }
-            if ty > 0 { neighbor_indices.push(assignments[(ty - 1) * tw + tx]); }
-            if tx > 0 && ty > 0 { neighbor_indices.push(assignments[(ty - 1) * tw + (tx - 1)]); }
-            if tx + 1 < tw && ty > 0 { neighbor_indices.push(assignments[(ty - 1) * tw + (tx + 1)]); }
+            if tx > 0 { neighbor_indices.push(assignments[ty * tw + (tx - 1)] as usize); }
+            if ty > 0 { neighbor_indices.push(assignments[(ty - 1) * tw + tx] as usize); }
+            if tx > 0 && ty > 0 { neighbor_indices.push(assignments[(ty - 1) * tw + (tx - 1)] as usize); }
+            if tx + 1 < tw && ty > 0 { neighbor_indices.push(assignments[(ty - 1) * tw + (tx + 1)] as usize); }
 
             let same_region_count = if let (Some(_seg), Some(_dom_seg)) = (segmentation, dominant_segment) {
                 neighbor_indices.iter().filter(|&&n_idx| {
-                    n_idx == assignments.get(tidx.saturating_sub(1)).copied().unwrap_or(0)
+                    n_idx == assignments.get(tidx.saturating_sub(1)).map(|&x| x as usize).unwrap_or(0)
                 }).count()
             } else {
                 0
@@ -543,7 +544,7 @@ fn initial_assignment_oklab_optimized(
                 config.region_weight,
             );
 
-            assignments[tidx] = best_idx;
+            assignments[tidx] = best_idx as u8;
         }
     }
 
@@ -622,7 +623,7 @@ fn find_best_palette_match_oklab_fast(
 }
 
 fn refinement_pass_oklab(
-    assignments: &mut [usize],
+    assignments: &mut [u8],
     tile_oklabs: &[Oklab],
     width: usize,
     height: usize,
@@ -645,7 +646,7 @@ fn refinement_pass_oklab(
                     let ny = y as i32 + dy;
                     if nx >= 0 && ny >= 0 && (nx as usize) < width && (ny as usize) < height {
                         let nidx = ny as usize * width + nx as usize;
-                        neighbor_indices.push(original[nidx]);
+                        neighbor_indices.push(original[nidx] as usize);
                     }
                 }
             }
@@ -657,7 +658,7 @@ fn refinement_pass_oklab(
                 0, 
                 neighbor_weight,
                 0.0,
-            );
+            ) as u8;
 
             if new_idx != assignments[idx] {
                 assignments[idx] = new_idx;

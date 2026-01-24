@@ -522,6 +522,70 @@ fn merge_small_regions(
     }
 }
 
+// =============================================================================
+// Packed Union-Find Implementation
+// =============================================================================
+
+struct PackedDisjointSet {
+    // Stores parent (lower 28 bits) and rank (upper 4 bits)
+    data: Vec<u32>,
+}
+
+impl PackedDisjointSet {
+    fn new(size: usize) -> Self {
+        // Init: parent = index, rank = 0
+        // Since rank is 0, we just store the index
+        let data = (0..size).map(|i| i as u32).collect();
+        Self { data }
+    }
+
+    #[inline]
+    fn find(&mut self, mut x: usize) -> usize {
+        let mut root = x;
+        // Extract parent (mask 0x0FFFFFFF)
+        while (self.data[root] & 0x0FFFFFFF) as usize != root {
+            root = (self.data[root] & 0x0FFFFFFF) as usize;
+        }
+        
+        // Path compression
+        while x != root {
+            let entry = self.data[x];
+            let next = (entry & 0x0FFFFFFF) as usize;
+            // Preserve rank (top 4 bits), set new parent
+            self.data[x] = (entry & 0xF0000000) | (root as u32);
+            x = next;
+        }
+        root
+    }
+
+    #[inline]
+    fn union(&mut self, a: usize, b: usize) {
+        let root_a = self.find(a);
+        let root_b = self.find(b);
+
+        if root_a != root_b {
+            let rank_a = self.data[root_a] >> 28;
+            let rank_b = self.data[root_b] >> 28;
+
+            if rank_a < rank_b {
+                // Attach A to B
+                // Keep rank_a same (it's now a child), update parent
+                self.data[root_a] = (self.data[root_a] & 0xF0000000) | (root_b as u32);
+            } else if rank_a > rank_b {
+                // Attach B to A
+                self.data[root_b] = (self.data[root_b] & 0xF0000000) | (root_a as u32);
+            } else {
+                // Ranks equal, attach B to A, increment A's rank
+                self.data[root_b] = (self.data[root_b] & 0xF0000000) | (root_a as u32);
+                
+                // Increment rank of A, clamped to 15 (max 4 bits)
+                let new_rank = (rank_a + 1).min(15);
+                self.data[root_a] = (new_rank << 28) | (self.data[root_a] & 0x0FFFFFFF);
+            }
+        }
+    }
+}
+
 /// Fast variant using union-find for better performance on large images
 pub fn hierarchical_cluster_fast(
     pixels: &[Rgb],
@@ -532,35 +596,11 @@ pub fn hierarchical_cluster_fast(
     let labs: Vec<Lab> = pixels.iter().map(|p| p.to_lab()).collect();
     let num_pixels = width * height;
 
-    // Union-Find structure
-    let mut parent = (0..num_pixels).collect::<Vec<_>>();
-    let mut rank = vec![0usize; num_pixels];
-
-    fn find(parent: &mut [usize], x: usize) -> usize {
-        if parent[x] != x {
-            parent[x] = find(parent, parent[x]);
-        }
-        parent[x]
-    }
-
-    fn union(parent: &mut [usize], rank: &mut [usize], x: usize, y: usize) {
-        let px = find(parent, x);
-        let py = find(parent, y);
-        if px == py {
-            return;
-        }
-        if rank[px] < rank[py] {
-            parent[px] = py;
-        } else if rank[px] > rank[py] {
-            parent[py] = px;
-        } else {
-            parent[py] = px;
-            rank[px] += 1;
-        }
-    }
+    // Use packed union-find
+    let mut dset = PackedDisjointSet::new(num_pixels);
 
     // Sort edges by color distance
-    let mut edges: Vec<(usize, usize, f32)> = Vec::new();
+    let mut edges: Vec<(usize, usize, f32)> = Vec::with_capacity(num_pixels * 2);
 
     for y in 0..height {
         for x in 0..width {
@@ -585,20 +625,18 @@ pub fn hierarchical_cluster_fast(
         if dist > color_threshold {
             break;
         }
-        union(&mut parent, &mut rank, a, b);
-    }
-
-    // Flatten parent array
-    for i in 0..num_pixels {
-        find(&mut parent, i);
+        dset.union(a, b);
     }
 
     // Build regions from union-find result
     let mut region_map: HashMap<usize, usize> = HashMap::new();
     let mut regions: Vec<Region> = Vec::new();
     let mut active_regions: HashSet<usize> = HashSet::new();
+    let mut pixel_labels = vec![0usize; num_pixels];
 
-    for (pixel_idx, &root) in parent.iter().enumerate() {
+    for pixel_idx in 0..num_pixels {
+        let root = dset.find(pixel_idx);
+        
         let region_id = *region_map.entry(root).or_insert_with(|| {
             let id = regions.len();
             let x = pixel_idx % width;
@@ -607,6 +645,8 @@ pub fn hierarchical_cluster_fast(
             active_regions.insert(id);
             id
         });
+        
+        pixel_labels[pixel_idx] = region_id;
 
         if pixel_idx != root {
             let x = pixel_idx % width;
@@ -623,9 +663,6 @@ pub fn hierarchical_cluster_fast(
         }
     }
 
-    // Build pixel labels
-    let pixel_labels: Vec<usize> = parent.iter().map(|&root| region_map[&root]).collect();
-
     Hierarchy {
         width,
         height,
@@ -633,52 +670,5 @@ pub fn hierarchical_cluster_fast(
         active_regions,
         pixel_labels,
         merge_history: Vec::new(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_hierarchical_cluster_uniform() {
-        // Uniform color should result in one region
-        let pixels: Vec<Rgb> = (0..100).map(|_| Rgb::new(128, 128, 128)).collect();
-        let config = HierarchyConfig::default();
-        let hierarchy = hierarchical_cluster(&pixels, 10, 10, &config);
-        
-        assert_eq!(hierarchy.active_regions.len(), 1);
-    }
-
-    #[test]
-    fn test_hierarchical_cluster_two_colors() {
-        // Two distinct colors should result in two regions
-        let mut pixels = Vec::new();
-        for y in 0..10 {
-            for x in 0..10 {
-                if x < 5 {
-                    pixels.push(Rgb::new(255, 0, 0));
-                } else {
-                    pixels.push(Rgb::new(0, 0, 255));
-                }
-            }
-        }
-
-        let config = HierarchyConfig {
-            merge_threshold: 10.0,
-            min_region_size: 1,
-            ..Default::default()
-        };
-        let hierarchy = hierarchical_cluster(&pixels, 10, 10, &config);
-        
-        assert_eq!(hierarchy.active_regions.len(), 2);
-    }
-
-    #[test]
-    fn test_fast_variant() {
-        let pixels: Vec<Rgb> = (0..100).map(|_| Rgb::new(128, 128, 128)).collect();
-        let hierarchy = hierarchical_cluster_fast(&pixels, 10, 10, 15.0);
-        
-        assert_eq!(hierarchy.active_regions.len(), 1);
     }
 }

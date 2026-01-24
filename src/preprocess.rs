@@ -9,6 +9,8 @@
 
 use crate::color::Rgb;
 
+// REMOVED: llvm.memset definition (caused E0658)
+
 /// Preprocessing configuration
 #[derive(Clone, Debug)]
 pub struct PreprocessConfig {
@@ -181,41 +183,40 @@ pub fn fast_color_quantize_lut(
     // Index = R<<16 | G<<8 | B. Value = Palette Index (or 0xFFFFFFFF if empty)
     // Size = 16,777,216 entries * 4 bytes = 64 MB.
     let mut lut = vec![0xFFFFFFFFu32; 1 << 24]; 
+    
+    // FIXED: Use standard fill instead of llvm intrinsic
+    // This is safe and highly optimized by the compiler
+    lut.fill(0xFFFFFFFF);
+
     let mut unique_colors = Vec::with_capacity(max_colors + 100);
-    let mut indices = Vec::with_capacity(pixels.len());
     let mut overflow = false;
     let mut original_unique_count = 0;
 
+    // Use direct bit shifting instead of casting overhead
     for &p in pixels {
         let key = ((p.r as usize) << 16) | ((p.g as usize) << 8) | (p.b as usize);
         
-        let mapped_idx = lut[key];
+        // Unsafe get is safe here because key is strictly 24-bit
+        let mapped_idx = unsafe { *lut.get_unchecked(key) };
+        
         if mapped_idx == 0xFFFFFFFF {
             // New color found
             original_unique_count += 1;
             
             if unique_colors.len() >= max_colors {
                 overflow = true;
-                // We don't break immediately so we can count total unique colors roughly,
-                // but for speed we break phase 1 and switch to phase 2
                 break;
             }
             
             let new_idx = unique_colors.len() as u32;
-            lut[key] = new_idx;
+            unsafe { *lut.get_unchecked_mut(key) = new_idx };
             unique_colors.push(p);
-            indices.push(new_idx);
-        } else {
-            // Existing color
-            indices.push(mapped_idx);
         }
     }
 
     if !overflow {
         // Optimization: If we didn't overflow, we have the exact unique colors.
-        // We can just return the original pixels. 
-        // Note: The caller might depend on the fact that we identified unique colors.
-        // But simply returning the original buffer is the fastest "no-op".
+        // Returning original pixels is fastest "no-op"
         return (pixels.to_vec(), unique_colors.len(), unique_colors.len(), false);
     }
 
@@ -235,11 +236,11 @@ pub fn fast_color_quantize_lut(
         // Key is 15 bits
         let key = (r5 << 10) | (g5 << 5) | b5;
 
-        let mapped_idx = lut_15[key];
+        let mapped_idx = unsafe { *lut_15.get_unchecked(key) };
         if mapped_idx == 0xFFFFFFFF {
             // New quantized color
             let new_idx = unique_colors.len() as u32;
-            lut_15[key] = new_idx;
+            unsafe { *lut_15.get_unchecked_mut(key) = new_idx };
             
             // Reconstruct color (using middle of the bin values 0x04)
             // e.g. 11111000 | 00000100 = 11111100
@@ -270,11 +271,9 @@ pub fn fast_edge_detect(
     if width < 3 || height < 3 {
         return edges;
     }
-
-    // Use luminance approximation: Y = (R*2 + G*5 + B) >> 3
-    let lum = |p: &Rgb| -> i32 {
-        ((p.r as i32) * 2 + (p.g as i32) * 5 + (p.b as i32)) >> 3
-    };
+    
+    // Import fast luminance from crate::fast
+    use crate::fast::fast_luminance;
 
     for y in 1..height - 1 {
         let row = y * width;
@@ -282,22 +281,29 @@ pub fn fast_edge_detect(
         let row_down = (y + 1) * width;
 
         for x in 1..width - 1 {
-            // Sobel kernel
-            let p00 = lum(&pixels[row_up + x - 1]);
-            let p01 = lum(&pixels[row_up + x]);
-            let p02 = lum(&pixels[row_up + x + 1]);
-            let p10 = lum(&pixels[row + x - 1]);
-            let p12 = lum(&pixels[row + x + 1]);
-            let p20 = lum(&pixels[row_down + x - 1]);
-            let p21 = lum(&pixels[row_down + x]);
-            let p22 = lum(&pixels[row_down + x + 1]);
+            // Sobel kernel using integer luminance
+            // fast_luminance returns u8 (0..255)
+            let p00 = fast_luminance(pixels[row_up + x - 1].r, pixels[row_up + x - 1].g, pixels[row_up + x - 1].b) as i32;
+            let p01 = fast_luminance(pixels[row_up + x].r, pixels[row_up + x].g, pixels[row_up + x].b) as i32;
+            let p02 = fast_luminance(pixels[row_up + x + 1].r, pixels[row_up + x + 1].g, pixels[row_up + x + 1].b) as i32;
+            
+            let p10 = fast_luminance(pixels[row + x - 1].r, pixels[row + x - 1].g, pixels[row + x - 1].b) as i32;
+            let p12 = fast_luminance(pixels[row + x + 1].r, pixels[row + x + 1].g, pixels[row + x + 1].b) as i32;
+            
+            let p20 = fast_luminance(pixels[row_down + x - 1].r, pixels[row_down + x - 1].g, pixels[row_down + x - 1].b) as i32;
+            let p21 = fast_luminance(pixels[row_down + x].r, pixels[row_down + x].g, pixels[row_down + x].b) as i32;
+            let p22 = fast_luminance(pixels[row_down + x + 1].r, pixels[row_down + x + 1].g, pixels[row_down + x + 1].b) as i32;
 
             let gx = -p00 + p02 - 2 * p10 + 2 * p12 - p20 + p22;
             let gy = -p00 - 2 * p01 - p02 + p20 + 2 * p21 + p22;
 
-            let mag = gx.abs() + gy.abs();
+            // Fast magnitude approximation: max + min/2
+            use crate::fast::fast_magnitude;
+            let mag = fast_magnitude(gx, gy);
             
-            edges[row + x] = (mag.min(4080) * 16) as u16;
+            // Map 0..1020 to 0..65535
+            // Multiply by 64 (<< 6)
+            edges[row + x] = (mag as u16).saturating_mul(64);
         }
     }
 
