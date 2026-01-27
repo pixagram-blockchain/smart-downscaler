@@ -1,14 +1,11 @@
 //! Color space conversions and perceptual distance calculations.
-//!
-//! Implements multiple color spaces for perceptually uniform color comparisons:
-//! - CIE Lab: Classic perceptual space, good for general use
-//! - Oklab: Modern perceptual space with better hue linearity and saturation preservation
-//! - Linear RGB: For gamma-correct averaging operations
+//! Optimized with Fixed-Point arithmetic for WASM performance.
 
 use std::ops::{Add, Div, Mul, Sub};
 
 /// RGB color in 8-bit per channel format (sRGB gamma-encoded)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[repr(C)] // Ensure C layout for raw byte access optimization
 pub struct Rgb {
     pub r: u8,
     pub g: u8,
@@ -16,6 +13,7 @@ pub struct Rgb {
 }
 
 impl Rgb {
+    #[inline(always)]
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
@@ -28,47 +26,31 @@ impl Rgb {
         [self.r, self.g, self.b]
     }
 
-    /// Convert to CIE Lab color space
     pub fn to_lab(self) -> Lab {
         Lab::from_rgb(self)
     }
 
-    /// Convert to Oklab color space (recommended for palette operations)
     pub fn to_oklab(self) -> Oklab {
         Oklab::from_rgb(self)
     }
+    
+    /// Convert directly to fixed point for hot loops
+    pub fn to_oklab_fixed(self) -> OklabFixed {
+        OklabFixed::from_oklab(self.to_oklab())
+    }
 
-    /// Convert to linear RGB (gamma-decoded)
     pub fn to_linear(self) -> LinearRgb {
         LinearRgb::from_srgb(self)
     }
 
-    /// Compute squared Euclidean distance in RGB space
-    pub fn distance_squared(self, other: Self) -> u32 {
-        let dr = self.r as i32 - other.r as i32;
-        let dg = self.g as i32 - other.g as i32;
-        let db = self.b as i32 - other.b as i32;
-        (dr * dr + dg * dg + db * db) as u32
-    }
-
-    /// Compute luminance (perceived brightness)
+    #[inline(always)]
     pub fn luminance(self) -> f32 {
-        // Rec. 709 coefficients on gamma-encoded values (approximate)
         0.2126 * self.r as f32 + 0.7152 * self.g as f32 + 0.0722 * self.b as f32
     }
     
-    /// Fast integer luminance approximation (scaled by 256)
-    /// Returns 0..255
     #[inline(always)]
     pub fn luminance_u8(self) -> u8 {
-        // R:54, G:183, B:19
         ((self.r as u32 * 54 + self.g as u32 * 183 + self.b as u32 * 19) >> 8) as u8
-    }
-
-    /// Compute true luminance (gamma-correct)
-    pub fn luminance_linear(self) -> f32 {
-        let lin = self.to_linear();
-        0.2126 * lin.r + 0.7152 * lin.g + 0.0722 * lin.b
     }
 
     /// Compute saturation (HSL-style)
@@ -81,33 +63,172 @@ impl Rgb {
             (max - min) / max
         }
     }
+}
 
-    /// Compute chroma (colorfulness)
+// =============================================================================
+// Oklab Fixed Point (Optimization)
+// =============================================================================
+
+/// Fixed point representation of Oklab for integer-only distance calculations.
+/// Scale factor: 4096 (12 bits). 
+/// Fits in i16: L [0..4096], a/b [-2048..2048]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub struct OklabFixed {
+    pub l: i16,
+    pub a: i16,
+    pub b: i16,
+}
+
+impl OklabFixed {
+    const SCALE: f32 = 4096.0;
+    
+    #[inline(always)]
+    pub fn from_oklab(o: Oklab) -> Self {
+        Self {
+            l: (o.l * Self::SCALE) as i16,
+            a: (o.a * Self::SCALE) as i16,
+            b: (o.b * Self::SCALE) as i16,
+        }
+    }
+
+    /// Integer squared Euclidean distance (fast path)
+    /// Returns i32 to prevent overflow during squaring
+    #[inline(always)]
+    pub fn distance_squared(self, other: Self) -> i32 {
+        let dl = self.l as i32 - other.l as i32;
+        let da = self.a as i32 - other.a as i32;
+        let db = self.b as i32 - other.b as i32;
+        // imul is much faster than fmul
+        dl * dl + da * da + db * db
+    }
+}
+
+// =============================================================================
+// Oklab (Modern perceptual color space)
+// =============================================================================
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Oklab {
+    pub l: f32,
+    pub a: f32,
+    pub b: f32,
+}
+
+impl Oklab {
+    pub const fn new(l: f32, a: f32, b: f32) -> Self {
+        Self { l, a, b }
+    }
+
+    pub fn from_rgb(rgb: Rgb) -> Self {
+        let lin = rgb.to_linear();
+        Self::from_linear_rgb(lin)
+    }
+
+    // Optimization: Precomputed matrix multiplication coefficients
+    pub fn from_linear_rgb(lin: LinearRgb) -> Self {
+        let l = 0.4122214708 * lin.r + 0.5363325363 * lin.g + 0.0514459929 * lin.b;
+        let m = 0.2119034982 * lin.r + 0.6806995451 * lin.g + 0.1073969566 * lin.b;
+        let s = 0.0883024619 * lin.r + 0.2817188376 * lin.g + 0.6299787005 * lin.b;
+
+        // Fast cbrt approximation could go here, but this is usually pre-calculated
+        let l_ = l.cbrt();
+        let m_ = m.cbrt();
+        let s_ = s.cbrt();
+
+        Oklab {
+            l: 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+            a: 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+            b: 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,
+        }
+    }
+
+    pub fn to_rgb(self) -> Rgb {
+        self.to_linear_rgb().to_srgb()
+    }
+
+    pub fn to_linear_rgb(self) -> LinearRgb {
+        let l_ = self.l + 0.3963377774 * self.a + 0.2158037573 * self.b;
+        let m_ = self.l - 0.1055613458 * self.a - 0.0638541728 * self.b;
+        let s_ = self.l - 0.0894841775 * self.a - 1.2914855480 * self.b;
+
+        let l = l_ * l_ * l_;
+        let m = m_ * m_ * m_;
+        let s = s_ * s_ * s_;
+
+        LinearRgb {
+            r: (4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s).clamp(0.0, 1.0),
+            g: (-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s).clamp(0.0, 1.0),
+            b: (-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s).clamp(0.0, 1.0),
+        }
+    }
+
+    #[inline(always)]
+    pub fn distance_squared(self, other: Self) -> f32 {
+        let dl = self.l - other.l;
+        let da = self.a - other.a;
+        let db = self.b - other.b;
+        dl * dl + da * da + db * db
+    }
+
+    #[inline(always)]
+    pub fn distance(self, other: Self) -> f32 {
+        self.distance_squared(other).sqrt()
+    }
+    
     pub fn chroma(self) -> f32 {
-        let oklab = self.to_oklab();
-        (oklab.a * oklab.a + oklab.b * oklab.b).sqrt()
+        (self.a * self.a + self.b * self.b).sqrt()
+    }
+
+    pub fn hue(self) -> f32 {
+        self.b.atan2(self.a)
+    }
+
+    pub fn to_oklch(self) -> (f32, f32, f32) {
+        (self.l, self.chroma(), self.hue())
+    }
+
+    pub fn from_oklch(l: f32, c: f32, h: f32) -> Self {
+        Self {
+            l,
+            a: c * h.cos(),
+            b: c * h.sin(),
+        }
     }
 }
 
-#[cfg(feature = "native")]
-impl From<image::Rgb<u8>> for Rgb {
-    fn from(pixel: image::Rgb<u8>) -> Self {
-        Self::new(pixel[0], pixel[1], pixel[2])
+impl Add for Oklab {
+    type Output = Self;
+    fn add(self, other: Self) -> Self {
+        Oklab { l: self.l + other.l, a: self.a + other.a, b: self.b + other.b }
     }
 }
 
-#[cfg(feature = "native")]
-impl From<Rgb> for image::Rgb<u8> {
-    fn from(rgb: Rgb) -> Self {
-        image::Rgb([rgb.r, rgb.g, rgb.b])
+impl Sub for Oklab {
+    type Output = Self;
+    fn sub(self, other: Self) -> Self {
+        Oklab { l: self.l - other.l, a: self.a - other.a, b: self.b - other.b }
+    }
+}
+
+impl Mul<f32> for Oklab {
+    type Output = Self;
+    fn mul(self, scalar: f32) -> Self {
+        Oklab { l: self.l * scalar, a: self.a * scalar, b: self.b * scalar }
+    }
+}
+
+impl Div<f32> for Oklab {
+    type Output = Self;
+    fn div(self, scalar: f32) -> Self {
+        Oklab { l: self.l / scalar, a: self.a / scalar, b: self.b / scalar }
     }
 }
 
 // =============================================================================
-// Linear RGB (gamma-decoded)
+// Linear RGB
 // =============================================================================
 
-/// Linear RGB for gamma-correct color operations
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LinearRgb {
     pub r: f32,
@@ -120,7 +241,6 @@ impl LinearRgb {
         Self { r, g, b }
     }
 
-    /// Convert from sRGB (gamma-encoded) to linear RGB
     pub fn from_srgb(rgb: Rgb) -> Self {
         Self {
             r: srgb_to_linear(rgb.r as f32 / 255.0),
@@ -129,7 +249,6 @@ impl LinearRgb {
         }
     }
 
-    /// Convert back to sRGB (gamma-encoded)
     pub fn to_srgb(self) -> Rgb {
         Rgb {
             r: clamp_u8_f32(linear_to_srgb(self.r) * 255.0),
@@ -138,7 +257,6 @@ impl LinearRgb {
         }
     }
 
-    /// Squared distance in linear RGB space
     pub fn distance_squared(self, other: Self) -> f32 {
         let dr = self.r - other.r;
         let dg = self.g - other.g;
@@ -181,166 +299,9 @@ impl Div<f32> for LinearRgb {
 }
 
 // =============================================================================
-// Oklab (Modern perceptual color space)
-// =============================================================================
-
-/// Oklab color space - superior perceptual uniformity
-/// 
-/// Oklab provides better hue linearity than CIE Lab, meaning interpolations
-/// and averages preserve saturation and hue more accurately. This is crucial
-/// for palette extraction where we want to preserve vibrant colors.
-/// 
-/// Reference: https://bottosson.github.io/posts/oklab/
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Oklab {
-    pub l: f32,  // Lightness [0, 1]
-    pub a: f32,  // Green-Red axis (roughly [-0.4, 0.4])
-    pub b: f32,  // Blue-Yellow axis (roughly [-0.4, 0.4])
-}
-
-impl Oklab {
-    pub const fn new(l: f32, a: f32, b: f32) -> Self {
-        Self { l, a, b }
-    }
-
-    /// Convert from sRGB to Oklab
-    pub fn from_rgb(rgb: Rgb) -> Self {
-        let lin = rgb.to_linear();
-        Self::from_linear_rgb(lin)
-    }
-
-    /// Convert from linear RGB to Oklab
-    pub fn from_linear_rgb(lin: LinearRgb) -> Self {
-        // Linear RGB to LMS
-        let l = 0.4122214708 * lin.r + 0.5363325363 * lin.g + 0.0514459929 * lin.b;
-        let m = 0.2119034982 * lin.r + 0.6806995451 * lin.g + 0.1073969566 * lin.b;
-        let s = 0.0883024619 * lin.r + 0.2817188376 * lin.g + 0.6299787005 * lin.b;
-
-        // Cube root (handle negative values)
-        let l_ = l.abs().cbrt().copysign(l);
-        let m_ = m.abs().cbrt().copysign(m);
-        let s_ = s.abs().cbrt().copysign(s);
-
-        // LMS' to Oklab
-        Oklab {
-            l: 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
-            a: 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
-            b: 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,
-        }
-    }
-
-    /// Convert from Oklab to sRGB
-    pub fn to_rgb(self) -> Rgb {
-        self.to_linear_rgb().to_srgb()
-    }
-
-    /// Convert from Oklab to linear RGB
-    pub fn to_linear_rgb(self) -> LinearRgb {
-        // Oklab to LMS'
-        let l_ = self.l + 0.3963377774 * self.a + 0.2158037573 * self.b;
-        let m_ = self.l - 0.1055613458 * self.a - 0.0638541728 * self.b;
-        let s_ = self.l - 0.0894841775 * self.a - 1.2914855480 * self.b;
-
-        // Cube
-        let l = l_ * l_ * l_;
-        let m = m_ * m_ * m_;
-        let s = s_ * s_ * s_;
-
-        // LMS to linear RGB
-        LinearRgb {
-            r: (4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s).clamp(0.0, 1.0),
-            g: (-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s).clamp(0.0, 1.0),
-            b: (-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s).clamp(0.0, 1.0),
-        }
-    }
-
-    /// Squared Euclidean distance in Oklab space
-    pub fn distance_squared(self, other: Self) -> f32 {
-        let dl = self.l - other.l;
-        let da = self.a - other.a;
-        let db = self.b - other.b;
-        dl * dl + da * da + db * db
-    }
-
-    /// Euclidean distance
-    pub fn distance(self, other: Self) -> f32 {
-        self.distance_squared(other).sqrt()
-    }
-
-    /// Chroma (colorfulness/saturation)
-    pub fn chroma(self) -> f32 {
-        (self.a * self.a + self.b * self.b).sqrt()
-    }
-
-    /// Hue angle in radians
-    pub fn hue(self) -> f32 {
-        self.b.atan2(self.a)
-    }
-
-    /// Convert to cylindrical Oklch (Lightness, Chroma, Hue)
-    pub fn to_oklch(self) -> (f32, f32, f32) {
-        (self.l, self.chroma(), self.hue())
-    }
-
-    /// Create from cylindrical Oklch
-    pub fn from_oklch(l: f32, c: f32, h: f32) -> Self {
-        Self {
-            l,
-            a: c * h.cos(),
-            b: c * h.sin(),
-        }
-    }
-}
-
-impl Add for Oklab {
-    type Output = Self;
-    fn add(self, other: Self) -> Self {
-        Oklab {
-            l: self.l + other.l,
-            a: self.a + other.a,
-            b: self.b + other.b,
-        }
-    }
-}
-
-impl Sub for Oklab {
-    type Output = Self;
-    fn sub(self, other: Self) -> Self {
-        Oklab {
-            l: self.l - other.l,
-            a: self.a - other.a,
-            b: self.b - other.b,
-        }
-    }
-}
-
-impl Mul<f32> for Oklab {
-    type Output = Self;
-    fn mul(self, scalar: f32) -> Self {
-        Oklab {
-            l: self.l * scalar,
-            a: self.a * scalar,
-            b: self.b * scalar,
-        }
-    }
-}
-
-impl Div<f32> for Oklab {
-    type Output = Self;
-    fn div(self, scalar: f32) -> Self {
-        Oklab {
-            l: self.l / scalar,
-            a: self.a / scalar,
-            b: self.b / scalar,
-        }
-    }
-}
-
-// =============================================================================
 // CIE Lab (Classic perceptual color space)
 // =============================================================================
 
-/// CIE Lab color for perceptually uniform comparisons
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Lab {
     pub l: f32,  // Lightness [0, 100]
@@ -353,21 +314,16 @@ impl Lab {
         Self { l, a, b }
     }
 
-    /// D65 illuminant reference white
     const XN: f32 = 0.95047;
     const YN: f32 = 1.00000;
     const ZN: f32 = 1.08883;
 
-    /// Convert from RGB to Lab via XYZ
     pub fn from_rgb(rgb: Rgb) -> Self {
         let lin = rgb.to_linear();
-
-        // Linear RGB to XYZ (sRGB D65)
         let x = lin.r * 0.4124564 + lin.g * 0.3575761 + lin.b * 0.1804375;
         let y = lin.r * 0.2126729 + lin.g * 0.7151522 + lin.b * 0.0721750;
         let z = lin.r * 0.0193339 + lin.g * 0.1191920 + lin.b * 0.9503041;
 
-        // XYZ to Lab
         let fx = Self::xyz_to_lab_f(x / Self::XN);
         let fy = Self::xyz_to_lab_f(y / Self::YN);
         let fz = Self::xyz_to_lab_f(z / Self::ZN);
@@ -379,9 +335,7 @@ impl Lab {
         }
     }
 
-    /// Convert from Lab back to RGB
     pub fn to_rgb(self) -> Rgb {
-        // Lab to XYZ
         let fy = (self.l + 16.0) / 116.0;
         let fx = self.a / 500.0 + fy;
         let fz = fy - self.b / 200.0;
@@ -390,7 +344,6 @@ impl Lab {
         let y = Self::YN * Self::lab_to_xyz_f(fy);
         let z = Self::ZN * Self::lab_to_xyz_f(fz);
 
-        // XYZ to linear RGB
         let lin = LinearRgb {
             r: (x * 3.2404542 + y * -1.5371385 + z * -0.4985314).clamp(0.0, 1.0),
             g: (x * -0.9692660 + y * 1.8760108 + z * 0.0415560).clamp(0.0, 1.0),
@@ -400,7 +353,6 @@ impl Lab {
         lin.to_srgb()
     }
 
-    /// Squared Euclidean distance in Lab space (perceptual)
     pub fn distance_squared(self, other: Self) -> f32 {
         let dl = self.l - other.l;
         let da = self.a - other.a;
@@ -408,16 +360,13 @@ impl Lab {
         dl * dl + da * da + db * db
     }
 
-    /// Euclidean distance in Lab space
     pub fn distance(self, other: Self) -> f32 {
         self.distance_squared(other).sqrt()
     }
 
-    // Lab conversion functions
     fn xyz_to_lab_f(t: f32) -> f32 {
         const DELTA: f32 = 6.0 / 29.0;
         const DELTA_CUBE: f32 = DELTA * DELTA * DELTA;
-        
         if t > DELTA_CUBE {
             t.cbrt()
         } else {
@@ -427,7 +376,6 @@ impl Lab {
 
     fn lab_to_xyz_f(t: f32) -> f32 {
         const DELTA: f32 = 6.0 / 29.0;
-        
         if t > DELTA {
             t * t * t
         } else {
@@ -438,7 +386,6 @@ impl Lab {
 
 impl Add for Lab {
     type Output = Self;
-    
     fn add(self, other: Self) -> Self {
         Lab {
             l: self.l + other.l,
@@ -450,7 +397,6 @@ impl Add for Lab {
 
 impl Mul<f32> for Lab {
     type Output = Self;
-    
     fn mul(self, scalar: f32) -> Self {
         Lab {
             l: self.l * scalar,
@@ -462,7 +408,6 @@ impl Mul<f32> for Lab {
 
 impl Div<f32> for Lab {
     type Output = Self;
-    
     fn div(self, scalar: f32) -> Self {
         Lab {
             l: self.l / scalar,
@@ -473,10 +418,9 @@ impl Div<f32> for Lab {
 }
 
 // =============================================================================
-// Accumulators for computing weighted means
+// Accumulators
 // =============================================================================
 
-/// Weighted Lab accumulator for computing means
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LabAccumulator {
     pub sum: Lab,
@@ -487,12 +431,10 @@ impl LabAccumulator {
     pub fn new() -> Self {
         Self::default()
     }
-
     pub fn add(&mut self, lab: Lab, weight: f32) {
         self.sum = self.sum + lab * weight;
         self.weight += weight;
     }
-
     pub fn mean(&self) -> Lab {
         if self.weight > 0.0 {
             self.sum / self.weight
@@ -503,11 +445,6 @@ impl LabAccumulator {
 }
 
 /// Fixed-point Lab color for optimized integer arithmetic
-///
-/// Values are scaled by 64 (6 bits of fractional precision).
-/// This allows fitting standard Lab ranges into i16:
-/// - L: 0..100 -> 0..6400
-/// - a, b: -128..127 -> -8192..8128
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct LabFixed {
     pub l: i16,
@@ -521,7 +458,6 @@ impl LabFixed {
     }
 }
 
-/// Weighted Oklab accumulator for computing means
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OklabAccumulator {
     pub sum: Oklab,
@@ -529,15 +465,20 @@ pub struct OklabAccumulator {
 }
 
 impl OklabAccumulator {
-    pub fn new() -> Self {
-        Self::default()
-    }
+    #[inline(always)]
+    pub fn new() -> Self { Self::default() }
 
+    #[inline(always)]
     pub fn add(&mut self, oklab: Oklab, weight: f32) {
-        self.sum = self.sum + oklab * weight;
+        self.sum = self.sum + Oklab { 
+            l: oklab.l * weight, 
+            a: oklab.a * weight, 
+            b: oklab.b * weight 
+        };
         self.weight += weight;
     }
 
+    #[inline(always)]
     pub fn mean(&self) -> Oklab {
         if self.weight > 0.0 {
             self.sum / self.weight
@@ -547,7 +488,6 @@ impl OklabAccumulator {
     }
 }
 
-/// Weighted linear RGB accumulator (gamma-correct averaging)
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LinearRgbAccumulator {
     pub sum: LinearRgb,
@@ -558,16 +498,13 @@ impl LinearRgbAccumulator {
     pub fn new() -> Self {
         Self::default()
     }
-
     pub fn add(&mut self, lin: LinearRgb, weight: f32) {
         self.sum = self.sum + lin * weight;
         self.weight += weight;
     }
-
     pub fn add_rgb(&mut self, rgb: Rgb, weight: f32) {
         self.add(rgb.to_linear(), weight);
     }
-
     pub fn mean(&self) -> LinearRgb {
         if self.weight > 0.0 {
             self.sum / self.weight
@@ -575,50 +512,33 @@ impl LinearRgbAccumulator {
             LinearRgb::default()
         }
     }
-
     pub fn mean_rgb(&self) -> Rgb {
         self.mean().to_srgb()
     }
 }
 
 // =============================================================================
-// Gamma correction functions & Low Level Ops
+// Constants & Utils
 // =============================================================================
 
-/// sRGB gamma correction: encoded -> linear
 #[inline]
 pub fn srgb_to_linear(v: f32) -> f32 {
-    if v > 0.04045 {
-        ((v + 0.055) / 1.055).powf(2.4)
-    } else {
-        v / 12.92
-    }
+    if v > 0.04045 { ((v + 0.055) / 1.055).powf(2.4) } else { v / 12.92 }
 }
 
-/// sRGB gamma correction: linear -> encoded
 #[inline]
 pub fn linear_to_srgb(v: f32) -> f32 {
-    if v > 0.0031308 {
-        1.055 * v.powf(1.0 / 2.4) - 0.055
-    } else {
-        12.92 * v
-    }
+    if v > 0.0031308 { 1.055 * v.powf(1.0 / 2.4) - 0.055 } else { 12.92 * v }
 }
 
-/// Branchless clamp float to u8
 #[inline(always)]
 pub fn clamp_u8_f32(v: f32) -> u8 {
-    // Rely on max/min optimization
-    // if v < 0.0 { 0 } else if v > 255.0 { 255 } else { v as u8 }
     v.max(0.0).min(255.0) as u8
 }
 
-/// Branchless integer clamp
 #[inline(always)]
 pub fn clamp_u8(x: i32) -> u8 {
     let mut y = x;
-    // if y < 0 -> y = 0
     y &= !(y >> 31);
-    // if y > 255 -> y = 255
     if y > 255 { 255 } else { y as u8 }
 }
