@@ -102,6 +102,12 @@ impl OklabFixed {
         // imul is much faster than fmul
         dl * dl + da * da + db * db
     }
+
+    /// Returns float distance (expensive, use squared where possible)
+    #[inline(always)]
+    pub fn distance(self, other: Self) -> f32 {
+        (self.distance_squared(other) as f32).sqrt()
+    }
 }
 
 // =============================================================================
@@ -131,7 +137,6 @@ impl Oklab {
         let m = 0.2119034982 * lin.r + 0.6806995451 * lin.g + 0.1073969566 * lin.b;
         let s = 0.0883024619 * lin.r + 0.2817188376 * lin.g + 0.6299787005 * lin.b;
 
-        // Fast cbrt approximation could go here, but this is usually pre-calculated
         let l_ = l.cbrt();
         let m_ = m.cbrt();
         let s_ = s.cbrt();
@@ -445,6 +450,7 @@ impl LabAccumulator {
 }
 
 /// Fixed-point Lab color for optimized integer arithmetic
+/// Kept for compatibility
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct LabFixed {
     pub l: i16,

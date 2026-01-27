@@ -1,5 +1,5 @@
 //! Palette extraction using Median Cut and K-Means++ refinement.
-//! Optimized with integer-based Fixed Point lookups.
+//! Optimized with integer-based Fixed Point lookups and KD-Tree acceleration.
 
 use crate::color::{Lab, Oklab, Rgb, OklabFixed};
 use std::collections::HashMap;
@@ -17,13 +17,25 @@ pub enum PaletteStrategy {
     RgbBitmask,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct KdNode {
+    pub left: u32,
+    pub right: u32,
+    pub axis: u8,
+    pub split: i16,
+    pub color_idx: u16,
+    pub min: [i16; 3],
+    pub max: [i16; 3],
+}
+
 #[derive(Clone, Debug)]
 pub struct Palette {
     pub colors: Vec<Rgb>,
     pub oklab_colors: Vec<Oklab>,
     pub lab_colors: Vec<Lab>,
-    // Optimization: Fixed point values for fast integer matching
     pub fixed_colors: Vec<OklabFixed>,
+    pub tree: Vec<KdNode>,
+    pub use_tree: bool,
 }
 
 impl Palette {
@@ -31,101 +43,171 @@ impl Palette {
         let oklab_colors: Vec<Oklab> = colors.iter().map(|&c| c.to_oklab()).collect();
         let lab_colors: Vec<Lab> = colors.iter().map(|&c| c.to_lab()).collect();
         let fixed_colors: Vec<OklabFixed> = oklab_colors.iter().map(|&c| OklabFixed::from_oklab(c)).collect();
-        Self { colors, oklab_colors, lab_colors, fixed_colors }
+        
+        // Build KD-Tree if palette is large enough to justify overhead (> 32 colors)
+        let use_tree = fixed_colors.len() >= 32;
+        let tree = if use_tree {
+            build_kdtree(&fixed_colors)
+        } else {
+            Vec::new()
+        };
+
+        Self { colors, oklab_colors, lab_colors, fixed_colors, tree, use_tree }
     }
 
     pub fn len(&self) -> usize { self.colors.len() }
     pub fn is_empty(&self) -> bool { self.colors.is_empty() }
 
-    /// Find nearest using fast integer math
     #[inline(always)]
     pub fn find_nearest_fixed(&self, target: OklabFixed) -> usize {
+        if self.use_tree {
+            self.find_nearest_kdtree(target)
+        } else {
+            self.find_nearest_linear(target)
+        }
+    }
+
+    #[inline(always)]
+    fn find_nearest_linear(&self, target: OklabFixed) -> usize {
         let mut best_idx = 0;
         let mut best_dist = i32::MAX;
-        
-        // Loop unrolling for small palettes handled by compiler
         for (i, &p) in self.fixed_colors.iter().enumerate() {
             let dist = target.distance_squared(p);
             if dist < best_dist {
                 best_dist = dist;
                 best_idx = i;
-                // Early exit for exact match
                 if dist == 0 { break; }
             }
         }
         best_idx
     }
 
-    // Compat for float logic
+    #[inline(always)]
+    fn find_nearest_kdtree(&self, target: OklabFixed) -> usize {
+        self.find_nearest_pruned(target, f32::MAX, 1.0).0
+    }
+
+    pub fn find_nearest_pruned(&self, target: OklabFixed, best_score_so_far: f32, inv_bias_factor: f32) -> (usize, f32) {
+        if !self.use_tree || self.tree.is_empty() {
+            return (self.find_nearest_linear(target), 0.0);
+        }
+
+        let mut stack = [(0u32, 0i32); 32];
+        let mut stack_ptr;
+        
+        let mut best_idx = 0;
+        let max_dist_float = best_score_so_far * inv_bias_factor;
+        let mut best_dist_sq = if max_dist_float >= 2e9 { i32::MAX } else { max_dist_float as i32 };
+        
+        stack[0] = (0, 0);
+        stack_ptr = 1;
+
+        let t_vals = [target.l, target.a, target.b];
+
+        while stack_ptr > 0 {
+            stack_ptr -= 1;
+            let (node_idx, box_dist) = stack[stack_ptr];
+
+            if box_dist >= best_dist_sq { continue; }
+
+            let node = &self.tree[node_idx as usize];
+            let p = self.fixed_colors[node.color_idx as usize];
+            let d = target.distance_squared(p);
+
+            if d < best_dist_sq {
+                best_dist_sq = d;
+                best_idx = node.color_idx as usize;
+            }
+
+            let axis = node.axis as usize;
+            let diff = t_vals[axis] - node.split;
+            
+            let near_idx = if diff <= 0 { node.left } else { node.right };
+            let far_idx = if diff <= 0 { node.right } else { node.left };
+
+            if far_idx != u32::MAX {
+                let plane_dist = (diff as i32) * (diff as i32);
+                if plane_dist < best_dist_sq {
+                    stack[stack_ptr] = (far_idx, plane_dist); 
+                    stack_ptr += 1;
+                }
+            }
+
+            if near_idx != u32::MAX {
+                stack[stack_ptr] = (near_idx, 0);
+                stack_ptr += 1;
+            }
+        }
+        
+        (best_idx, best_dist_sq as f32)
+    }
+
     pub fn find_nearest_oklab(&self, oklab: &Oklab) -> usize {
         self.find_nearest_fixed(OklabFixed::from_oklab(*oklab))
     }
     
-    // Legacy Lab support
     pub fn find_nearest(&self, lab: &Lab) -> usize {
-        // Fallback to Oklab approximation or implement Lab logic if strictly required.
-        // For this optimization pass, we assume Oklab is primary.
         self.find_nearest_oklab(&Oklab::from_rgb(lab.to_rgb()))
     }
+}
 
-    pub fn find_nearest_biased(
-        &self,
-        lab: &Lab,
-        neighbor_indices: &[usize],
-        neighbor_weight: f32,
-    ) -> usize {
-        // Redirect to Oklab logic for consistency
-        let oklab = Oklab::from_rgb(lab.to_rgb());
-        self.find_nearest_region_aware(&oklab, neighbor_indices, &[], neighbor_weight, 0.0)
+fn build_kdtree(points: &[OklabFixed]) -> Vec<KdNode> {
+    let mut indices: Vec<usize> = (0..points.len()).collect();
+    let mut nodes = Vec::with_capacity(points.len());
+    build_recursive(points, &mut indices, 0, &mut nodes);
+    nodes
+}
+
+fn build_recursive(
+    points: &[OklabFixed],
+    indices: &mut [usize],
+    depth: usize,
+    nodes: &mut Vec<KdNode>
+) -> u32 {
+    if indices.is_empty() { return u32::MAX; }
+
+    let axis = (depth % 3) as u8;
+    let mid = indices.len() / 2;
+
+    indices.sort_unstable_by_key(|&i| {
+        let p = points[i];
+        match axis { 0 => p.l, 1 => p.a, _ => p.b }
+    });
+
+    let color_idx = indices[mid] as u16;
+    let point = points[indices[mid]];
+    let split_val = match axis { 0 => point.l, 1 => point.a, _ => point.b };
+
+    let curr_idx = nodes.len() as u32;
+    nodes.push(KdNode::default());
+
+    let (min, max) = compute_bounds(points, indices);
+
+    let left_child = build_recursive(points, &mut indices[..mid], depth + 1, nodes);
+    let right_child = build_recursive(points, &mut indices[mid+1..], depth + 1, nodes);
+
+    let node = &mut nodes[curr_idx as usize];
+    node.left = left_child;
+    node.right = right_child;
+    node.axis = axis;
+    node.split = split_val;
+    node.color_idx = color_idx;
+    node.min = min;
+    node.max = max;
+
+    curr_idx
+}
+
+fn compute_bounds(points: &[OklabFixed], indices: &[usize]) -> ([i16; 3], [i16; 3]) {
+    let mut min = [i16::MAX, i16::MAX, i16::MAX];
+    let mut max = [i16::MIN, i16::MIN, i16::MIN];
+    for &idx in indices {
+        let p = points[idx];
+        min[0] = min[0].min(p.l); max[0] = max[0].max(p.l);
+        min[1] = min[1].min(p.a); max[1] = max[1].max(p.a);
+        min[2] = min[2].min(p.b); max[2] = max[2].max(p.b);
     }
-
-    pub fn find_nearest_region_aware(
-        &self,
-        oklab: &Oklab,
-        neighbor_indices: &[usize],
-        same_region_indices: &[usize],
-        neighbor_weight: f32,
-        region_weight: f32,
-    ) -> usize {
-        // This is the slow float path, maintained for compatibility/fallback.
-        // See downscale.rs for the optimized fixed-point version of this logic.
-        if neighbor_indices.is_empty() && same_region_indices.is_empty() {
-            return self.find_nearest_oklab(oklab);
-        }
-
-        let mut neighbor_counts = vec![0usize; self.colors.len()];
-        let mut region_counts = vec![0usize; self.colors.len()];
-
-        for &idx in neighbor_indices {
-            if idx < neighbor_counts.len() { neighbor_counts[idx] += 1; }
-        }
-        for &idx in same_region_indices {
-            if idx < region_counts.len() { region_counts[idx] += 1; }
-        }
-
-        let max_neighbor = neighbor_indices.len().max(1) as f32;
-        let max_region = same_region_indices.len().max(1) as f32;
-
-        self.oklab_colors.iter().enumerate()
-            .min_by(|(i, a), (j, b)| {
-                let dist_a = oklab.distance_squared(**a);
-                let dist_b = oklab.distance_squared(**b);
-                
-                let nb_a = (neighbor_counts[*i] as f32 / max_neighbor) * neighbor_weight;
-                let nb_b = (neighbor_counts[*j] as f32 / max_neighbor) * neighbor_weight;
-                
-                let rb_a = (region_counts[*i] as f32 / max_region) * region_weight;
-                let rb_b = (region_counts[*j] as f32 / max_region) * region_weight;
-
-                let tb_a = (nb_a + rb_a).min(0.9);
-                let tb_b = (nb_b + rb_b).min(0.9);
-
-                let sa = dist_a * (1.0 - tb_a);
-                let sb = dist_b * (1.0 - tb_b);
-                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|(i, _)| i).unwrap_or(0)
-    }
+    (min, max)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -321,13 +403,11 @@ fn median_cut_rgb_bitmask(colors: &[WeightedColor], target: usize) -> Vec<Rgb> {
     }).collect()
 }
 
-// K-Means Refinement
 pub fn kmeans_refine_oklab(pixels: &[Rgb], centroids: Vec<Rgb>, iterations: usize) -> Vec<Rgb> {
     if centroids.is_empty() || pixels.is_empty() || iterations == 0 { return centroids; }
     let pixel_oklabs: Vec<Oklab> = pixels.iter().map(|p| p.to_oklab()).collect();
     let mut centers: Vec<Oklab> = centroids.iter().map(|c| c.to_oklab()).collect();
     
-    // Convert to fixed point for the loop
     let pixel_fixed: Vec<OklabFixed> = pixel_oklabs.iter().map(|&o| OklabFixed::from_oklab(o)).collect();
     let mut center_fixed: Vec<OklabFixed> = centers.iter().map(|&o| OklabFixed::from_oklab(o)).collect();
 
@@ -338,28 +418,43 @@ pub fn kmeans_refine_oklab(pixels: &[Rgb], centroids: Vec<Rgb>, iterations: usiz
 
         #[cfg(feature = "parallel")]
         {
-            // Parallel implementation omitted for brevity in optimized loop, 
-            // but standard pattern would apply. For now we use single thread fast path.
+            let assignments: Vec<usize> = pixel_fixed.par_iter()
+                .map(|p| {
+                    let mut best = 0;
+                    let mut best_d = i32::MAX;
+                    for (ci, &c) in center_fixed.iter().enumerate() {
+                        let d = p.distance_squared(c);
+                        if d < best_d { best_d = d; best = ci; }
+                    }
+                    best
+                })
+                .collect();
+            
+            for (i, &cluster) in assignments.iter().enumerate() {
+                sums[cluster] = sums[cluster] + pixel_oklabs[i];
+                counts[cluster] += 1;
+            }
         }
 
-        for (i, &p) in pixel_fixed.iter().enumerate() {
-            let mut best = 0;
-            let mut best_d = i32::MAX;
-            for (ci, &c) in center_fixed.iter().enumerate() {
-                let d = p.distance_squared(c);
-                if d < best_d { best_d = d; best = ci; }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for (i, &p) in pixel_fixed.iter().enumerate() {
+                let mut best = 0;
+                let mut best_d = i32::MAX;
+                for (ci, &c) in center_fixed.iter().enumerate() {
+                    let d = p.distance_squared(c);
+                    if d < best_d { best_d = d; best = ci; }
+                }
+                sums[best] = sums[best] + pixel_oklabs[i];
+                counts[best] += 1;
             }
-            // Use original float Oklab for summation to preserve precision during averaging
-            sums[best] = sums[best] + pixel_oklabs[i];
-            counts[best] += 1;
         }
 
         for i in 0..centers.len() {
             if counts[i] > 0 {
                 let new_c = sums[i] / counts[i] as f32;
                 let new_fixed = OklabFixed::from_oklab(new_c);
-                // Check convergence in fixed space (fast)
-                if new_fixed.distance_squared(center_fixed[i]) > 4 { // tolerance
+                if new_fixed.distance_squared(center_fixed[i]) > 4 { 
                     converged = false;
                 }
                 center_fixed[i] = new_fixed;
@@ -378,7 +473,6 @@ pub fn kmeans_plus_plus_init(pixels: &[Oklab], k: usize) -> Vec<Oklab> {
     
     for _ in 1..k {
         let fixed_centroids: Vec<OklabFixed> = centroids.iter().map(|&c| OklabFixed::from_oklab(c)).collect();
-        // Use integer distance for selection
         let (idx, _) = fixed_pixels.iter().enumerate()
             .map(|(i, &p)| {
                 let d = fixed_centroids.iter().map(|&c| p.distance_squared(c)).min().unwrap_or(0);

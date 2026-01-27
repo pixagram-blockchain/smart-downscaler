@@ -1,349 +1,82 @@
-//! Edge detection for boundary-aware processing.
-//!
-//! Implements Sobel edge detection and related boundary analysis
-//! for identifying transitions between regions.
+//! Edge detection algorithms for pixel art downscaling.
 
 use crate::color::Rgb;
-use crate::fast::{fast_luminance, fast_magnitude};
 
-#[cfg(feature = "parallel")]
-#[allow(unused_imports)]
-use rayon::prelude::*;
-
-/// Edge map storing gradient magnitudes for each pixel
 #[derive(Clone, Debug)]
 pub struct EdgeMap {
     pub width: usize,
     pub height: usize,
-    /// Edge strength values [0.0, 1.0] normalized
     pub data: Vec<f32>,
-    /// Maximum raw edge value (for normalization reference)
     pub max_value: f32,
 }
 
 impl EdgeMap {
-    /// Get edge strength at (x, y)
     pub fn get(&self, x: usize, y: usize) -> f32 {
-        if x < self.width && y < self.height {
-            self.data[y * self.width + x]
-        } else {
-            0.0
-        }
-    }
-
-    /// Get edge strength at (x, y) with bounds checking, returns 0 for out-of-bounds
-    pub fn get_safe(&self, x: i32, y: i32) -> f32 {
-        if x >= 0 && y >= 0 && (x as usize) < self.width && (y as usize) < self.height {
-            self.data[y as usize * self.width + x as usize]
-        } else {
-            0.0
-        }
-    }
-
-    /// Check if a pixel is on a strong edge (above threshold)
-    pub fn is_edge(&self, x: usize, y: usize, threshold: f32) -> bool {
-        self.get(x, y) > threshold
-    }
-
-    /// Compute average edge strength in a rectangular region
-    pub fn average_in_rect(&self, x: usize, y: usize, w: usize, h: usize) -> f32 {
-        let mut sum = 0.0;
-        let mut count = 0;
-
-        for dy in 0..h {
-            for dx in 0..w {
-                let px = x + dx;
-                let py = y + dy;
-                if px < self.width && py < self.height {
-                    sum += self.get(px, py);
-                    count += 1;
-                }
-            }
-        }
-
-        if count > 0 {
-            sum / count as f32
-        } else {
-            0.0
-        }
-    }
-
-    /// Find local maxima (non-maximum suppression for thin edges)
-    pub fn non_maximum_suppression(&self) -> EdgeMap {
-        let mut suppressed = vec![0.0f32; self.data.len()];
-
-        for y in 1..self.height.saturating_sub(1) {
-            for x in 1..self.width.saturating_sub(1) {
-                let center = self.get(x, y);
-                
-                // Compare with neighbors in gradient direction
-                // Simplified: compare with horizontal and vertical neighbors
-                let left = self.get(x - 1, y);
-                let right = self.get(x + 1, y);
-                let up = self.get(x, y - 1);
-                let down = self.get(x, y + 1);
-
-                let is_max_h = center >= left && center >= right;
-                let is_max_v = center >= up && center >= down;
-
-                if is_max_h || is_max_v {
-                    suppressed[y * self.width + x] = center;
-                }
-            }
-        }
-
-        EdgeMap {
-            width: self.width,
-            height: self.height,
-            data: suppressed,
-            max_value: self.max_value,
-        }
+        self.data[y * self.width + x]
     }
 }
 
-/// Compute edge map using Sobel operator
-/// Optimized to use Integer Luminance and Fast Magnitude
-pub fn compute_edge_map(pixels: &[Rgb], width: usize, height: usize) -> EdgeMap {
-    // Precompute luminance as u8 to avoid float ops
-    let luminance: Vec<u8> = pixels.iter()
-        .map(|p| fast_luminance(p.r, p.g, p.b))
-        .collect();
-
-    let mut edges = vec![0.0f32; width * height];
-    let mut max_value_u16: u16 = 0;
-
-    // Sobel kernels
-    // Gx = [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]
-    // Gy = [[-1, -2, -1], [0, 0, 0], [1, 2, 1]]
-
-    for y in 1..height.saturating_sub(1) {
-        for x in 1..width.saturating_sub(1) {
-            let get = |dx: i32, dy: i32| -> i32 {
-                let px = (x as i32 + dx) as usize;
-                let py = (y as i32 + dy) as usize;
-                luminance[py * width + px] as i32
-            };
-
-            let gx = -get(-1, -1) - 2 * get(-1, 0) - get(-1, 1)
-                   + get(1, -1) + 2 * get(1, 0) + get(1, 1);
-
-            let gy = -get(-1, -1) - 2 * get(0, -1) - get(1, -1)
-                   + get(-1, 1) + 2 * get(0, 1) + get(1, 1);
-
-            // Use fast integer magnitude (approx sqrt)
-            let magnitude = fast_magnitude(gx, gy) as u16;
-            
-            // Store temporarily as float for compatibility
-            edges[y * width + x] = magnitude as f32;
-            max_value_u16 = max_value_u16.max(magnitude);
-        }
-    }
-
-    // Normalize to [0, 1]
-    let max_value = max_value_u16 as f32;
-    if max_value > 0.0 {
-        let inv_max = 1.0 / max_value;
-        for e in edges.iter_mut() {
-            *e *= inv_max;
-        }
-    }
-
-    EdgeMap {
-        width,
-        height,
-        data: edges,
-        max_value,
-    }
-}
-
-/// Compute edge map using Scharr operator (more rotational symmetry than Sobel)
-pub fn compute_edge_map_scharr(pixels: &[Rgb], width: usize, height: usize) -> EdgeMap {
-    let luminance: Vec<u8> = pixels.iter()
-        .map(|p| fast_luminance(p.r, p.g, p.b))
-        .collect();
-
-    let mut edges = vec![0.0f32; width * height];
-    let mut max_value: f32 = 0.0;
-
-    // Scharr kernels (better rotational symmetry)
-    // Gx = [[-3, 0, 3], [-10, 0, 10], [-3, 0, 3]]
-    // Gy = [[-3, -10, -3], [0, 0, 0], [3, 10, 3]]
-
-    for y in 1..height.saturating_sub(1) {
-        for x in 1..width.saturating_sub(1) {
-            let get = |dx: i32, dy: i32| -> i32 {
-                let px = (x as i32 + dx) as usize;
-                let py = (y as i32 + dy) as usize;
-                luminance[py * width + px] as i32
-            };
-
-            let gx = -3 * get(-1, -1) - 10 * get(-1, 0) - 3 * get(-1, 1)
-                   + 3 * get(1, -1) + 10 * get(1, 0) + 3 * get(1, 1);
-
-            let gy = -3 * get(-1, -1) - 10 * get(0, -1) - 3 * get(1, -1)
-                   + 3 * get(-1, 1) + 10 * get(0, 1) + 3 * get(1, 1);
-
-            let magnitude = fast_magnitude(gx, gy) as f32;
-            edges[y * width + x] = magnitude;
-            max_value = max_value.max(magnitude);
-        }
-    }
-
-    // Normalize
-    if max_value > 0.0 {
-        for e in edges.iter_mut() {
-            *e /= max_value;
-        }
-    }
-
-    EdgeMap {
-        width,
-        height,
-        data: edges,
-        max_value,
-    }
-}
-
-/// Color gradient magnitude (using Lab space for perceptual accuracy)
-pub fn compute_color_gradient(pixels: &[Rgb], width: usize, height: usize) -> EdgeMap {
-    use crate::color::Lab;
-
-    let labs: Vec<Lab> = pixels.iter().map(|p| p.to_lab()).collect();
-
-    let mut edges = vec![0.0f32; width * height];
-    let mut max_value: f32 = 0.0;
-
-    for y in 1..height.saturating_sub(1) {
-        for x in 1..width.saturating_sub(1) {
-            let center = labs[y * width + x];
-
-            // Compute maximum color difference with neighbors
-            let mut max_diff: f32 = 0.0;
-
-            for dy in -1i32..=1 {
-                for dx in -1i32..=1 {
-                    if dx == 0 && dy == 0 {
-                        continue;
-                    }
-                    let nx = (x as i32 + dx) as usize;
-                    let ny = (y as i32 + dy) as usize;
-                    let neighbor = labs[ny * width + nx];
-                    let diff = center.distance(neighbor);
-                    max_diff = max_diff.max(diff);
-                }
-            }
-
-            edges[y * width + x] = max_diff;
-            max_value = max_value.max(max_diff);
-        }
-    }
-
-    // Normalize
-    if max_value > 0.0 {
-        for e in edges.iter_mut() {
-            *e /= max_value;
-        }
-    }
-
-    EdgeMap {
-        width,
-        height,
-        data: edges,
-        max_value,
-    }
-}
-
-/// Combined edge detection (luminance + color)
+/// Compute combined edge map using Scharr operator and color distance
 pub fn compute_combined_edges(
     pixels: &[Rgb],
     width: usize,
     height: usize,
-    luminance_weight: f32,
-    color_weight: f32,
+    color_sensitivity: f32,
+    edge_weight: f32,
 ) -> EdgeMap {
-    let lum_edges = compute_edge_map(pixels, width, height);
-    let color_edges = compute_color_gradient(pixels, width, height);
+    let mut edge_data = vec![0.0; width * height];
+    let mut max_val = 0.0f32;
 
-    let total_weight = luminance_weight + color_weight;
-    let lw = luminance_weight / total_weight;
-    let cw = color_weight / total_weight;
+    for y in 1..height - 1 {
+        for x in 1..width - 1 {
+            // Scharr operator
+            // [ 3 10  3]
+            // [ 0  0  0]
+            // [-3 -10 -3]
+            //
+            // [ 3  0 -3]
+            // [10  0 -10]
+            // [ 3  0 -3]
 
-    let mut combined = vec![0.0f32; width * height];
-    let mut max_value: f32 = 0.0;
+            let idx = y * width + x;
+            let mut gx = 0.0;
+            let mut gy = 0.0;
 
-    for i in 0..combined.len() {
-        combined[i] = lum_edges.data[i] * lw + color_edges.data[i] * cw;
-        max_value = max_value.max(combined[i]);
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let pixel_idx = (y as isize + dy) as usize * width + (x as isize + dx) as usize;
+                    let lum = pixels[pixel_idx].luminance();
+                    
+                    let weight_x = match (dx, dy) {
+                        (-1, -1) => 3.0, (-1, 0) => 10.0, (-1, 1) => 3.0,
+                        (1, -1) => -3.0, (1, 0) => -10.0, (1, 1) => -3.0,
+                        _ => 0.0
+                    };
+                    
+                    let weight_y = match (dx, dy) {
+                        (-1, -1) => 3.0, (0, -1) => 10.0, (1, -1) => 3.0,
+                        (-1, 1) => -3.0, (0, 1) => -10.0, (1, 1) => -3.0,
+                        _ => 0.0
+                    };
+
+                    gx += lum * weight_x;
+                    gy += lum * weight_y;
+                }
+            }
+
+            let magnitude = (gx * gx + gy * gy).sqrt();
+            let val = magnitude * edge_weight * color_sensitivity;
+            edge_data[idx] = val;
+            if val > max_val {
+                max_val = val;
+            }
+        }
     }
 
     EdgeMap {
         width,
         height,
-        data: combined,
-        max_value,
-    }
-}
-
-/// Gradient direction at each pixel (for advanced edge analysis)
-#[derive(Clone, Debug)]
-pub struct GradientField {
-    pub width: usize,
-    pub height: usize,
-    /// Gradient angle in radians [-π, π]
-    pub angles: Vec<f32>,
-    /// Gradient magnitude
-    pub magnitudes: Vec<f32>,
-}
-
-impl GradientField {
-    pub fn get_angle(&self, x: usize, y: usize) -> f32 {
-        if x < self.width && y < self.height {
-            self.angles[y * self.width + x]
-        } else {
-            0.0
-        }
-    }
-
-    pub fn get_magnitude(&self, x: usize, y: usize) -> f32 {
-        if x < self.width && y < self.height {
-            self.magnitudes[y * self.width + x]
-        } else {
-            0.0
-        }
-    }
-}
-
-/// Compute gradient field with both magnitude and direction
-pub fn compute_gradient_field(pixels: &[Rgb], width: usize, height: usize) -> GradientField {
-    let luminance: Vec<f32> = pixels.iter().map(|p| p.luminance()).collect();
-
-    let mut angles = vec![0.0f32; width * height];
-    let mut magnitudes = vec![0.0f32; width * height];
-
-    for y in 1..height.saturating_sub(1) {
-        for x in 1..width.saturating_sub(1) {
-            let get = |dx: i32, dy: i32| -> f32 {
-                let px = (x as i32 + dx) as usize;
-                let py = (y as i32 + dy) as usize;
-                luminance[py * width + px]
-            };
-
-            let gx = -get(-1, -1) - 2.0 * get(-1, 0) - get(-1, 1)
-                   + get(1, -1) + 2.0 * get(1, 0) + get(1, 1);
-
-            let gy = -get(-1, -1) - 2.0 * get(0, -1) - get(1, -1)
-                   + get(-1, 1) + 2.0 * get(0, 1) + get(1, 1);
-
-            let idx = y * width + x;
-            magnitudes[idx] = (gx * gx + gy * gy).sqrt();
-            angles[idx] = gy.atan2(gx);
-        }
-    }
-
-    GradientField {
-        width,
-        height,
-        angles,
-        magnitudes,
+        data: edge_data,
+        max_value: max_val,
     }
 }

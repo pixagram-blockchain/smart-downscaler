@@ -1,5 +1,5 @@
-//! Smart pixel art downscaler with region-aware color quantization.
-//! Optimized with Fixed Point arithmetic and zero-allocation loops.
+/// Smart pixel art downscaler with region-aware color quantization.
+/// Optimized with Fixed Point arithmetic, zero-allocation loops, and Spatial KD-Tree pruning.
 
 use crate::color::{Oklab, OklabAccumulator, Rgb, OklabFixed};
 use crate::edge::{compute_combined_edges, EdgeMap};
@@ -293,7 +293,7 @@ fn get_tile_color_kcentroid(
     scratch.centroids[best_idx]
 }
 
-/// Fully optimized initial assignment using fixed point math and stack allocations
+/// Fully optimized initial assignment using fixed point math, stack allocations, and KD-Tree
 fn initial_assignment_fixed_optimized(
     source_pixels: &[Rgb],
     source_width: usize,
@@ -322,10 +322,9 @@ fn initial_assignment_fixed_optimized(
     let mut tile_fixed_oklabs = vec![OklabFixed::default(); tw * th];
     
     let max_segments = segmentation.map(|s| s.num_segments).unwrap_or(0);
-    // Use Vec for segments as they can be large, but reuse it
     let mut segment_counts = vec![0usize; max_segments.max(1)];
     
-    // Stack-allocated neighbors for speed (up to 4 for initial pass)
+    // Stack-allocated neighbors for speed
     let mut neighbor_indices = [0usize; 4];
     let mut neighbor_count: usize;
 
@@ -394,7 +393,7 @@ fn initial_assignment_fixed_optimized(
     (assignments, tile_fixed_oklabs)
 }
 
-/// Integer-only palette matching loop
+/// Integer-only palette matching with KD-Tree Acceleration
 #[inline(always)]
 fn find_best_palette_match_fixed(
     target: OklabFixed,
@@ -410,20 +409,14 @@ fn find_best_palette_match_fixed(
 
     let palette_len = palette.fixed_colors.len();
     
-    // Scale weights to integers (x 1024) to avoid floats in inner loop
-    // Base distance is scaled by 4096 (OklabFixed), squared ~ 2^24.
-    // We need to be careful with overflow if we multiply large distances.
-    // OklabFixed dist is roughly i32. 
-    // Let's use float for the weights combinator only, but keep distance int.
-    
-    // Use small stack array for neighbor counting
-    let mut neighbor_counts = [0u8; 64]; 
-    let use_stack = palette_len <= 64;
-    
-    // Fallback for huge palettes
+    // Stack Alloc
+    let mut neighbor_counts = [0u8; 256]; 
+    let use_stack = palette_len <= 256;
     let mut heap_counts = if !use_stack { vec![0u8; palette_len] } else { Vec::new() };
     let counts = if use_stack { &mut neighbor_counts[..palette_len] } else { &mut heap_counts };
+    counts.fill(0);
 
+    // Track neighbors to scan them explicitly
     for &idx in neighbor_indices {
         if idx < counts.len() { counts[idx] = counts[idx].saturating_add(1); }
     }
@@ -434,21 +427,52 @@ fn find_best_palette_match_fixed(
     let mut best_idx = 0;
     let mut best_score = f32::MAX;
 
-    for (i, &p_fixed) in palette.fixed_colors.iter().enumerate() {
-        // Integer distance
+    // 1. Initial Scan: Neighbors ONLY
+    for &idx in neighbor_indices {
+        if idx >= palette_len { continue; }
+        
+        let p_fixed = palette.fixed_colors[idx];
         let dist = target.distance_squared(p_fixed);
         
-        // Weight calculation (Float - unavoidable due to weights but much fewer ops)
-        let neighbor_bias = (counts[i] as f32 / max_neighbor) * neighbor_weight;
+        let neighbor_bias = (counts[idx] as f32 / max_neighbor) * neighbor_weight;
         let total_bias = (neighbor_bias + region_bonus).min(0.9);
-        
         let score = (dist as f32) * (1.0 - total_bias);
         
         if score < best_score {
             best_score = score;
-            best_idx = i;
+            best_idx = idx;
         }
     }
+
+    // 2. Spatial Search: KD-Tree (or Linear if small)
+    let non_neighbor_bias = region_bonus.min(0.9);
+    
+    // Optimization: If best_score is already extremely low, skip tree
+    if best_score < 1.0 { return best_idx; }
+
+    if palette.use_tree {
+        let inv_bias = 1.0 / (1.0 - non_neighbor_bias);
+        let (tree_idx, tree_dist) = palette.find_nearest_pruned(target, best_score, inv_bias);
+        let tree_score = tree_dist * (1.0 - non_neighbor_bias);
+        
+        if tree_score < best_score {
+            best_idx = tree_idx;
+        }
+    } else {
+        // Linear Search (Fallback)
+        for (i, &p_fixed) in palette.fixed_colors.iter().enumerate() {
+            if counts[i] > 0 { continue; } // Already checked in neighbors
+            
+            let dist = target.distance_squared(p_fixed);
+            let score = (dist as f32) * (1.0 - non_neighbor_bias);
+            
+            if score < best_score {
+                best_score = score;
+                best_idx = i;
+            }
+        }
+    }
+
     best_idx
 }
 
@@ -461,10 +485,8 @@ fn refinement_pass_fixed(
     neighbor_weight: f32,
 ) -> bool {
     let mut changed = false;
-    // Clone is unavoidable here as we need previous state
     let original = assignments.to_vec();
     
-    // Stack allocation for neighbors
     let mut neighbor_indices = [0usize; 8];
     let mut neighbor_count;
 
@@ -474,11 +496,9 @@ fn refinement_pass_fixed(
             let tile_oklab = tile_fixed_oklabs[idx];
             
             neighbor_count = 0;
-            // Manual unroll for 8 neighbors logic
             let ym = y.wrapping_sub(1); let yp = y + 1;
             let xm = x.wrapping_sub(1); let xp = x + 1;
             
-            // Checks using usize wrapping logic for bounds
             if ym < height {
                 if xm < width { neighbor_indices[neighbor_count] = original[ym * width + xm] as usize; neighbor_count += 1; }
                 neighbor_indices[neighbor_count] = original[ym * width + x] as usize; neighbor_count += 1;
