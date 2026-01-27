@@ -1,15 +1,21 @@
 //! WebAssembly interface for the smart downscaler.
+//! Fully implements the API expected by js/smart-downscaler.js
 
 use crate::color::Rgb;
 use crate::downscale::{
-    smart_downscale, DownscaleConfig, DownscaleResult, SegmentationMethod,
+    smart_downscale, smart_downscale_with_palette, DownscaleConfig, DownscaleResult, SegmentationMethod,
 };
 use crate::hierarchy::HierarchyConfig;
-use crate::palette::PaletteStrategy;
+use crate::palette::{extract_palette_with_strategy, Palette, PaletteStrategy};
 use crate::slic::SlicConfig;
 use crate::fast::morton_encode_rgb;
 use wasm_bindgen::prelude::*;
 use std::collections::HashMap;
+use serde::Serialize;
+
+// =============================================================================
+// Legacy Class (Kept for backward compatibility)
+// =============================================================================
 
 #[wasm_bindgen]
 pub struct SmartDownscaler {
@@ -30,32 +36,18 @@ impl SmartDownscaler {
             segmentation_method: 0,
         }
     }
-
-    pub fn set_palette_size(&mut self, size: usize) {
-        self.config.palette_size = size;
-    }
-
-    pub fn set_kmeans_iterations(&mut self, iterations: usize) {
-        self.config.kmeans_iterations = iterations;
-    }
-
-    pub fn set_neighbor_weight(&mut self, weight: f32) {
-        self.config.neighbor_weight = weight;
-    }
-
-    pub fn set_region_weight(&mut self, weight: f32) {
-        self.config.region_weight = weight;
-    }
-
+    
+    // Legacy setters (delegated to WasmDownscaleConfig in new JS code, 
+    // but kept here if old code instantiates SmartDownscaler directly)
+    pub fn set_palette_size(&mut self, size: usize) { self.config.palette_size = size; }
+    pub fn set_kmeans_iterations(&mut self, iterations: usize) { self.config.kmeans_iterations = iterations; }
+    pub fn set_neighbor_weight(&mut self, weight: f32) { self.config.neighbor_weight = weight; }
+    pub fn set_region_weight(&mut self, weight: f32) { self.config.region_weight = weight; }
     pub fn set_refinement_iterations(&mut self, iterations: usize) {
         self.config.refinement_iterations = iterations;
         self.config.two_pass_refinement = iterations > 0;
     }
-
-    pub fn set_edge_weight(&mut self, weight: f32) {
-        self.config.edge_weight = weight;
-    }
-
+    pub fn set_edge_weight(&mut self, weight: f32) { self.config.edge_weight = weight; }
     pub fn set_palette_strategy(&mut self, strategy: u8) {
         self.config.palette_strategy = match strategy {
             0 => PaletteStrategy::OklabMedianCut,
@@ -67,33 +59,42 @@ impl SmartDownscaler {
             _ => PaletteStrategy::OklabMedianCut,
         };
     }
-
-    pub fn set_max_resolution(&mut self, mp: f32) {
-        self.config.max_resolution_mp = mp;
-    }
-
-    pub fn set_max_color_preprocess(&mut self, count: usize) {
-        self.config.max_color_preprocess = count;
-    }
-
-    pub fn set_k_centroid(&mut self, k: usize) {
-        self.config.k_centroid = k;
-    }
-
-    pub fn set_k_centroid_iterations(&mut self, iterations: usize) {
-        self.config.k_centroid_iterations = iterations;
-    }
-
+    pub fn set_max_resolution(&mut self, mp: f32) { self.config.max_resolution_mp = mp; }
+    pub fn set_max_color_preprocess(&mut self, count: usize) { self.config.max_color_preprocess = count; }
+    pub fn set_k_centroid(&mut self, k: usize) { self.config.k_centroid = k; }
+    pub fn set_k_centroid_iterations(&mut self, iterations: usize) { self.config.k_centroid_iterations = iterations; }
+    
     pub fn set_segmentation_method(&mut self, method: u8) {
         self.segmentation_method = method;
+        self.update_segmentation();
     }
-
     pub fn set_slic_params(&mut self, region_size: usize, _compactness: f32, _iterations: usize) {
         self.slic_superpixels = region_size; 
+        self.update_segmentation();
     }
-
     pub fn set_hierarchy_params(&mut self, threshold: f32) {
         self.hierarchy_threshold = threshold;
+        self.update_segmentation();
+    }
+
+    fn update_segmentation(&mut self) {
+        self.config.segmentation = if self.segmentation_method == 1 {
+            SegmentationMethod::Slic(SlicConfig {
+                region_size: self.slic_superpixels,
+                iterations: 10,
+                compactness: 10.0,
+                perturb_seeds: true,
+            })
+        } else if self.segmentation_method == 2 {
+            SegmentationMethod::Hierarchy(HierarchyConfig {
+                color_threshold: self.hierarchy_threshold,
+                min_region_size: 4,
+                max_regions: 0,
+                spatial_weight: 0.1,
+            })
+        } else {
+            SegmentationMethod::None
+        };
     }
 
     pub fn process(
@@ -104,33 +105,7 @@ impl SmartDownscaler {
         target_width: u32,
         target_height: u32,
     ) -> WasmDownscaleResult {
-        let pixel_count = width * height;
-        let mut pixels = Vec::with_capacity(pixel_count);
-        for i in 0..pixel_count {
-            let base = i * 4;
-            pixels.push(Rgb::new(image_data[base], image_data[base + 1], image_data[base + 2]));
-        }
-
-        self.config.segmentation = if self.segmentation_method == 1 {
-            let slic_config = SlicConfig {
-                region_size: self.slic_superpixels,
-                iterations: 10,
-                compactness: 10.0,
-                perturb_seeds: true,
-            };
-            SegmentationMethod::Slic(slic_config)
-        } else if self.segmentation_method == 2 {
-            let hierarchy_config = HierarchyConfig {
-                color_threshold: self.hierarchy_threshold,
-                min_region_size: 4,
-                max_regions: 0,
-                spatial_weight: 0.1,
-            };
-            SegmentationMethod::Hierarchy(hierarchy_config)
-        } else {
-            SegmentationMethod::None
-        };
-
+        let pixels = bytes_to_pixels(image_data, width * height);
         let result = smart_downscale(
             &pixels,
             width,
@@ -139,13 +114,12 @@ impl SmartDownscaler {
             target_height,
             &self.config,
         );
-
         WasmDownscaleResult::from(result)
     }
 }
 
 // =============================================================================
-// NEW: WasmDownscaleConfig & Helper Functions
+// Configuration Object
 // =============================================================================
 
 #[wasm_bindgen]
@@ -168,33 +142,48 @@ impl WasmDownscaleConfig {
         }
     }
 
-    // --- Replicated Setters for Configuration ---
+    // --- Static Presets (Required by js/smart-downscaler.js) ---
 
-    pub fn set_palette_size(&mut self, size: usize) {
-        self.inner.palette_size = size;
+    pub fn fast() -> Self {
+        let mut config = Self::new();
+        config.inner.max_resolution_mp = 1.0;
+        config.inner.max_color_preprocess = 8192;
+        config
     }
 
-    pub fn set_kmeans_iterations(&mut self, iterations: usize) {
-        self.inner.kmeans_iterations = iterations;
+    pub fn quality() -> Self {
+        let mut config = Self::new();
+        config.inner.max_resolution_mp = 2.0;
+        config.inner.max_color_preprocess = 32768;
+        config
     }
 
-    pub fn set_neighbor_weight(&mut self, weight: f32) {
-        self.inner.neighbor_weight = weight;
+    pub fn vibrant() -> Self {
+        let mut config = Self::new();
+        config.inner.max_resolution_mp = 1.5;
+        config.inner.max_color_preprocess = 16384;
+        config.inner.palette_strategy = PaletteStrategy::SaturationWeighted;
+        config
     }
 
-    pub fn set_region_weight(&mut self, weight: f32) {
-        self.inner.region_weight = weight;
+    pub fn exact_colors() -> Self {
+        let mut config = Self::new();
+        config.inner.palette_strategy = PaletteStrategy::Medoid;
+        config.inner.max_resolution_mp = 0.0; // Disable downscaling during preprocess
+        config
     }
 
+    // --- Setters ---
+
+    pub fn set_palette_size(&mut self, size: usize) { self.inner.palette_size = size; }
+    pub fn set_kmeans_iterations(&mut self, iterations: usize) { self.inner.kmeans_iterations = iterations; }
+    pub fn set_neighbor_weight(&mut self, weight: f32) { self.inner.neighbor_weight = weight; }
+    pub fn set_region_weight(&mut self, weight: f32) { self.inner.region_weight = weight; }
     pub fn set_refinement_iterations(&mut self, iterations: usize) {
         self.inner.refinement_iterations = iterations;
         self.inner.two_pass_refinement = iterations > 0;
     }
-
-    pub fn set_edge_weight(&mut self, weight: f32) {
-        self.inner.edge_weight = weight;
-    }
-
+    pub fn set_edge_weight(&mut self, weight: f32) { self.inner.edge_weight = weight; }
     pub fn set_palette_strategy(&mut self, strategy: u8) {
         self.inner.palette_strategy = match strategy {
             0 => PaletteStrategy::OklabMedianCut,
@@ -206,33 +195,19 @@ impl WasmDownscaleConfig {
             _ => PaletteStrategy::OklabMedianCut,
         };
     }
-
-    pub fn set_max_resolution(&mut self, mp: f32) {
-        self.inner.max_resolution_mp = mp;
-    }
-
-    pub fn set_max_color_preprocess(&mut self, count: usize) {
-        self.inner.max_color_preprocess = count;
-    }
-
-    pub fn set_k_centroid(&mut self, k: usize) {
-        self.inner.k_centroid = k;
-    }
-
-    pub fn set_k_centroid_iterations(&mut self, iterations: usize) {
-        self.inner.k_centroid_iterations = iterations;
-    }
-
+    pub fn set_max_resolution(&mut self, mp: f32) { self.inner.max_resolution_mp = mp; }
+    pub fn set_max_color_preprocess(&mut self, count: usize) { self.inner.max_color_preprocess = count; }
+    pub fn set_k_centroid(&mut self, k: usize) { self.inner.k_centroid = k; }
+    pub fn set_k_centroid_iterations(&mut self, iterations: usize) { self.inner.k_centroid_iterations = iterations; }
+    
     pub fn set_segmentation_method(&mut self, method: u8) {
         self.segmentation_method = method;
         self.update_segmentation();
     }
-
     pub fn set_slic_params(&mut self, region_size: usize, _compactness: f32, _iterations: usize) {
         self.slic_superpixels = region_size; 
         self.update_segmentation();
     }
-
     pub fn set_hierarchy_params(&mut self, threshold: f32) {
         self.hierarchy_threshold = threshold;
         self.update_segmentation();
@@ -240,27 +215,30 @@ impl WasmDownscaleConfig {
 
     fn update_segmentation(&mut self) {
         self.inner.segmentation = if self.segmentation_method == 1 {
-            let slic_config = SlicConfig {
+            SegmentationMethod::Slic(SlicConfig {
                 region_size: self.slic_superpixels,
                 iterations: 10,
                 compactness: 10.0,
                 perturb_seeds: true,
-            };
-            SegmentationMethod::Slic(slic_config)
+            })
         } else if self.segmentation_method == 2 {
-            let hierarchy_config = HierarchyConfig {
+            SegmentationMethod::Hierarchy(HierarchyConfig {
                 color_threshold: self.hierarchy_threshold,
                 min_region_size: 4,
                 max_regions: 0,
                 spatial_weight: 0.1,
-            };
-            SegmentationMethod::Hierarchy(hierarchy_config)
+            })
         } else {
             SegmentationMethod::None
         };
     }
 }
 
+// =============================================================================
+// Core Exported Functions
+// =============================================================================
+
+/// Standard downscaling
 #[wasm_bindgen]
 pub fn downscale_rgba(
     image_data: &[u8],
@@ -270,19 +248,7 @@ pub fn downscale_rgba(
     target_height: u32,
     config: &WasmDownscaleConfig,
 ) -> WasmDownscaleResult {
-    let pixel_count = width * height;
-    let mut pixels = Vec::with_capacity(pixel_count);
-    
-    // Convert RGBA bytes to Rgb struct
-    for i in 0..pixel_count {
-        let base = i * 4;
-        if base + 2 < image_data.len() {
-            pixels.push(Rgb::new(image_data[base], image_data[base + 1], image_data[base + 2]));
-        } else {
-            pixels.push(Rgb::default());
-        }
-    }
-
+    let pixels = bytes_to_pixels(image_data, width * height);
     let result = smart_downscale(
         &pixels,
         width,
@@ -291,12 +257,114 @@ pub fn downscale_rgba(
         target_height,
         &config.inner,
     );
+    WasmDownscaleResult::from(result)
+}
+
+/// Downscaling with a specific palette
+#[wasm_bindgen]
+pub fn downscale_with_palette(
+    image_data: &[u8],
+    width: usize,
+    height: usize,
+    target_width: u32,
+    target_height: u32,
+    palette_flat: &[u8],
+    config: &WasmDownscaleConfig,
+) -> WasmDownscaleResult {
+    let pixels = bytes_to_pixels(image_data, width * height);
+    
+    // Parse flat palette [r, g, b, r, g, b...]
+    let mut palette_colors = Vec::with_capacity(palette_flat.len() / 3);
+    for chunk in palette_flat.chunks_exact(3) {
+        palette_colors.push(Rgb::new(chunk[0], chunk[1], chunk[2]));
+    }
+    let palette = Palette::new(palette_colors);
+
+    let result = smart_downscale_with_palette(
+        &pixels,
+        width,
+        height,
+        target_width,
+        target_height,
+        palette,
+        &config.inner,
+    );
 
     WasmDownscaleResult::from(result)
 }
 
+/// Extract palette from image
+#[wasm_bindgen]
+pub fn extract_palette_from_image(
+    image_data: &[u8],
+    width: usize,
+    height: usize,
+    num_colors: usize,
+    kmeans_iterations: usize,
+) -> Vec<u8> {
+    let pixels = bytes_to_pixels(image_data, width * height);
+    
+    let palette = extract_palette_with_strategy(
+        &pixels,
+        num_colors,
+        kmeans_iterations,
+        PaletteStrategy::OklabMedianCut, 
+    );
+
+    // Return flattened [r, g, b, r, g, b...]
+    palette.colors.iter().flat_map(|p| [p.r, p.g, p.b]).collect()
+}
+
+/// Quantize image to palette (No resizing)
+#[wasm_bindgen]
+pub fn quantize_to_palette(
+    image_data: &[u8],
+    width: usize,
+    height: usize,
+    palette_flat: &[u8],
+) -> WasmDownscaleResult {
+    // Re-use downscale_with_palette with target size = source size
+    // and a default config optimized for exact matching
+    let mut config = WasmDownscaleConfig::new();
+    config.inner.max_resolution_mp = 0.0; // Disable preprocessing
+    config.inner.max_color_preprocess = 0;
+    
+    downscale_with_palette(
+        image_data, 
+        width, 
+        height, 
+        width as u32, 
+        height as u32, 
+        palette_flat, 
+        &config
+    )
+}
+
+#[wasm_bindgen]
+pub fn version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 // =============================================================================
-// NEW: Color Analysis
+// Helper: Byte array to Rgb vector
+// =============================================================================
+
+fn bytes_to_pixels(image_data: &[u8], pixel_count: usize) -> Vec<Rgb> {
+    let mut pixels = Vec::with_capacity(pixel_count);
+    let max_len = image_data.len();
+    for i in 0..pixel_count {
+        let base = i * 4;
+        if base + 2 < max_len {
+            pixels.push(Rgb::new(image_data[base], image_data[base + 1], image_data[base + 2]));
+        } else {
+            pixels.push(Rgb::default());
+        }
+    }
+    pixels
+}
+
+// =============================================================================
+// Color Analysis 
 // =============================================================================
 
 #[wasm_bindgen]
@@ -307,22 +375,22 @@ pub struct ColorAnalysisResult {
     colors: Vec<ColorEntry>,
 }
 
+#[derive(Clone, Serialize)]
 #[wasm_bindgen]
-#[derive(Clone, Copy)]
 pub struct ColorEntry {
     pub r: u8,
     pub g: u8,
     pub b: u8,
     pub count: u32,
     pub percentage: f32,
+    #[wasm_bindgen(skip)]
+    pub hex: String, 
 }
 
 #[wasm_bindgen]
 impl ColorEntry {
     #[wasm_bindgen(getter)]
-    pub fn hex(&self) -> String {
-        format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
-    }
+    pub fn hex(&self) -> String { self.hex.clone() }
 }
 
 #[wasm_bindgen]
@@ -336,25 +404,25 @@ impl ColorAnalysisResult {
     #[wasm_bindgen(getter = totalPixels)]
     pub fn total_pixels(&self) -> usize { self.total_pixels }
     
-    pub fn getColor(&self, index: usize) -> Option<ColorEntry> {
+    #[wasm_bindgen(js_name = getColor)]
+    pub fn get_color(&self, index: usize) -> Option<ColorEntry> {
         self.colors.get(index).cloned()
     }
     
-    pub fn getColorsFlat(&self) -> Vec<u8> {
-        // Layout: R, G, B, Count (u32 LE), Percentage (f32 LE)
+    #[wasm_bindgen(js_name = getColorsFlat)]
+    pub fn get_colors_flat(&self) -> Vec<u8> {
         let mut flat = Vec::with_capacity(self.colors.len() * 11);
         for c in &self.colors {
-            flat.push(c.r);
-            flat.push(c.g);
-            flat.push(c.b);
+            flat.push(c.r); flat.push(c.g); flat.push(c.b);
             flat.extend_from_slice(&c.count.to_le_bytes());
             flat.extend_from_slice(&c.percentage.to_le_bytes());
         }
         flat
     }
     
-    pub fn toJson(&self) -> Vec<ColorEntry> {
-        self.colors.clone()
+    #[wasm_bindgen(js_name = toJson)]
+    pub fn to_json(&self) -> Result<JsValue, JsValue> {
+        serde_wasm_bindgen::to_value(&self.colors).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 }
 
@@ -389,13 +457,13 @@ pub fn analyze_colors(
             r: rgb.r, g: rgb.g, b: rgb.b,
             count,
             percentage: (count as f32 / total_pixels as f32) * 100.0,
+            hex: format!("#{:02x}{:02x}{:02x}", rgb.r, rgb.g, rgb.b),
         }
     }).collect();
     
     match sort_method {
         "frequency" => entries.sort_by(|a, b| b.count.cmp(&a.count)),
         "morton" | "hilbert" => {
-            // Hilbert uses Morton as fallback/approximation if not explicitly implemented
             entries.sort_by_key(|c| morton_encode_rgb(c.r, c.g, c.b))
         },
         _ => {}
@@ -410,7 +478,7 @@ pub fn analyze_colors(
 }
 
 // =============================================================================
-// Existing Result Structure
+// Result Structure
 // =============================================================================
 
 #[wasm_bindgen]
@@ -420,25 +488,16 @@ pub struct WasmDownscaleResult {
     rgba_data: Vec<u8>,
     palette_data: Vec<u8>,
     indices: Vec<u8>,
+    pub palette_size: usize,
 }
 
 #[wasm_bindgen]
 impl WasmDownscaleResult {
-    pub fn width(&self) -> u32 {
-        self.width
-    }
-    pub fn height(&self) -> u32 {
-        self.height
-    }
-    pub fn get_rgba_data(&self) -> Vec<u8> {
-        self.rgba_data.clone()
-    }
-    pub fn get_palette_data(&self) -> Vec<u8> {
-        self.palette_data.clone()
-    }
-    pub fn get_indices(&self) -> Vec<u8> {
-        self.indices.clone()
-    }
+    pub fn width(&self) -> u32 { self.width }
+    pub fn height(&self) -> u32 { self.height }
+    pub fn get_rgba_data(&self) -> Vec<u8> { self.rgba_data.clone() }
+    pub fn get_palette_data(&self) -> Vec<u8> { self.palette_data.clone() }
+    pub fn get_indices(&self) -> Vec<u8> { self.indices.clone() }
 }
 
 impl From<DownscaleResult> for WasmDownscaleResult {
@@ -451,6 +510,7 @@ impl From<DownscaleResult> for WasmDownscaleResult {
             rgba_data,
             palette_data,
             indices: result.palette_indices,
+            palette_size: result.palette.len(),
         }
     }
 }
