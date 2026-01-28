@@ -3,17 +3,16 @@
 //! Implements bottom-up hierarchical clustering that groups pixels
 //! into coherent regions based on color similarity, inspired by
 //! the VTracer algorithm's preprocessing stage.
-//! Optimized with OklabFixed for integer comparisons.
 
-use crate::color::{Rgb, OklabFixed};
+use crate::color::{Lab, Rgb};
 use ordered_float::OrderedFloat;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 /// Configuration for hierarchical clustering
 #[derive(Clone, Debug)]
 pub struct HierarchyConfig {
-    /// Maximum color distance to merge regions (in float Oklab units)
-    pub color_threshold: f32,
+    /// Maximum color distance to merge regions
+    pub merge_threshold: f32,
     /// Minimum region size (pixels)
     pub min_region_size: usize,
     /// Maximum number of regions (0 = unlimited)
@@ -25,7 +24,7 @@ pub struct HierarchyConfig {
 impl Default for HierarchyConfig {
     fn default() -> Self {
         Self {
-            color_threshold: 0.1,
+            merge_threshold: 15.0,
             min_region_size: 4,
             max_regions: 0,
             spatial_weight: 0.1,
@@ -38,8 +37,8 @@ impl Default for HierarchyConfig {
 pub struct Region {
     /// Unique region ID
     pub id: usize,
-    /// Average color in Fixed Point Oklab space
-    pub color: OklabFixed,
+    /// Average color in Lab space
+    pub color: Lab,
     /// Centroid position
     pub centroid: (f32, f32),
     /// Number of pixels
@@ -57,7 +56,7 @@ pub struct Region {
 }
 
 impl Region {
-    fn new(id: usize, pixel_idx: usize, color: OklabFixed, x: usize, y: usize) -> Self {
+    fn new(id: usize, pixel_idx: usize, color: Lab, x: usize, y: usize) -> Self {
         Self {
             id,
             color,
@@ -112,7 +111,7 @@ impl Ord for MergeCandidate {
 
 /// Result of hierarchical clustering
 #[derive(Clone, Debug)]
-pub struct HierarchyResult {
+pub struct Hierarchy {
     pub width: usize,
     pub height: usize,
     /// All regions (including merged ones)
@@ -123,10 +122,9 @@ pub struct HierarchyResult {
     pub pixel_labels: Vec<usize>,
     /// Merge history: (merged_region, into_region)
     pub merge_history: Vec<(usize, usize)>,
-    pub num_segments: usize,
 }
 
-impl HierarchyResult {
+impl Hierarchy {
     /// Get the root region for a pixel (following parent chain)
     pub fn get_root_region(&self, pixel_idx: usize) -> usize {
         let mut region_id = self.pixel_labels[pixel_idx];
@@ -170,11 +168,28 @@ impl HierarchyResult {
             })
             .collect();
 
+        let num_segments = self.active_regions.len();
+        let mut segment_colors = vec![Lab::default(); num_segments];
+        let mut segment_centers = vec![(0.0f32, 0.0f32); num_segments];
+        let mut segment_sizes = vec![0usize; num_segments];
+
+        for &region_id in &self.active_regions {
+            if let Some(&mapped_id) = region_map.get(&region_id) {
+                let region = &self.regions[region_id];
+                segment_colors[mapped_id] = region.color;
+                segment_centers[mapped_id] = region.centroid;
+                segment_sizes[mapped_id] = region.size;
+            }
+        }
+
         crate::slic::Segmentation {
             width: self.width,
             height: self.height,
             labels,
-            num_segments: self.active_regions.len(),
+            num_segments,
+            segment_colors,
+            segment_centers,
+            segment_sizes,
         }
     }
 
@@ -214,9 +229,8 @@ pub fn hierarchical_cluster(
     width: usize,
     height: usize,
     config: &HierarchyConfig,
-) -> HierarchyResult {
-    // Optimization: Convert to OklabFixed once
-    let labs: Vec<OklabFixed> = pixels.iter().map(|p| p.to_oklab_fixed()).collect();
+) -> Hierarchy {
+    let labs: Vec<Lab> = pixels.iter().map(|p| p.to_lab()).collect();
     let num_pixels = width * height;
 
     // Initialize: each pixel is its own region
@@ -273,8 +287,7 @@ pub fn hierarchical_cluster(
                         config.spatial_weight,
                     );
 
-                    // Threshold check
-                    if cost <= config.color_threshold { 
+                    if cost <= config.merge_threshold {
                         merge_queue.push(MergeCandidate {
                             region_a: pair.0,
                             region_b: pair.1,
@@ -310,7 +323,7 @@ pub fn hierarchical_cluster(
             config.spatial_weight,
         );
 
-        if current_cost > config.color_threshold {
+        if current_cost > config.merge_threshold {
             continue;
         }
 
@@ -339,7 +352,7 @@ pub fn hierarchical_cluster(
                     config.spatial_weight,
                 );
 
-                if cost <= config.color_threshold {
+                if cost <= config.merge_threshold {
                     merge_queue.push(MergeCandidate {
                         region_a: pair.0,
                         region_b: pair.1,
@@ -369,26 +382,20 @@ pub fn hierarchical_cluster(
         *label = region_id;
     }
 
-    HierarchyResult {
+    Hierarchy {
         width,
         height,
         regions,
-        active_regions: active_regions.clone(),
+        active_regions,
         pixel_labels,
         merge_history,
-        num_segments: active_regions.len(),
     }
 }
 
 /// Compute the cost of merging two regions
 fn compute_merge_cost(region_a: &Region, region_b: &Region, spatial_weight: f32) -> f32 {
-    // Optimization: Integer distance squared
-    let color_dist_sq = region_a.color.distance_squared(region_b.color);
-    
-    // Convert back to float for weighted combination. 
-    // OklabFixed is scaled by 4096. 
-    // sqrt(dist_sq) / 4096.0 gives true Oklab distance.
-    let color_dist = (color_dist_sq as f32).sqrt() / 4096.0;
+    // Color distance
+    let color_dist = region_a.color.distance(region_b.color);
 
     // Spatial distance (centroid to centroid)
     let dx = region_a.centroid.0 - region_b.centroid.0;
@@ -409,8 +416,6 @@ fn merge_regions(
     let region_b_color = regions[region_b_id].color;
     let region_b_centroid = regions[region_b_id].centroid;
     let region_b_size = regions[region_b_id].size;
-    // Optimization: Don't clone pixels vec if not strictly needed for logic, 
-    // but here we need to transfer ownership to A.
     let region_b_pixels = std::mem::take(&mut regions[region_b_id].pixels);
     let region_b_neighbors = std::mem::take(&mut regions[region_b_id].neighbors);
     let region_b_bounds = regions[region_b_id].bounds;
@@ -420,27 +425,20 @@ fn merge_regions(
 
     // Update region A
     let total_size = regions[region_a_id].size + region_b_size;
-    let weight_a = regions[region_a_id].size as i32; // Use integer weights for color
-    let weight_b = region_b_size as i32;
-    let total_weight = weight_a + weight_b;
+    let weight_a = regions[region_a_id].size as f32 / total_size as f32;
+    let weight_b = region_b_size as f32 / total_size as f32;
 
-    // Weighted average color (Integer math)
-    let color_a = regions[region_a_id].color;
-    let color_b = region_b_color;
-    
-    regions[region_a_id].color = OklabFixed {
-        l: ((color_a.l as i32 * weight_a + color_b.l as i32 * weight_b) / total_weight) as i16,
-        a: ((color_a.a as i32 * weight_a + color_b.a as i32 * weight_b) / total_weight) as i16,
-        b: ((color_a.b as i32 * weight_a + color_b.b as i32 * weight_b) / total_weight) as i16,
-    };
+    // Weighted average color
+    regions[region_a_id].color = Lab::new(
+        regions[region_a_id].color.l * weight_a + region_b_color.l * weight_b,
+        regions[region_a_id].color.a * weight_a + region_b_color.a * weight_b,
+        regions[region_a_id].color.b * weight_a + region_b_color.b * weight_b,
+    );
 
-    // Weighted average centroid (Float math)
-    let f_weight_a = regions[region_a_id].size as f32 / total_size as f32;
-    let f_weight_b = region_b_size as f32 / total_size as f32;
-    
+    // Weighted average centroid
     regions[region_a_id].centroid = (
-        regions[region_a_id].centroid.0 * f_weight_a + region_b_centroid.0 * f_weight_b,
-        regions[region_a_id].centroid.1 * f_weight_a + region_b_centroid.1 * f_weight_b,
+        regions[region_a_id].centroid.0 * weight_a + region_b_centroid.0 * weight_b,
+        regions[region_a_id].centroid.1 * weight_a + region_b_centroid.1 * weight_b,
     );
 
     regions[region_a_id].size = total_size;
@@ -511,7 +509,7 @@ fn merge_small_regions(
                 .min_by(|&&a, &&b| {
                     let dist_a = small_color.distance_squared(regions[a].color);
                     let dist_b = small_color.distance_squared(regions[b].color);
-                    dist_a.cmp(&dist_b) // Integer comparison!
+                    dist_a.partial_cmp(&dist_b).unwrap()
                 })
                 .copied();
 
@@ -525,7 +523,7 @@ fn merge_small_regions(
 }
 
 // =============================================================================
-// Packed Union-Find Implementation (Optimized Fast Path)
+// Packed Union-Find Implementation
 // =============================================================================
 
 struct PackedDisjointSet {
@@ -535,6 +533,8 @@ struct PackedDisjointSet {
 
 impl PackedDisjointSet {
     fn new(size: usize) -> Self {
+        // Init: parent = index, rank = 0
+        // Since rank is 0, we just store the index
         let data = (0..size).map(|i| i as u32).collect();
         Self { data }
     }
@@ -542,13 +542,16 @@ impl PackedDisjointSet {
     #[inline]
     fn find(&mut self, mut x: usize) -> usize {
         let mut root = x;
+        // Extract parent (mask 0x0FFFFFFF)
         while (self.data[root] & 0x0FFFFFFF) as usize != root {
             root = (self.data[root] & 0x0FFFFFFF) as usize;
         }
         
+        // Path compression
         while x != root {
             let entry = self.data[x];
             let next = (entry & 0x0FFFFFFF) as usize;
+            // Preserve rank (top 4 bits), set new parent
             self.data[x] = (entry & 0xF0000000) | (root as u32);
             x = next;
         }
@@ -565,11 +568,17 @@ impl PackedDisjointSet {
             let rank_b = self.data[root_b] >> 28;
 
             if rank_a < rank_b {
+                // Attach A to B
+                // Keep rank_a same (it's now a child), update parent
                 self.data[root_a] = (self.data[root_a] & 0xF0000000) | (root_b as u32);
             } else if rank_a > rank_b {
+                // Attach B to A
                 self.data[root_b] = (self.data[root_b] & 0xF0000000) | (root_a as u32);
             } else {
+                // Ranks equal, attach B to A, increment A's rank
                 self.data[root_b] = (self.data[root_b] & 0xF0000000) | (root_a as u32);
+                
+                // Increment rank of A, clamped to 15 (max 4 bits)
                 let new_rank = (rank_a + 1).min(15);
                 self.data[root_a] = (new_rank << 28) | (self.data[root_a] & 0x0FFFFFFF);
             }
@@ -583,44 +592,37 @@ pub fn hierarchical_cluster_fast(
     width: usize,
     height: usize,
     color_threshold: f32,
-) -> HierarchyResult {
-    let labs: Vec<OklabFixed> = pixels.iter().map(|p| p.to_oklab_fixed()).collect();
+) -> Hierarchy {
+    let labs: Vec<Lab> = pixels.iter().map(|p| p.to_lab()).collect();
     let num_pixels = width * height;
 
     // Use packed union-find
     let mut dset = PackedDisjointSet::new(num_pixels);
 
     // Sort edges by color distance
-    let mut edges: Vec<(usize, usize, i32)> = Vec::with_capacity(num_pixels * 2);
+    let mut edges: Vec<(usize, usize, f32)> = Vec::with_capacity(num_pixels * 2);
 
     for y in 0..height {
         for x in 0..width {
             let idx = y * width + x;
             if x + 1 < width {
                 let neighbor = y * width + (x + 1);
-                let dist = labs[idx].distance_squared(labs[neighbor]);
+                let dist = labs[idx].distance(labs[neighbor]);
                 edges.push((idx, neighbor, dist));
             }
             if y + 1 < height {
                 let neighbor = (y + 1) * width + x;
-                let dist = labs[idx].distance_squared(labs[neighbor]);
+                let dist = labs[idx].distance(labs[neighbor]);
                 edges.push((idx, neighbor, dist));
             }
         }
     }
 
-    edges.sort_unstable_by(|a, b| a.2.cmp(&b.2)); // Integer comparison
-
-    // Threshold conversion: threshold is float (Oklab units).
-    // OklabFixed is 4096 * Oklab.
-    // dist_sq is (4096 * d)^2.
-    // We want dist_sq <= (4096 * threshold)^2
-    let thresh_scaled = color_threshold * 4096.0;
-    let thresh_sq = (thresh_scaled * thresh_scaled) as i32;
+    edges.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
 
     // Merge edges below threshold
     for (a, b, dist) in edges {
-        if dist > thresh_sq {
+        if dist > color_threshold {
             break;
         }
         dset.union(a, b);
@@ -632,11 +634,6 @@ pub fn hierarchical_cluster_fast(
     let mut active_regions: HashSet<usize> = HashSet::new();
     let mut pixel_labels = vec![0usize; num_pixels];
 
-    // Need to track counts for correct averaging in reconstruction
-    // Note: This 'fast' method builds regions from scratch after merge,
-    // so we don't need the complex merge_region logic inside the loop.
-    
-    // First pass: create regions
     for pixel_idx in 0..num_pixels {
         let root = dset.find(pixel_idx);
         
@@ -655,32 +652,23 @@ pub fn hierarchical_cluster_fast(
             let x = pixel_idx % width;
             let y = pixel_idx / width;
             let region = &mut regions[region_id];
-            
-            // Incremental average update
             region.pixels.push(pixel_idx);
             region.size += 1;
-            let n = region.size as i32;
-            
-            let c_curr = region.color;
-            let c_new = labs[pixel_idx];
-            
-            region.color = OklabFixed {
-                l: ((c_curr.l as i32 * (n - 1) + c_new.l as i32) / n) as i16,
-                a: ((c_curr.a as i32 * (n - 1) + c_new.a as i32) / n) as i16,
-                b: ((c_curr.b as i32 * (n - 1) + c_new.b as i32) / n) as i16,
-            };
-            
+            region.color = Lab::new(
+                (region.color.l * (region.size - 1) as f32 + labs[pixel_idx].l) / region.size as f32,
+                (region.color.a * (region.size - 1) as f32 + labs[pixel_idx].a) / region.size as f32,
+                (region.color.b * (region.size - 1) as f32 + labs[pixel_idx].b) / region.size as f32,
+            );
             region.update_bounds(x, y);
         }
     }
 
-    HierarchyResult {
+    Hierarchy {
         width,
         height,
         regions,
         active_regions,
         pixel_labels,
         merge_history: Vec::new(),
-        num_segments: region_map.len(),
     }
 }

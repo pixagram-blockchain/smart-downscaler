@@ -1,234 +1,228 @@
 //! Palette extraction using Median Cut and K-Means++ refinement.
-//! Optimized with integer-based Fixed Point lookups and KD-Tree acceleration.
+//!
+//! This module implements a multi-stage palette extraction pipeline:
+//! 1. Median Cut in Oklab space (perceptually uniform, preserves saturation)
+//! 2. Optional saturation-weighted sampling to preserve vibrant colors
+//! 3. K-Means++ refinement for final optimization
+//!
+//! Key improvements over naive RGB-space median cut:
+//! - Operations in Oklab prevent desaturation and darkening
+//! - Medoid selection uses actual image colors instead of computed averages
+//! - Saturation weighting ensures vibrant colors are represented
 
-use crate::color::{Lab, Oklab, Rgb, OklabFixed};
+use crate::color::{Lab, Oklab, Rgb};
 use std::collections::HashMap;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
+/// Palette extraction strategy
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum PaletteStrategy {
-    #[default] OklabMedianCut,
+    /// Standard Median Cut + K-Means in Oklab space (good balance)
+    #[default]
+    OklabMedianCut,
+    /// Median Cut with saturation weighting (preserves vibrant colors)
     SaturationWeighted,
+    /// Use medoids instead of centroids (exact image colors only)
     Medoid,
+    /// K-Means++ only (no Median Cut, good for small palettes)
     KMeansPlusPlus,
+    /// Legacy RGB-space Median Cut (for comparison, not recommended)
     LegacyRgb,
+    /// Bit-masked RGB Median Cut (fast, precise for high color counts)
     RgbBitmask,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct KdNode {
-    pub left: u32,
-    pub right: u32,
-    pub axis: u8,
-    pub split: i16,
-    pub color_idx: u16,
-    pub min: [i16; 3],
-    pub max: [i16; 3],
-}
-
+/// A color palette with precomputed Lab/Oklab values for fast matching
 #[derive(Clone, Debug)]
 pub struct Palette {
+    /// RGB colors in the palette
     pub colors: Vec<Rgb>,
-    pub oklab_colors: Vec<Oklab>,
+    /// Precomputed Lab values for each color
     pub lab_colors: Vec<Lab>,
-    pub fixed_colors: Vec<OklabFixed>,
-    pub tree: Vec<KdNode>,
-    pub use_tree: bool,
+    /// Precomputed Oklab values for each color
+    pub oklab_colors: Vec<Oklab>,
 }
 
 impl Palette {
+    /// Create a new palette from RGB colors
     pub fn new(colors: Vec<Rgb>) -> Self {
-        let oklab_colors: Vec<Oklab> = colors.iter().map(|&c| c.to_oklab()).collect();
-        let lab_colors: Vec<Lab> = colors.iter().map(|&c| c.to_lab()).collect();
-        let fixed_colors: Vec<OklabFixed> = oklab_colors.iter().map(|&c| OklabFixed::from_oklab(c)).collect();
-        
-        // Build KD-Tree if palette is large enough to justify overhead (> 32 colors)
-        let use_tree = fixed_colors.len() >= 32;
-        let tree = if use_tree {
-            build_kdtree(&fixed_colors)
-        } else {
-            Vec::new()
-        };
-
-        Self { colors, oklab_colors, lab_colors, fixed_colors, tree, use_tree }
+        let lab_colors = colors.iter().map(|&c| c.to_lab()).collect();
+        let oklab_colors = colors.iter().map(|&c| c.to_oklab()).collect();
+        Self { colors, lab_colors, oklab_colors }
     }
 
-    pub fn len(&self) -> usize { self.colors.len() }
-    pub fn is_empty(&self) -> bool { self.colors.is_empty() }
-
-    #[inline(always)]
-    pub fn find_nearest_fixed(&self, target: OklabFixed) -> usize {
-        if self.use_tree {
-            self.find_nearest_kdtree(target)
-        } else {
-            self.find_nearest_linear(target)
-        }
+    /// Number of colors in the palette
+    pub fn len(&self) -> usize {
+        self.colors.len()
     }
 
-    #[inline(always)]
-    fn find_nearest_linear(&self, target: OklabFixed) -> usize {
+    /// Check if palette is empty
+    pub fn is_empty(&self) -> bool {
+        self.colors.is_empty()
+    }
+
+    /// Find the index of the nearest palette color to the given Lab color
+    pub fn find_nearest(&self, lab: &Lab) -> usize {
+        self.lab_colors
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                lab.distance_squared(**a)
+                    .partial_cmp(&lab.distance_squared(**b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    }
+
+    /// Find nearest using Oklab (often better perceptual results)
+    pub fn find_nearest_oklab(&self, oklab: &Oklab) -> usize {
+        // Optimized branchless-style search
         let mut best_idx = 0;
-        let mut best_dist = i32::MAX;
-        for (i, &p) in self.fixed_colors.iter().enumerate() {
-            let dist = target.distance_squared(p);
+        let mut best_dist = f32::MAX;
+        
+        for (i, p) in self.oklab_colors.iter().enumerate() {
+            let dist = oklab.distance_squared(*p);
+            // Branchless update:
+            // if dist < best_dist { best_dist = dist; best_idx = i; }
             if dist < best_dist {
                 best_dist = dist;
                 best_idx = i;
-                if dist == 0 { break; }
             }
         }
         best_idx
     }
 
-    #[inline(always)]
-    fn find_nearest_kdtree(&self, target: OklabFixed) -> usize {
-        self.find_nearest_pruned(target, f32::MAX, 1.0).0
-    }
-
-    pub fn find_nearest_pruned(&self, target: OklabFixed, best_score_so_far: f32, inv_bias_factor: f32) -> (usize, f32) {
-        if !self.use_tree || self.tree.is_empty() {
-            return (self.find_nearest_linear(target), 0.0);
+    /// Find nearest color with bias toward neighbor colors
+    /// 
+    /// This creates spatial coherence by preferring colors already used nearby
+    pub fn find_nearest_biased(
+        &self,
+        lab: &Lab,
+        neighbor_indices: &[usize],
+        neighbor_weight: f32,
+    ) -> usize {
+        if neighbor_indices.is_empty() {
+            return self.find_nearest(lab);
         }
 
-        let mut stack = [(0u32, 0i32); 32];
-        let mut stack_ptr;
-        
-        let mut best_idx = 0;
-        let max_dist_float = best_score_so_far * inv_bias_factor;
-        let mut best_dist_sq = if max_dist_float >= 2e9 { i32::MAX } else { max_dist_float as i32 };
-        
-        stack[0] = (0, 0);
-        stack_ptr = 1;
-
-        let t_vals = [target.l, target.a, target.b];
-
-        while stack_ptr > 0 {
-            stack_ptr -= 1;
-            let (node_idx, box_dist) = stack[stack_ptr];
-
-            if box_dist >= best_dist_sq { continue; }
-
-            let node = &self.tree[node_idx as usize];
-            let p = self.fixed_colors[node.color_idx as usize];
-            let d = target.distance_squared(p);
-
-            if d < best_dist_sq {
-                best_dist_sq = d;
-                best_idx = node.color_idx as usize;
-            }
-
-            let axis = node.axis as usize;
-            let diff = t_vals[axis] - node.split;
-            
-            let near_idx = if diff <= 0 { node.left } else { node.right };
-            let far_idx = if diff <= 0 { node.right } else { node.left };
-
-            if far_idx != u32::MAX {
-                let plane_dist = (diff as i32) * (diff as i32);
-                if plane_dist < best_dist_sq {
-                    stack[stack_ptr] = (far_idx, plane_dist); 
-                    stack_ptr += 1;
-                }
-            }
-
-            if near_idx != u32::MAX {
-                stack[stack_ptr] = (near_idx, 0);
-                stack_ptr += 1;
+        // Count neighbor color frequencies
+        let mut neighbor_counts = vec![0usize; self.colors.len()];
+        for &idx in neighbor_indices {
+            if idx < neighbor_counts.len() {
+                neighbor_counts[idx] += 1;
             }
         }
-        
-        (best_idx, best_dist_sq as f32)
+
+        let max_count = neighbor_indices.len() as f32;
+
+        self.lab_colors
+            .iter()
+            .enumerate()
+            .min_by(|(i, a), (j, b)| {
+                let dist_a = lab.distance_squared(**a);
+                let dist_b = lab.distance_squared(**b);
+
+                // Bias formula: reduce distance for colors used by neighbors
+                let bias_a = (neighbor_counts[*i] as f32 / max_count) * neighbor_weight;
+                let bias_b = (neighbor_counts[*j] as f32 / max_count) * neighbor_weight;
+
+                // Multiply distance by (1 - bias) to favor neighbor colors
+                let score_a = dist_a * (1.0 - bias_a * 0.5);
+                let score_b = dist_b * (1.0 - bias_b * 0.5);
+
+                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0)
     }
 
-    pub fn find_nearest_oklab(&self, oklab: &Oklab) -> usize {
-        self.find_nearest_fixed(OklabFixed::from_oklab(*oklab))
-    }
-    
-    pub fn find_nearest(&self, lab: &Lab) -> usize {
-        self.find_nearest_oklab(&Oklab::from_rgb(lab.to_rgb()))
+    /// Find nearest color considering region membership
+    pub fn find_nearest_region_aware(
+        &self,
+        lab: &Lab,
+        neighbor_indices: &[usize],
+        same_region_indices: &[usize],
+        neighbor_weight: f32,
+        region_weight: f32,
+    ) -> usize {
+        if neighbor_indices.is_empty() && same_region_indices.is_empty() {
+            return self.find_nearest(lab);
+        }
+
+        let mut neighbor_counts = vec![0usize; self.colors.len()];
+        let mut region_counts = vec![0usize; self.colors.len()];
+
+        for &idx in neighbor_indices {
+            if idx < neighbor_counts.len() {
+                neighbor_counts[idx] += 1;
+            }
+        }
+        for &idx in same_region_indices {
+            if idx < region_counts.len() {
+                region_counts[idx] += 1;
+            }
+        }
+
+        let max_neighbor = neighbor_indices.len().max(1) as f32;
+        let max_region = same_region_indices.len().max(1) as f32;
+
+        self.lab_colors
+            .iter()
+            .enumerate()
+            .min_by(|(i, a), (j, b)| {
+                let dist_a = lab.distance_squared(**a);
+                let dist_b = lab.distance_squared(**b);
+
+                let neighbor_bias_a = (neighbor_counts[*i] as f32 / max_neighbor) * neighbor_weight;
+                let neighbor_bias_b = (neighbor_counts[*j] as f32 / max_neighbor) * neighbor_weight;
+
+                let region_bias_a = (region_counts[*i] as f32 / max_region) * region_weight;
+                let region_bias_b = (region_counts[*j] as f32 / max_region) * region_weight;
+
+                let total_bias_a = (neighbor_bias_a + region_bias_a).min(0.9);
+                let total_bias_b = (neighbor_bias_b + region_bias_b).min(0.9);
+
+                let score_a = dist_a * (1.0 - total_bias_a);
+                let score_b = dist_b * (1.0 - total_bias_b);
+
+                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0)
     }
 }
 
-fn build_kdtree(points: &[OklabFixed]) -> Vec<KdNode> {
-    let mut indices: Vec<usize> = (0..points.len()).collect();
-    let mut nodes = Vec::with_capacity(points.len());
-    build_recursive(points, &mut indices, 0, &mut nodes);
-    nodes
-}
-
-fn build_recursive(
-    points: &[OklabFixed],
-    indices: &mut [usize],
-    depth: usize,
-    nodes: &mut Vec<KdNode>
-) -> u32 {
-    if indices.is_empty() { return u32::MAX; }
-
-    let axis = (depth % 3) as u8;
-    let mid = indices.len() / 2;
-
-    indices.sort_unstable_by_key(|&i| {
-        let p = points[i];
-        match axis { 0 => p.l, 1 => p.a, _ => p.b }
-    });
-
-    let color_idx = indices[mid] as u16;
-    let point = points[indices[mid]];
-    let split_val = match axis { 0 => point.l, 1 => point.a, _ => point.b };
-
-    let curr_idx = nodes.len() as u32;
-    nodes.push(KdNode::default());
-
-    let (min, max) = compute_bounds(points, indices);
-
-    let left_child = build_recursive(points, &mut indices[..mid], depth + 1, nodes);
-    let right_child = build_recursive(points, &mut indices[mid+1..], depth + 1, nodes);
-
-    let node = &mut nodes[curr_idx as usize];
-    node.left = left_child;
-    node.right = right_child;
-    node.axis = axis;
-    node.split = split_val;
-    node.color_idx = color_idx;
-    node.min = min;
-    node.max = max;
-
-    curr_idx
-}
-
-fn compute_bounds(points: &[OklabFixed], indices: &[usize]) -> ([i16; 3], [i16; 3]) {
-    let mut min = [i16::MAX, i16::MAX, i16::MAX];
-    let mut max = [i16::MIN, i16::MIN, i16::MIN];
-    for &idx in indices {
-        let p = points[idx];
-        min[0] = min[0].min(p.l); max[0] = max[0].max(p.l);
-        min[1] = min[1].min(p.a); max[1] = max[1].max(p.a);
-        min[2] = min[2].min(p.b); max[2] = max[2].max(p.b);
-    }
-    (min, max)
-}
-
+/// Weighted color entry for palette operations
 #[derive(Clone, Copy, Debug)]
 struct WeightedColor {
     rgb: Rgb,
     oklab: Oklab,
     count: usize,
+    /// Saturation boost factor (higher for more saturated colors)
     saturation_weight: f32,
 }
 
 impl WeightedColor {
     fn new(rgb: Rgb, count: usize) -> Self {
         let oklab = rgb.to_oklab();
-        let saturation_weight = 1.0 + oklab.chroma() * 2.0;
+        let saturation_weight = 1.0 + oklab.chroma() * 2.0; // Boost saturated colors
         Self { rgb, oklab, count, saturation_weight }
     }
+
     fn effective_weight(&self, use_saturation: bool) -> f32 {
-        if use_saturation { self.count as f32 * self.saturation_weight } else { self.count as f32 }
+        let base = self.count as f32;
+        if use_saturation {
+            base * self.saturation_weight
+        } else {
+            base
+        }
     }
 }
 
+/// Extract a palette from an image using the specified strategy
 pub fn extract_palette(
     pixels: &[Rgb],
     target_colors: usize,
@@ -242,12 +236,14 @@ pub fn extract_palette(
     )
 }
 
+/// Extract a palette with explicit strategy selection
 pub fn extract_palette_with_strategy(
     pixels: &[Rgb],
     target_colors: usize,
     kmeans_iterations: usize,
     strategy: PaletteStrategy,
 ) -> Palette {
+    // Build color histogram
     let mut color_counts: HashMap<[u8; 3], usize> = HashMap::new();
     for pixel in pixels {
         *color_counts.entry(pixel.to_array()).or_insert(0) += 1;
@@ -259,227 +255,547 @@ pub fn extract_palette_with_strategy(
         .collect();
 
     let initial_centroids = match strategy {
-        PaletteStrategy::OklabMedianCut => median_cut_oklab(&weighted_colors, target_colors, false),
-        PaletteStrategy::SaturationWeighted => median_cut_oklab(&weighted_colors, target_colors, true),
-        PaletteStrategy::Medoid => median_cut_medoid(&weighted_colors, target_colors),
+        PaletteStrategy::OklabMedianCut => {
+            median_cut_oklab(&weighted_colors, target_colors, false)
+        }
+        PaletteStrategy::SaturationWeighted => {
+            median_cut_oklab(&weighted_colors, target_colors, true)
+        }
+        PaletteStrategy::Medoid => {
+            median_cut_medoid(&weighted_colors, target_colors)
+        }
         PaletteStrategy::KMeansPlusPlus => {
             let oklabs: Vec<Oklab> = pixels.iter().map(|p| p.to_oklab()).collect();
-            kmeans_plus_plus_init(&oklabs, target_colors).into_iter().map(|ok| ok.to_rgb()).collect()
+            kmeans_plus_plus_init(&oklabs, target_colors)
+                .into_iter()
+                .map(|ok| ok.to_rgb())
+                .collect()
         }
-        PaletteStrategy::LegacyRgb => median_cut_legacy(&weighted_colors, target_colors),
-        PaletteStrategy::RgbBitmask => median_cut_rgb_bitmask(&weighted_colors, target_colors),
+        PaletteStrategy::LegacyRgb => {
+            median_cut_legacy(&weighted_colors, target_colors)
+        }
+        PaletteStrategy::RgbBitmask => {
+            median_cut_rgb_bitmask(&weighted_colors, target_colors)
+        }
     };
 
+    // Stage 2: K-Means refinement in Oklab space
     let refined = kmeans_refine_oklab(pixels, initial_centroids, kmeans_iterations);
+
     Palette::new(refined)
 }
 
-fn median_cut_oklab(colors: &[WeightedColor], target: usize, use_saturation: bool) -> Vec<Rgb> {
-    if colors.is_empty() { return vec![]; }
+// =============================================================================
+// Oklab-based Median Cut (recommended)
+// =============================================================================
+
+/// Median Cut in Oklab space - preserves perceptual color relationships
+fn median_cut_oklab(colors: &[WeightedColor], target: usize, use_saturation_weight: bool) -> Vec<Rgb> {
+    if colors.is_empty() {
+        return vec![];
+    }
+
     let mut buckets = vec![colors.to_vec()];
 
     while buckets.len() < target {
-        let split_result = buckets.iter().enumerate().filter(|(_, b)| b.len() > 1)
-            .map(|(i, b)| (i, find_largest_axis_oklab(b)))
-            .max_by(|a, b| a.1.1.partial_cmp(&b.1.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Find bucket with largest perceptual range to split
+        let split_result = buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.len() > 1)
+            .map(|(i, bucket)| {
+                let (axis, range) = find_largest_axis_oklab(bucket);
+                (i, axis, range)
+            })
+            .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
-        match split_result {
-            Some((i, (axis, _))) => {
-                let bucket = buckets.remove(i);
-                let (left, right) = split_bucket_oklab(bucket, axis, use_saturation);
-                if !left.is_empty() { buckets.push(left); }
-                if !right.is_empty() { buckets.push(right); }
-            }
+        let (split_idx, axis) = match split_result {
+            Some((i, axis, _)) => (i, axis),
             None => break,
+        };
+
+        let bucket = buckets.remove(split_idx);
+        let (left, right) = split_bucket_oklab(bucket, axis, use_saturation_weight);
+
+        if !left.is_empty() {
+            buckets.push(left);
+        }
+        if !right.is_empty() {
+            buckets.push(right);
         }
     }
 
-    buckets.iter().map(|bucket| {
-        let (sl, sa, sb, tw) = bucket.iter().fold((0.0, 0.0, 0.0, 0.0), |acc, wc| {
-            let w = wc.effective_weight(use_saturation) as f64;
-            (acc.0 + wc.oklab.l as f64 * w, acc.1 + wc.oklab.a as f64 * w, acc.2 + wc.oklab.b as f64 * w, acc.3 + w)
-        });
-        let total_weight = tw.max(1.0);
-        Oklab::new((sl/total_weight) as f32, (sa/total_weight) as f32, (sb/total_weight) as f32).to_rgb()
-    }).collect()
+    // Compute weighted centroid in Oklab space, then convert back to RGB
+    buckets
+        .iter()
+        .map(|bucket| {
+            let (sum_l, sum_a, sum_b, total_weight) = bucket.iter().fold(
+                (0.0f64, 0.0f64, 0.0f64, 0.0f64),
+                |(sl, sa, sb, tw), wc| {
+                    let w = wc.effective_weight(use_saturation_weight) as f64;
+                    (
+                        sl + wc.oklab.l as f64 * w,
+                        sa + wc.oklab.a as f64 * w,
+                        sb + wc.oklab.b as f64 * w,
+                        tw + w,
+                    )
+                },
+            );
+
+            let total_weight = total_weight.max(1.0);
+            let centroid = Oklab::new(
+                (sum_l / total_weight) as f32,
+                (sum_a / total_weight) as f32,
+                (sum_b / total_weight) as f32,
+            );
+
+            centroid.to_rgb()
+        })
+        .collect()
 }
 
+/// Find the axis (L=0, a=1, b=2) with the largest range in Oklab space
 fn find_largest_axis_oklab(colors: &[WeightedColor]) -> (usize, f32) {
-    let (mut min_l, mut max_l) = (f32::INFINITY, f32::NEG_INFINITY);
-    let (mut min_a, mut max_a) = (f32::INFINITY, f32::NEG_INFINITY);
-    let (mut min_b, mut max_b) = (f32::INFINITY, f32::NEG_INFINITY);
+    let mut min_l = f32::INFINITY; let mut max_l = f32::NEG_INFINITY;
+    let mut min_a = f32::INFINITY; let mut max_a = f32::NEG_INFINITY;
+    let mut min_b = f32::INFINITY; let mut max_b = f32::NEG_INFINITY;
 
     for wc in colors {
-        min_l = min_l.min(wc.oklab.l); max_l = max_l.max(wc.oklab.l);
-        min_a = min_a.min(wc.oklab.a); max_a = max_a.max(wc.oklab.a);
-        min_b = min_b.min(wc.oklab.b); max_b = max_b.max(wc.oklab.b);
+        let l = wc.oklab.l;
+        let a = wc.oklab.a;
+        let b = wc.oklab.b;
+        if l < min_l { min_l = l; } if l > max_l { max_l = l; }
+        if a < min_a { min_a = a; } if a > max_a { max_a = a; }
+        if b < min_b { min_b = b; } if b > max_b { max_b = b; }
     }
-    let (rl, ra, rb) = (max_l - min_l, max_a - min_a, max_b - min_b);
-    if rl >= ra && rl >= rb { (0, rl) } else if ra >= rb { (1, ra) } else { (2, rb) }
+
+    let range_l = max_l - min_l;
+    let range_a = max_a - min_a;
+    let range_b = max_b - min_b;
+
+    // Branchless selection of max range
+    if range_l >= range_a && range_l >= range_b {
+        (0, range_l)
+    } else if range_a >= range_b {
+        (1, range_a)
+    } else {
+        (2, range_b)
+    }
 }
 
-fn split_bucket_oklab(mut colors: Vec<WeightedColor>, axis: usize, use_saturation: bool) -> (Vec<WeightedColor>, Vec<WeightedColor>) {
+/// Split a bucket at the weighted median along the given Oklab axis
+fn split_bucket_oklab(
+    mut colors: Vec<WeightedColor>,
+    axis: usize,
+    use_saturation_weight: bool,
+) -> (Vec<WeightedColor>, Vec<WeightedColor>) {
+    let get_component = |wc: &WeightedColor| -> f32 {
+        match axis {
+            0 => wc.oklab.l,
+            1 => wc.oklab.a,
+            _ => wc.oklab.b,
+        }
+    };
+
     colors.sort_by(|a, b| {
-        let v1 = match axis { 0 => a.oklab.l, 1 => a.oklab.a, _ => a.oklab.b };
-        let v2 = match axis { 0 => b.oklab.l, 1 => b.oklab.a, _ => b.oklab.b };
-        v1.partial_cmp(&v2).unwrap_or(std::cmp::Ordering::Equal)
+        get_component(a)
+            .partial_cmp(&get_component(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
-    
-    let total_weight: f64 = colors.iter().map(|c| c.effective_weight(use_saturation) as f64).sum();
+
+    // Find the median by effective weight
+    let total_weight: f64 = colors.iter()
+        .map(|wc| wc.effective_weight(use_saturation_weight) as f64)
+        .sum();
     let half = total_weight / 2.0;
-    let mut cum = 0.0;
-    let mut split = colors.len() / 2;
-    
-    for (i, c) in colors.iter().enumerate() {
-        cum += c.effective_weight(use_saturation) as f64;
-        if cum >= half { split = (i + 1).min(colors.len() - 1); break; }
+
+    let mut cumulative = 0.0;
+    let mut split_idx = colors.len() / 2;
+
+    for (i, wc) in colors.iter().enumerate() {
+        cumulative += wc.effective_weight(use_saturation_weight) as f64;
+        if cumulative >= half {
+            split_idx = (i + 1).min(colors.len() - 1);
+            break;
+        }
     }
-    let right = colors.split_off(split.clamp(1, colors.len().saturating_sub(1).max(1)));
+
+    // Ensure at least one element on each side
+    split_idx = split_idx.clamp(1, colors.len() - 1);
+
+    let right = colors.split_off(split_idx);
     (colors, right)
 }
 
+// =============================================================================
+// Medoid-based Median Cut (exact colors only)
+// =============================================================================
+
+/// Median Cut using medoids - always returns actual image colors
 fn median_cut_medoid(colors: &[WeightedColor], target: usize) -> Vec<Rgb> {
-    if colors.is_empty() { return vec![]; }
+    if colors.is_empty() {
+        return vec![];
+    }
+
     let mut buckets = vec![colors.to_vec()];
+
     while buckets.len() < target {
-        let split_result = buckets.iter().enumerate().filter(|(_, b)| b.len() > 1)
-            .map(|(i, b)| (i, find_largest_axis_oklab(b)))
-            .max_by(|a, b| a.1.1.partial_cmp(&b.1.1).unwrap_or(std::cmp::Ordering::Equal));
-        match split_result {
-            Some((i, (axis, _))) => {
-                let bucket = buckets.remove(i);
-                let (left, right) = split_bucket_oklab(bucket, axis, false);
-                if !left.is_empty() { buckets.push(left); }
-                if !right.is_empty() { buckets.push(right); }
-            }
+        let split_result = buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.len() > 1)
+            .map(|(i, bucket)| {
+                let (axis, range) = find_largest_axis_oklab(bucket);
+                (i, axis, range)
+            })
+            .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        let (split_idx, axis) = match split_result {
+            Some((i, axis, _)) => (i, axis),
             None => break,
+        };
+
+        let bucket = buckets.remove(split_idx);
+        let (left, right) = split_bucket_oklab(bucket, axis, false);
+
+        if !left.is_empty() {
+            buckets.push(left);
+        }
+        if !right.is_empty() {
+            buckets.push(right);
         }
     }
-    buckets.iter().map(|b| {
-        let (sl, sa, sb, tw) = b.iter().fold((0.0,0.0,0.0,0.0), |acc, c| {
-            let w = c.count as f64;
-            (acc.0 + c.oklab.l as f64 * w, acc.1 + c.oklab.a as f64 * w, acc.2 + c.oklab.b as f64 * w, acc.3 + w)
-        });
-        let total_weight = tw.max(1.0);
-        let c = Oklab::new((sl/total_weight) as f32, (sa/total_weight) as f32, (sb/total_weight) as f32);
-        b.iter().min_by(|x, y| x.oklab.distance_squared(c).partial_cmp(&y.oklab.distance_squared(c)).unwrap()).unwrap().rgb
-    }).collect()
+
+    // Select medoid (actual color closest to centroid) from each bucket
+    buckets
+        .iter()
+        .map(|bucket| {
+            // First compute centroid
+            let (sum_l, sum_a, sum_b, total_weight) = bucket.iter().fold(
+                (0.0f64, 0.0f64, 0.0f64, 0.0f64),
+                |(sl, sa, sb, tw), wc| {
+                    let w = wc.count as f64;
+                    (
+                        sl + wc.oklab.l as f64 * w,
+                        sa + wc.oklab.a as f64 * w,
+                        sb + wc.oklab.b as f64 * w,
+                        tw + w,
+                    )
+                },
+            );
+
+            let total_weight = total_weight.max(1.0);
+            let centroid = Oklab::new(
+                (sum_l / total_weight) as f32,
+                (sum_a / total_weight) as f32,
+                (sum_b / total_weight) as f32,
+            );
+
+            // Find color closest to centroid (medoid)
+            bucket
+                .iter()
+                .min_by(|a, b| {
+                    let dist_a = a.oklab.distance_squared(centroid);
+                    let dist_b = b.oklab.distance_squared(centroid);
+                    dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|wc| wc.rgb)
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
+// =============================================================================
+// Legacy RGB-space Median Cut (for comparison)
+// =============================================================================
+
+/// Legacy Median Cut in RGB space - causes desaturation and darkening
 fn median_cut_legacy(colors: &[WeightedColor], target: usize) -> Vec<Rgb> {
-    median_cut_rgb_bitmask(colors, target)
-}
+    if colors.is_empty() {
+        return vec![];
+    }
 
-fn median_cut_rgb_bitmask(colors: &[WeightedColor], target: usize) -> Vec<Rgb> {
-     if colors.is_empty() { return vec![]; }
-    let mask = 0xF8; 
-    let get = |c: &WeightedColor, ax| match ax { 0 => c.rgb.r & mask, 1 => c.rgb.g & mask, _ => c.rgb.b & mask };
     let mut buckets = vec![colors.to_vec()];
 
     while buckets.len() < target {
-        let split_req = buckets.iter().enumerate().filter(|(_, b)| b.len() > 1)
+        let split_result = buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.len() > 1)
+            .map(|(i, bucket)| {
+                let (axis, range) = find_largest_axis_rgb(bucket);
+                (i, axis, range)
+            })
+            .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        let (split_idx, axis) = match split_result {
+            Some((i, axis, _)) => (i, axis),
+            None => break,
+        };
+
+        let bucket = buckets.remove(split_idx);
+        let (left, right) = split_bucket_rgb(bucket, axis);
+
+        if !left.is_empty() {
+            buckets.push(left);
+        }
+        if !right.is_empty() {
+            buckets.push(right);
+        }
+    }
+
+    // WARNING: RGB averaging causes desaturation!
+    buckets
+        .iter()
+        .map(|bucket| {
+            let (sum, count) = bucket.iter().fold(([0u64; 3], 0u64), |(mut sum, count), wc| {
+                sum[0] += wc.rgb.r as u64 * wc.count as u64;
+                sum[1] += wc.rgb.g as u64 * wc.count as u64;
+                sum[2] += wc.rgb.b as u64 * wc.count as u64;
+                (sum, count + wc.count as u64)
+            });
+
+            let count = count.max(1);
+            Rgb::new(
+                (sum[0] / count) as u8,
+                (sum[1] / count) as u8,
+                (sum[2] / count) as u8,
+            )
+        })
+        .collect()
+}
+
+fn find_largest_axis_rgb(colors: &[WeightedColor]) -> (usize, f32) {
+    let get_component = |wc: &WeightedColor, axis: usize| -> u8 {
+        match axis {
+            0 => wc.rgb.r,
+            1 => wc.rgb.g,
+            _ => wc.rgb.b,
+        }
+    };
+
+    (0..3)
+        .map(|axis| {
+            let min = colors.iter().map(|wc| get_component(wc, axis)).min().unwrap_or(0);
+            let max = colors.iter().map(|wc| get_component(wc, axis)).max().unwrap_or(0);
+            (axis, (max - min) as f32)
+        })
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or((0, 0.0))
+}
+
+fn split_bucket_rgb(mut colors: Vec<WeightedColor>, axis: usize) -> (Vec<WeightedColor>, Vec<WeightedColor>) {
+    let get_component = |wc: &WeightedColor| -> u8 {
+        match axis {
+            0 => wc.rgb.r,
+            1 => wc.rgb.g,
+            _ => wc.rgb.b,
+        }
+    };
+
+    colors.sort_by_key(|wc| get_component(wc));
+
+    let total_count: usize = colors.iter().map(|wc| wc.count).sum();
+    let half = total_count / 2;
+
+    let mut cumulative = 0;
+    let mut split_idx = colors.len() / 2;
+
+    for (i, wc) in colors.iter().enumerate() {
+        cumulative += wc.count;
+        if cumulative >= half {
+            split_idx = (i + 1).min(colors.len() - 1);
+            break;
+        }
+    }
+
+    split_idx = split_idx.clamp(1, colors.len() - 1);
+
+    let right = colors.split_off(split_idx);
+    (colors, right)
+}
+
+// =============================================================================
+// RGB Bitmask Median Cut (for precise color clustering)
+// =============================================================================
+
+/// Median Cut using RGB bit-masking for clustering
+/// Preserves dominant colors by masking lower bits, preventing subtle blends
+fn median_cut_rgb_bitmask(colors: &[WeightedColor], target: usize) -> Vec<Rgb> {
+    if colors.is_empty() { return vec![]; }
+    
+    // Mask to use for clustering decisions (e.g., 5 bits = 32 levels)
+    // This groups "similar" colors without averaging them into new tints immediately
+    let mask = 0xF8; 
+
+    // Helper to get masked component
+    let get_masked = |wc: &WeightedColor, axis: usize| -> u8 {
+        match axis {
+            0 => wc.rgb.r & mask,
+            1 => wc.rgb.g & mask,
+            _ => wc.rgb.b & mask,
+        }
+    };
+
+    let mut buckets = vec![colors.to_vec()];
+
+    while buckets.len() < target {
+        // Find split axis based on MASKED range
+        let split_req = buckets.iter().enumerate()
+            .filter(|(_, b)| b.len() > 1)
             .map(|(i, b)| {
-                let ranges: Vec<u8> = (0..3).map(|ax| {
-                    let (min, max) = b.iter().fold((255, 0), |(mi, ma), c| { let v = get(c, ax); (mi.min(v), ma.max(v)) });
+                let ranges: Vec<u8> = (0..3).map(|axis| {
+                    let min = b.iter().map(|c| get_masked(c, axis)).min().unwrap_or(0);
+                    let max = b.iter().map(|c| get_masked(c, axis)).max().unwrap_or(0);
                     max - min
                 }).collect();
-                (i, ranges.into_iter().enumerate().max_by_key(|r| r.1).unwrap())
-            }).max_by_key(|r| r.1.1);
-        
-        if let Some((i, (axis, range))) = split_req {
-            if range == 0 { break; }
+                let (axis, range) = ranges.iter().enumerate().max_by_key(|(_, r)| *r).unwrap();
+                (i, axis, *range)
+            })
+            .max_by_key(|(_, _, range)| *range);
+
+        if let Some((i, axis, range)) = split_req {
+            if range == 0 { break; } // Cannot split further with this mask
+            
             let mut bucket = buckets.remove(i);
-            bucket.sort_by_key(|c| get(c, axis));
+            // Sort by MASKED value
+            bucket.sort_by_key(|c| get_masked(c, axis));
+            
+            // Split at median
             let split_idx = bucket.len() / 2;
             let right = bucket.split_off(split_idx);
             buckets.push(bucket);
             buckets.push(right);
-        } else { break; }
+        } else {
+            break;
+        }
     }
+
+    // Final centroid calculation: Use simple average of the bucket
+    // Since we clustered by bitmask, the average will be "safe"
     buckets.iter().map(|b| {
-        let (r, g, b, cnt) = b.iter().fold((0u64,0u64,0u64,0u64), |acc, c| 
-            (acc.0 + c.rgb.r as u64, acc.1 + c.rgb.g as u64, acc.2 + c.rgb.b as u64, acc.3 + 1));
-        if cnt == 0 { Rgb::default() } else { Rgb::new((r/cnt) as u8, (g/cnt) as u8, (b/cnt) as u8) }
+        let (r, g, b, count) = b.iter().fold((0u64,0u64,0u64,0u64), |acc, c| {
+            (acc.0 + c.rgb.r as u64, acc.1 + c.rgb.g as u64, acc.2 + c.rgb.b as u64, acc.3 + 1)
+        });
+        if count == 0 { return Rgb::default(); }
+        Rgb::new((r/count) as u8, (g/count) as u8, (b/count) as u8)
     }).collect()
 }
 
-pub fn kmeans_refine_oklab(pixels: &[Rgb], centroids: Vec<Rgb>, iterations: usize) -> Vec<Rgb> {
-    if centroids.is_empty() || pixels.is_empty() || iterations == 0 { return centroids; }
+
+// =============================================================================
+// K-Means refinement
+// =============================================================================
+
+/// K-Means refinement in Oklab space
+fn kmeans_refine_oklab(pixels: &[Rgb], centroids: Vec<Rgb>, iterations: usize) -> Vec<Rgb> {
+    if centroids.is_empty() || pixels.is_empty() {
+        return centroids;
+    }
+
     let pixel_oklabs: Vec<Oklab> = pixels.iter().map(|p| p.to_oklab()).collect();
-    let mut centers: Vec<Oklab> = centroids.iter().map(|c| c.to_oklab()).collect();
-    
-    let pixel_fixed: Vec<OklabFixed> = pixel_oklabs.iter().map(|&o| OklabFixed::from_oklab(o)).collect();
-    let mut center_fixed: Vec<OklabFixed> = centers.iter().map(|&o| OklabFixed::from_oklab(o)).collect();
+    let mut centroid_oklabs: Vec<Oklab> = centroids.iter().map(|c| c.to_oklab()).collect();
 
     for _ in 0..iterations {
-        let mut sums = vec![Oklab::default(); centers.len()];
-        let mut counts = vec![0usize; centers.len()];
-        let mut converged = true;
-
+        // Assign pixels to nearest centroid
         #[cfg(feature = "parallel")]
-        {
-            let assignments: Vec<usize> = pixel_fixed.par_iter()
-                .map(|p| {
-                    let mut best = 0;
-                    let mut best_d = i32::MAX;
-                    for (ci, &c) in center_fixed.iter().enumerate() {
-                        let d = p.distance_squared(c);
-                        if d < best_d { best_d = d; best = ci; }
-                    }
-                    best
-                })
-                .collect();
-            
-            for (i, &cluster) in assignments.iter().enumerate() {
-                sums[cluster] = sums[cluster] + pixel_oklabs[i];
-                counts[cluster] += 1;
-            }
-        }
+        let assignments: Vec<usize> = pixel_oklabs
+            .par_iter()
+            .map(|pixel| find_nearest_centroid_oklab(pixel, &centroid_oklabs))
+            .collect();
 
         #[cfg(not(feature = "parallel"))]
-        {
-            for (i, &p) in pixel_fixed.iter().enumerate() {
-                let mut best = 0;
-                let mut best_d = i32::MAX;
-                for (ci, &c) in center_fixed.iter().enumerate() {
-                    let d = p.distance_squared(c);
-                    if d < best_d { best_d = d; best = ci; }
-                }
-                sums[best] = sums[best] + pixel_oklabs[i];
-                counts[best] += 1;
-            }
+        let assignments: Vec<usize> = pixel_oklabs
+            .iter()
+            .map(|pixel| find_nearest_centroid_oklab(pixel, &centroid_oklabs))
+            .collect();
+
+        // Recompute centroids
+        let k = centroid_oklabs.len();
+        let mut sums = vec![Oklab::new(0.0, 0.0, 0.0); k];
+        let mut counts = vec![0usize; k];
+
+        for (pixel, &cluster) in pixel_oklabs.iter().zip(assignments.iter()) {
+            sums[cluster] = sums[cluster] + *pixel;
+            counts[cluster] += 1;
         }
 
-        for i in 0..centers.len() {
+        let mut converged = true;
+        for i in 0..k {
             if counts[i] > 0 {
-                let new_c = sums[i] / counts[i] as f32;
-                let new_fixed = OklabFixed::from_oklab(new_c);
-                if new_fixed.distance_squared(center_fixed[i]) > 4 { 
+                let new_centroid = sums[i] / counts[i] as f32;
+                if new_centroid.distance_squared(centroid_oklabs[i]) > 0.0001 {
                     converged = false;
                 }
-                center_fixed[i] = new_fixed;
-                centers[i] = new_c;
+                centroid_oklabs[i] = new_centroid;
             }
         }
-        if converged { break; }
+
+        if converged {
+            break;
+        }
     }
-    centers.iter().map(|c| c.to_rgb()).collect()
+
+    // Convert back to RGB
+    centroid_oklabs.iter().map(|oklab| oklab.to_rgb()).collect()
 }
 
-pub fn kmeans_plus_plus_init(pixels: &[Oklab], k: usize) -> Vec<Oklab> {
-    if pixels.is_empty() || k == 0 { return vec![]; }
-    let mut centroids = vec![pixels[pixels.len()/2]];
-    let fixed_pixels: Vec<OklabFixed> = pixels.iter().map(|&p| OklabFixed::from_oklab(p)).collect();
+fn find_nearest_centroid_oklab(pixel: &Oklab, centroids: &[Oklab]) -> usize {
+    let mut best_idx = 0;
+    let mut best_dist = f32::MAX;
     
-    for _ in 1..k {
-        let fixed_centroids: Vec<OklabFixed> = centroids.iter().map(|&c| OklabFixed::from_oklab(c)).collect();
-        let (idx, _) = fixed_pixels.iter().enumerate()
-            .map(|(i, &p)| {
-                let d = fixed_centroids.iter().map(|&c| p.distance_squared(c)).min().unwrap_or(0);
-                (i, d)
-            })
-            .max_by_key(|&(_, d)| d).unwrap_or((0, 0));
-        centroids.push(pixels[idx]);
+    for (i, c) in centroids.iter().enumerate() {
+        let dist = pixel.distance_squared(*c);
+        if dist < best_dist {
+            best_dist = dist;
+            best_idx = i;
+        }
     }
+    best_idx
+}
+
+/// K-Means++ initialization in Oklab space
+pub fn kmeans_plus_plus_init(pixels: &[Oklab], k: usize) -> Vec<Oklab> {
+    if pixels.is_empty() || k == 0 {
+        return vec![];
+    }
+
+    let mut centroids = Vec::with_capacity(k);
+
+    // First centroid: use deterministic selection based on pixel distribution
+    // (For truly random selection, enable 'native' or 'wasm' feature)
+    let first_idx = pixels.len() / 2;
+    centroids.push(pixels[first_idx]);
+
+    // Remaining centroids: weighted by squared distance to nearest existing centroid
+    for _ in 1..k {
+        let distances: Vec<f32> = pixels
+            .iter()
+            .map(|p| {
+                centroids
+                    .iter()
+                    .map(|c| p.distance_squared(*c))
+                    .min_by(|a, b| a.partial_cmp(b).unwrap())
+                    .unwrap_or(f32::MAX)
+            })
+            .collect();
+
+        let total: f32 = distances.iter().sum();
+        if total <= 0.0 {
+            break;
+        }
+
+        // Select point with probability proportional to D(x)^2
+        // Using deterministic selection: pick the point with max distance
+        let selected_idx = distances
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        centroids.push(pixels[selected_idx]);
+    }
+
     centroids
 }
