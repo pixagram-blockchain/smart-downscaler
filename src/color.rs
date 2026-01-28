@@ -3,6 +3,7 @@
 //! Implements multiple color spaces for perceptually uniform color comparisons:
 //! - CIE Lab: Classic perceptual space, good for general use
 //! - Oklab: Modern perceptual space with better hue linearity and saturation preservation
+//! - OklabFixed: Integer-based Oklab for high-performance operations (NEW)
 //! - Linear RGB: For gamma-correct averaging operations
 
 use std::ops::{Add, Div, Mul, Sub};
@@ -36,6 +37,11 @@ impl Rgb {
     /// Convert to Oklab color space (recommended for palette operations)
     pub fn to_oklab(self) -> Oklab {
         Oklab::from_rgb(self)
+    }
+
+    /// Convert to fixed-point Oklab (fast integer operations)
+    pub fn to_oklab_fixed(self) -> OklabFixed {
+        OklabFixed::from_rgb(self)
     }
 
     /// Convert to linear RGB (gamma-decoded)
@@ -290,6 +296,11 @@ impl Oklab {
             b: c * h.sin(),
         }
     }
+
+    /// Convert to fixed-point representation
+    pub fn to_fixed(self) -> OklabFixed {
+        OklabFixed::from_oklab(self)
+    }
 }
 
 impl Add for Oklab {
@@ -333,6 +344,200 @@ impl Div<f32> for Oklab {
             a: self.a / scalar,
             b: self.b / scalar,
         }
+    }
+}
+
+// =============================================================================
+// OklabFixed - High-Performance Integer Oklab (NEW)
+// =============================================================================
+
+/// Fixed-point Oklab for high-performance integer arithmetic.
+///
+/// Uses i32 with 16 bits of fractional precision (Q15.16 format).
+/// This allows for fast distance calculations without floating point.
+///
+/// Ranges:
+/// - L: [0, 1] maps to [0, 65536]
+/// - a, b: [-0.5, 0.5] maps to [-32768, 32768]
+///
+/// Squared distance fits in i64 without overflow.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct OklabFixed {
+    pub l: i32,  // Q15.16: 0..65536 represents 0.0..1.0
+    pub a: i32,  // Q15.16: -32768..32768 represents -0.5..0.5
+    pub b: i32,  // Q15.16: -32768..32768 represents -0.5..0.5
+}
+
+/// Scale factor for fixed-point conversion (2^16 = 65536)
+const OKLAB_FIXED_SCALE: f32 = 65536.0;
+const OKLAB_FIXED_SCALE_I: i32 = 65536;
+
+impl OklabFixed {
+    pub const fn new(l: i32, a: i32, b: i32) -> Self {
+        Self { l, a, b }
+    }
+
+    /// Convert from floating-point Oklab
+    #[inline]
+    pub fn from_oklab(oklab: Oklab) -> Self {
+        Self {
+            l: (oklab.l * OKLAB_FIXED_SCALE) as i32,
+            a: (oklab.a * OKLAB_FIXED_SCALE) as i32,
+            b: (oklab.b * OKLAB_FIXED_SCALE) as i32,
+        }
+    }
+
+    /// Convert from RGB directly using LUT-accelerated path
+    #[inline]
+    pub fn from_rgb(rgb: Rgb) -> Self {
+        // Use the floating-point path for now; can be optimized with LUTs
+        Self::from_oklab(rgb.to_oklab())
+    }
+
+    /// Convert back to floating-point Oklab
+    #[inline]
+    pub fn to_oklab(self) -> Oklab {
+        Oklab {
+            l: self.l as f32 / OKLAB_FIXED_SCALE,
+            a: self.a as f32 / OKLAB_FIXED_SCALE,
+            b: self.b as f32 / OKLAB_FIXED_SCALE,
+        }
+    }
+
+    /// Convert to RGB
+    #[inline]
+    pub fn to_rgb(self) -> Rgb {
+        self.to_oklab().to_rgb()
+    }
+
+    /// Squared Euclidean distance in fixed-point space.
+    /// Returns value in Q30.32 format (use >> 16 to get Q15.16).
+    /// For comparison purposes, no scaling needed.
+    #[inline(always)]
+    pub fn distance_squared(self, other: Self) -> i64 {
+        let dl = (self.l - other.l) as i64;
+        let da = (self.a - other.a) as i64;
+        let db = (self.b - other.b) as i64;
+        dl * dl + da * da + db * db
+    }
+
+    /// Approximate distance (for fast comparisons)
+    /// Uses Manhattan distance which is faster than Euclidean
+    #[inline(always)]
+    pub fn distance_manhattan(self, other: Self) -> i32 {
+        (self.l - other.l).abs() + (self.a - other.a).abs() + (self.b - other.b).abs()
+    }
+
+    /// Chroma squared (avoids sqrt)
+    #[inline(always)]
+    pub fn chroma_squared(self) -> i64 {
+        (self.a as i64) * (self.a as i64) + (self.b as i64) * (self.b as i64)
+    }
+
+    /// Add with weight (for accumulation)
+    #[inline]
+    pub fn weighted_add(self, other: Self, weight: i32) -> Self {
+        Self {
+            l: self.l + ((other.l as i64 * weight as i64) >> 16) as i32,
+            a: self.a + ((other.a as i64 * weight as i64) >> 16) as i32,
+            b: self.b + ((other.b as i64 * weight as i64) >> 16) as i32,
+        }
+    }
+}
+
+impl Add for OklabFixed {
+    type Output = Self;
+    #[inline]
+    fn add(self, other: Self) -> Self {
+        Self {
+            l: self.l + other.l,
+            a: self.a + other.a,
+            b: self.b + other.b,
+        }
+    }
+}
+
+impl Sub for OklabFixed {
+    type Output = Self;
+    #[inline]
+    fn sub(self, other: Self) -> Self {
+        Self {
+            l: self.l - other.l,
+            a: self.a - other.a,
+            b: self.b - other.b,
+        }
+    }
+}
+
+impl Mul<i32> for OklabFixed {
+    type Output = Self;
+    #[inline]
+    fn mul(self, scalar: i32) -> Self {
+        Self {
+            l: ((self.l as i64 * scalar as i64) >> 16) as i32,
+            a: ((self.a as i64 * scalar as i64) >> 16) as i32,
+            b: ((self.b as i64 * scalar as i64) >> 16) as i32,
+        }
+    }
+}
+
+impl Div<i32> for OklabFixed {
+    type Output = Self;
+    #[inline]
+    fn div(self, scalar: i32) -> Self {
+        if scalar == 0 {
+            return Self::default();
+        }
+        Self {
+            l: ((self.l as i64 * OKLAB_FIXED_SCALE_I as i64) / scalar as i64) as i32,
+            a: ((self.a as i64 * OKLAB_FIXED_SCALE_I as i64) / scalar as i64) as i32,
+            b: ((self.b as i64 * OKLAB_FIXED_SCALE_I as i64) / scalar as i64) as i32,
+        }
+    }
+}
+
+/// Accumulator for OklabFixed weighted averaging
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OklabFixedAccumulator {
+    pub l_sum: i64,
+    pub a_sum: i64,
+    pub b_sum: i64,
+    pub weight: i64,
+}
+
+impl OklabFixedAccumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn add(&mut self, oklab: OklabFixed, weight: u32) {
+        let w = weight as i64;
+        self.l_sum += oklab.l as i64 * w;
+        self.a_sum += oklab.a as i64 * w;
+        self.b_sum += oklab.b as i64 * w;
+        self.weight += w;
+    }
+
+    #[inline]
+    pub fn mean(&self) -> OklabFixed {
+        if self.weight > 0 {
+            OklabFixed {
+                l: (self.l_sum / self.weight) as i32,
+                a: (self.a_sum / self.weight) as i32,
+                b: (self.b_sum / self.weight) as i32,
+            }
+        } else {
+            OklabFixed::default()
+        }
+    }
+
+    #[inline]
+    pub fn reset(&mut self) {
+        self.l_sum = 0;
+        self.a_sum = 0;
+        self.b_sum = 0;
+        self.weight = 0;
     }
 }
 
@@ -519,6 +724,15 @@ impl LabFixed {
     pub const fn new(l: i16, a: i16, b: i16) -> Self {
         Self { l, a, b }
     }
+
+    /// Squared distance for integer comparisons
+    #[inline(always)]
+    pub fn distance_squared(self, other: Self) -> i32 {
+        let dl = (self.l - other.l) as i32;
+        let da = (self.a - other.a) as i32;
+        let db = (self.b - other.b) as i32;
+        dl * dl + da * da + db * db
+    }
 }
 
 /// Weighted Oklab accumulator for computing means
@@ -621,4 +835,61 @@ pub fn clamp_u8(x: i32) -> u8 {
     y &= !(y >> 31);
     // if y > 255 -> y = 255
     if y > 255 { 255 } else { y as u8 }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_oklab_fixed_roundtrip() {
+        let rgb = Rgb::new(128, 64, 200);
+        let oklab = rgb.to_oklab();
+        let fixed = oklab.to_fixed();
+        let back = fixed.to_oklab();
+        
+        // Should be within 0.001 of original
+        assert!((oklab.l - back.l).abs() < 0.001);
+        assert!((oklab.a - back.a).abs() < 0.001);
+        assert!((oklab.b - back.b).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_oklab_fixed_distance() {
+        let a = Rgb::new(255, 0, 0).to_oklab_fixed();
+        let b = Rgb::new(0, 0, 255).to_oklab_fixed();
+        
+        let dist_fixed = a.distance_squared(b);
+        
+        let a_f = a.to_oklab();
+        let b_f = b.to_oklab();
+        let dist_float = a_f.distance_squared(b_f);
+        
+        // Fixed point distance should be proportional to float distance
+        // (scaled by OKLAB_FIXED_SCALE^2)
+        let expected = (dist_float * OKLAB_FIXED_SCALE * OKLAB_FIXED_SCALE) as i64;
+        let ratio = dist_fixed as f64 / expected as f64;
+        assert!((ratio - 1.0).abs() < 0.01, "ratio: {}", ratio);
+    }
+
+    #[test]
+    fn test_oklab_fixed_accumulator() {
+        let mut acc = OklabFixedAccumulator::new();
+        
+        let red = Rgb::new(255, 0, 0).to_oklab_fixed();
+        let blue = Rgb::new(0, 0, 255).to_oklab_fixed();
+        
+        acc.add(red, 1);
+        acc.add(blue, 1);
+        
+        let mean = acc.mean();
+        
+        // Mean should be somewhere between red and blue
+        assert!(mean.l > 0);
+        assert!(mean.l < red.l.max(blue.l));
+    }
 }

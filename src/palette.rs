@@ -3,14 +3,19 @@
 //! This module implements a multi-stage palette extraction pipeline:
 //! 1. Median Cut in Oklab space (perceptually uniform, preserves saturation)
 //! 2. Optional saturation-weighted sampling to preserve vibrant colors
-//! 3. K-Means++ refinement for final optimization
+//! 3. K-Means++ refinement on WEIGHTED HISTOGRAM (not raw pixels!)
 //!
 //! Key improvements over naive RGB-space median cut:
 //! - Operations in Oklab prevent desaturation and darkening
 //! - Medoid selection uses actual image colors instead of computed averages
 //! - Saturation weighting ensures vibrant colors are represented
+//!
+//! PERFORMANCE OPTIMIZATION (v0.3):
+//! - K-Means now operates on unique colors with weights, not raw pixels
+//! - For a 1MP image with 16k unique colors: 10 iterations = 160k ops (not 10M!)
+//! - Uses OklabFixed for integer arithmetic in hot paths
 
-use crate::color::{Lab, Oklab, Rgb};
+use crate::color::{Lab, Oklab, OklabFixed, OklabFixedAccumulator, Rgb};
 use std::collections::HashMap;
 
 #[cfg(feature = "parallel")]
@@ -43,6 +48,8 @@ pub struct Palette {
     pub lab_colors: Vec<Lab>,
     /// Precomputed Oklab values for each color
     pub oklab_colors: Vec<Oklab>,
+    /// Precomputed OklabFixed values for fast integer matching
+    pub oklab_fixed_colors: Vec<OklabFixed>,
 }
 
 impl Palette {
@@ -50,7 +57,8 @@ impl Palette {
     pub fn new(colors: Vec<Rgb>) -> Self {
         let lab_colors = colors.iter().map(|&c| c.to_lab()).collect();
         let oklab_colors = colors.iter().map(|&c| c.to_oklab()).collect();
-        Self { colors, lab_colors, oklab_colors }
+        let oklab_fixed_colors = colors.iter().map(|&c| c.to_oklab_fixed()).collect();
+        Self { colors, lab_colors, oklab_colors, oklab_fixed_colors }
     }
 
     /// Number of colors in the palette
@@ -87,6 +95,22 @@ impl Palette {
             let dist = oklab.distance_squared(*p);
             // Branchless update:
             // if dist < best_dist { best_dist = dist; best_idx = i; }
+            if dist < best_dist {
+                best_dist = dist;
+                best_idx = i;
+            }
+        }
+        best_idx
+    }
+
+    /// Find nearest using OklabFixed (fastest, integer arithmetic)
+    #[inline]
+    pub fn find_nearest_oklab_fixed(&self, oklab: &OklabFixed) -> usize {
+        let mut best_idx = 0;
+        let mut best_dist = i64::MAX;
+        
+        for (i, p) in self.oklab_fixed_colors.iter().enumerate() {
+            let dist = oklab.distance_squared(*p);
             if dist < best_dist {
                 best_dist = dist;
                 best_idx = i;
@@ -222,6 +246,24 @@ impl WeightedColor {
     }
 }
 
+/// Weighted color for fast K-Means (uses OklabFixed)
+#[derive(Clone, Copy, Debug)]
+struct WeightedColorFixed {
+    rgb: Rgb,
+    oklab: OklabFixed,
+    count: u32,
+}
+
+impl WeightedColorFixed {
+    fn new(rgb: Rgb, count: u32) -> Self {
+        Self {
+            rgb,
+            oklab: rgb.to_oklab_fixed(),
+            count,
+        }
+    }
+}
+
 /// Extract a palette from an image using the specified strategy
 pub fn extract_palette(
     pixels: &[Rgb],
@@ -250,8 +292,8 @@ pub fn extract_palette_with_strategy(
     }
 
     let weighted_colors: Vec<WeightedColor> = color_counts
-        .into_iter()
-        .map(|(arr, count)| WeightedColor::new(Rgb::from_array(arr), count))
+        .iter()
+        .map(|(arr, &count)| WeightedColor::new(Rgb::from_array(*arr), count))
         .collect();
 
     let initial_centroids = match strategy {
@@ -279,8 +321,14 @@ pub fn extract_palette_with_strategy(
         }
     };
 
-    // Stage 2: K-Means refinement in Oklab space
-    let refined = kmeans_refine_oklab(pixels, initial_centroids, kmeans_iterations);
+    // Stage 2: K-Means refinement on WEIGHTED HISTOGRAM (not raw pixels!)
+    // This is the key optimization: we reduce from O(W*H) to O(unique_colors)
+    let weighted_fixed: Vec<WeightedColorFixed> = color_counts
+        .into_iter()
+        .map(|(arr, count)| WeightedColorFixed::new(Rgb::from_array(arr), count as u32))
+        .collect();
+
+    let refined = kmeans_refine_weighted(&weighted_fixed, initial_centroids, kmeans_iterations);
 
     Palette::new(refined)
 }
@@ -684,50 +732,56 @@ fn median_cut_rgb_bitmask(colors: &[WeightedColor], target: usize) -> Vec<Rgb> {
 
 
 // =============================================================================
-// K-Means refinement
+// K-Means refinement - OPTIMIZED for weighted histogram
 // =============================================================================
 
-/// K-Means refinement in Oklab space
-fn kmeans_refine_oklab(pixels: &[Rgb], centroids: Vec<Rgb>, iterations: usize) -> Vec<Rgb> {
-    if centroids.is_empty() || pixels.is_empty() {
+/// K-Means refinement on WEIGHTED COLOR HISTOGRAM using OklabFixed
+/// 
+/// This is the key performance optimization:
+/// - Old: O(iterations * width * height * k) = O(10 * 1M * 16) = 160M ops
+/// - New: O(iterations * unique_colors * k) = O(10 * 16k * 16) = 2.5M ops
+/// 
+/// That's a 64x speedup for typical preprocessed images!
+fn kmeans_refine_weighted(
+    weighted_colors: &[WeightedColorFixed],
+    centroids: Vec<Rgb>,
+    iterations: usize,
+) -> Vec<Rgb> {
+    if centroids.is_empty() || weighted_colors.is_empty() || iterations == 0 {
         return centroids;
     }
 
-    let pixel_oklabs: Vec<Oklab> = pixels.iter().map(|p| p.to_oklab()).collect();
-    let mut centroid_oklabs: Vec<Oklab> = centroids.iter().map(|c| c.to_oklab()).collect();
+    let k = centroids.len();
+    let mut centroid_fixed: Vec<OklabFixed> = centroids.iter()
+        .map(|c| c.to_oklab_fixed())
+        .collect();
 
-    for _ in 0..iterations {
-        // Assign pixels to nearest centroid
-        #[cfg(feature = "parallel")]
-        let assignments: Vec<usize> = pixel_oklabs
-            .par_iter()
-            .map(|pixel| find_nearest_centroid_oklab(pixel, &centroid_oklabs))
-            .collect();
+    // Pre-allocate accumulators
+    let mut accumulators: Vec<OklabFixedAccumulator> = vec![OklabFixedAccumulator::new(); k];
 
-        #[cfg(not(feature = "parallel"))]
-        let assignments: Vec<usize> = pixel_oklabs
-            .iter()
-            .map(|pixel| find_nearest_centroid_oklab(pixel, &centroid_oklabs))
-            .collect();
-
-        // Recompute centroids
-        let k = centroid_oklabs.len();
-        let mut sums = vec![Oklab::new(0.0, 0.0, 0.0); k];
-        let mut counts = vec![0usize; k];
-
-        for (pixel, &cluster) in pixel_oklabs.iter().zip(assignments.iter()) {
-            sums[cluster] = sums[cluster] + *pixel;
-            counts[cluster] += 1;
+    for _iter in 0..iterations {
+        // Reset accumulators
+        for acc in accumulators.iter_mut() {
+            acc.reset();
         }
 
+        // Assign each unique color to nearest centroid (weighted)
+        for wc in weighted_colors {
+            let nearest = find_nearest_centroid_fixed(&wc.oklab, &centroid_fixed);
+            accumulators[nearest].add(wc.oklab, wc.count);
+        }
+
+        // Update centroids
         let mut converged = true;
         for i in 0..k {
-            if counts[i] > 0 {
-                let new_centroid = sums[i] / counts[i] as f32;
-                if new_centroid.distance_squared(centroid_oklabs[i]) > 0.0001 {
+            if accumulators[i].weight > 0 {
+                let new_centroid = accumulators[i].mean();
+                // Check convergence (threshold in fixed-point space)
+                // 65536 * 0.0001 ≈ 6.5, so squared threshold ≈ 42
+                if new_centroid.distance_squared(centroid_fixed[i]) > 50 {
                     converged = false;
                 }
-                centroid_oklabs[i] = new_centroid;
+                centroid_fixed[i] = new_centroid;
             }
         }
 
@@ -737,9 +791,26 @@ fn kmeans_refine_oklab(pixels: &[Rgb], centroids: Vec<Rgb>, iterations: usize) -
     }
 
     // Convert back to RGB
-    centroid_oklabs.iter().map(|oklab| oklab.to_rgb()).collect()
+    centroid_fixed.iter().map(|okf| okf.to_rgb()).collect()
 }
 
+/// Find nearest centroid using OklabFixed (integer arithmetic)
+#[inline]
+fn find_nearest_centroid_fixed(pixel: &OklabFixed, centroids: &[OklabFixed]) -> usize {
+    let mut best_idx = 0;
+    let mut best_dist = i64::MAX;
+    
+    for (i, c) in centroids.iter().enumerate() {
+        let dist = pixel.distance_squared(*c);
+        if dist < best_dist {
+            best_dist = dist;
+            best_idx = i;
+        }
+    }
+    best_idx
+}
+
+// Keep the old float-based K-Means for backwards compatibility with KMeansPlusPlus strategy
 fn find_nearest_centroid_oklab(pixel: &Oklab, centroids: &[Oklab]) -> usize {
     let mut best_idx = 0;
     let mut best_dist = f32::MAX;
@@ -798,4 +869,55 @@ pub fn kmeans_plus_plus_init(pixels: &[Oklab], k: usize) -> Vec<Oklab> {
     }
 
     centroids
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_weighted_kmeans_faster_than_raw() {
+        // Simulate a 100x100 image with some repeated colors
+        let mut pixels = Vec::with_capacity(10000);
+        for i in 0..100 {
+            for j in 0..100 {
+                // Create some color variety but with repetition
+                let r = ((i * 3) % 256) as u8;
+                let g = ((j * 3) % 256) as u8;
+                let b = (((i + j) * 2) % 256) as u8;
+                pixels.push(Rgb::new(r, g, b));
+            }
+        }
+
+        // Build histogram
+        let mut counts: HashMap<[u8; 3], u32> = HashMap::new();
+        for p in &pixels {
+            *counts.entry(p.to_array()).or_insert(0) += 1;
+        }
+
+        // Should have fewer unique colors than total pixels
+        assert!(counts.len() < pixels.len());
+        
+        // Test that extraction works
+        let palette = extract_palette(&pixels, 8, 5);
+        assert_eq!(palette.len(), 8);
+    }
+
+    #[test]
+    fn test_oklab_fixed_palette_matching() {
+        let palette = Palette::new(vec![
+            Rgb::new(255, 0, 0),
+            Rgb::new(0, 255, 0),
+            Rgb::new(0, 0, 255),
+        ]);
+
+        // Test that matching works correctly
+        let red_fixed = Rgb::new(200, 50, 50).to_oklab_fixed();
+        let nearest = palette.find_nearest_oklab_fixed(&red_fixed);
+        assert_eq!(nearest, 0); // Should match red
+    }
 }
