@@ -1,88 +1,15 @@
 //! Smart Pixel Art Downscaler
 //!
-//! A comprehensive library for intelligent image downscaling with focus on
-//! pixel art preservation. Combines multiple advanced techniques:
-//!
-//! - **Global Palette Extraction**: Median Cut with K-Means++ refinement in
-//!   Oklab color space for perceptually optimal and vibrant color palettes
-//! - **Edge Detection**: Sobel/Scharr operators for boundary awareness
-//! - **Region Segmentation**: SLIC superpixels or VTracer-style hierarchical
-//!   clustering for coherent region detection
-//! - **Neighbor-Coherent Assignment**: Spatial coherence through neighbor and
-//!   region-aware color selection
-//! - **Two-Pass Refinement**: Iterative optimization for smooth results
-//!
-//! # Color Space Improvements (v0.2)
-//!
-//! This version uses **Oklab** color space for all perceptual operations:
-//! - Better hue linearity than CIE Lab
-//! - Preserves saturation during color averaging
-//! - Prevents the "muddy" desaturated colors from RGB averaging
-//!
-//! # Features
-//!
-//! - `native` (default): Enable image crate support and parallel processing
-//! - `wasm`: Enable WebAssembly bindings for browser/Node.js usage
-//! - `parallel`: Enable rayon-based parallel processing
-//!
-//! # Palette Strategies
-//!
-//! Choose the best strategy for your use case:
-//!
-//! - `OklabMedianCut` (default): Best general-purpose quality
-//! - `SaturationWeighted`: Preserves vibrant colors
-//! - `Medoid`: Uses only exact colors from the source image
-//! - `KMeansPlusPlus`: Good for small palettes
-//! - `LegacyRgb`: Original RGB median cut (not recommended)
-//!
-//! # Quick Start (Native)
-//!
-//! ```rust,ignore
-//! use smart_downscaler::{downscale, DownscaleConfig, smart_downscale};
-//! use smart_downscaler::color::Rgb;
-//! use smart_downscaler::palette::PaletteStrategy;
-//!
-//! // Simple usage with image crate
-//! let img = image::open("input.png").unwrap().to_rgb8();
-//! let result = downscale(&img, 64, 64, 16);
-//! result.save("output.png").unwrap();
-//!
-//! // Advanced usage with configuration
-//! let config = DownscaleConfig {
-//!     palette_size: 24,
-//!     palette_strategy: PaletteStrategy::SaturationWeighted,
-//!     ..Default::default()
-//! };
-//! ```
-//!
-//! # Quick Start (WebAssembly)
-//!
-//! ```javascript
-//! import init, { downscale, WasmDownscaleConfig } from 'smart-downscaler';
-//!
-//! await init();
-//!
-//! // Get image data from canvas
-//! const ctx = canvas.getContext('2d');
-//! const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-//!
-//! // Configure downscaler with vibrant colors preset
-//! const config = WasmDownscaleConfig.vibrant();
-//! config.palette_size = 16;
-//!
-//! // Downscale
-//! const result = downscale(
-//!     imageData.data,
-//!     canvas.width,
-//!     canvas.height,
-//!     64, 64,
-//!     config
-//! );
-//!
-//! // Use result
-//! const outputData = new ImageData(result.data, result.width, result.height);
-//! outputCtx.putImageData(outputData, 0, 0);
-//! ```
+//! # v0.4 Changes
+//! - `Rgb` is now `#[repr(transparent)]` u32-packed (0x00RRGGBB)
+//! - Removed dead code: `LabFixed`, `LabAccumulator`, `LinearRgbAccumulator`
+//! - `Palette` no longer stores `lab_colors` (unused in main pipeline)
+//! - `PreprocessResult` uses `Cow<[Rgb]>` — zero-copy when no preprocessing needed
+//! - Fixed: `same_region_count`, `was_reduced`, refinement allocation, k_centroid mode 3
+//! - `analyze_colors` uses HashMap (O(1) lookup, was O(n) linear scan)
+//! - `quantize_to_palette` computes Oklab once per pixel (was twice)
+//! - PackedDisjointSet uses path splitting
+//! - MaybeUninit pattern for hot allocation paths
 
 pub mod color;
 pub mod downscale;
@@ -96,7 +23,7 @@ pub mod slic;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
-// Re-export main types and functions for convenience
+// Re-exports
 pub use color::{Lab, LinearRgb, Oklab, Rgb};
 pub use downscale::{
     smart_downscale, smart_downscale_with_palette,
@@ -108,14 +35,11 @@ pub use palette::{extract_palette, extract_palette_with_strategy, Palette, Palet
 pub use preprocess::{preprocess_image, PreprocessConfig, PreprocessResult};
 pub use slic::{flood_fill_segment, slic_segment, Segmentation, SlicConfig};
 
-// Native-only exports
 #[cfg(feature = "native")]
 pub use downscale::downscale;
 
-/// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Prelude module for convenient imports
 pub mod prelude {
     pub use crate::color::{Lab, LinearRgb, Oklab, Rgb};
     pub use crate::downscale::{
@@ -135,7 +59,6 @@ mod integration_tests {
 
     #[test]
     fn test_full_pipeline() {
-        // Create a test image with distinct regions
         let mut pixels = Vec::new();
         for y in 0..64 {
             for x in 0..64 {
@@ -156,24 +79,16 @@ mod integration_tests {
         let config = DownscaleConfig {
             palette_size: 8,
             two_pass_refinement: true,
-            segmentation: SegmentationMethod::HierarchyFast {
-                color_threshold: 20.0,
-            },
+            segmentation: SegmentationMethod::HierarchyFast { color_threshold: 20.0 },
             palette_strategy: PaletteStrategy::OklabMedianCut,
             ..Default::default()
         };
 
         let result = smart_downscale(&pixels, 64, 64, 16, 16, &config);
-
-        // Verify output dimensions
         assert_eq!(result.width, 16);
         assert_eq!(result.height, 16);
         assert_eq!(result.pixels.len(), 256);
-
-        // Verify palette was used
         assert!(result.palette.len() <= 8);
-
-        // Verify all output pixels are from the palette
         for pixel in &result.pixels {
             assert!(result.palette.colors.contains(pixel));
         }
@@ -181,15 +96,11 @@ mod integration_tests {
 
     #[test]
     fn test_saturation_preservation() {
-        // Create highly saturated colors
         let mut pixels = Vec::new();
         for _y in 0..100 {
             for x in 0..100 {
-                if x < 50 {
-                    pixels.push(Rgb::new(255, 0, 0)); // Pure red
-                } else {
-                    pixels.push(Rgb::new(0, 0, 255)); // Pure blue
-                }
+                if x < 50 { pixels.push(Rgb::new(255, 0, 0)); }
+                else { pixels.push(Rgb::new(0, 0, 255)); }
             }
         }
 
@@ -200,50 +111,30 @@ mod integration_tests {
         };
 
         let result = smart_downscale(&pixels, 100, 100, 10, 10, &config);
-
-        // Check that output colors are still saturated
         for color in &result.palette.colors {
             let oklab = color.to_oklab();
-            // Saturated colors should have chroma > 0.1
             assert!(
                 oklab.chroma() > 0.1 || oklab.l < 0.1 || oklab.l > 0.9,
-                "Color {:?} has low chroma: {}",
-                color,
-                oklab.chroma()
+                "Color {:?} has low chroma: {}", color, oklab.chroma()
             );
         }
     }
 
     #[test]
     fn test_medoid_strategy() {
-        // Create a simple image
         let pixels = vec![
-            Rgb::new(255, 0, 0),
-            Rgb::new(255, 0, 0),
-            Rgb::new(0, 255, 0),
-            Rgb::new(0, 255, 0),
+            Rgb::new(255, 0, 0), Rgb::new(255, 0, 0),
+            Rgb::new(0, 255, 0), Rgb::new(0, 255, 0),
         ];
 
-        let palette = extract_palette_with_strategy(
-            &pixels,
-            2,
-            0, // No K-means refinement
-            PaletteStrategy::Medoid,
-        );
-
-        // Medoid should return exact colors
+        let palette = extract_palette_with_strategy(&pixels, 2, 0, PaletteStrategy::Medoid);
         for color in &palette.colors {
-            assert!(
-                pixels.contains(color),
-                "Medoid returned non-source color: {:?}",
-                color
-            );
+            assert!(pixels.contains(color), "Medoid returned non-source color: {:?}", color);
         }
     }
 
     #[test]
     fn test_gradient_image() {
-        // Create a gradient image
         let mut pixels = Vec::new();
         for y in 0..100 {
             for x in 0..100 {
@@ -261,68 +152,40 @@ mod integration_tests {
         };
 
         let result = smart_downscale(&pixels, 100, 100, 10, 10, &config);
-
-        // Should produce smooth gradient in output
         assert_eq!(result.pixels.len(), 100);
     }
 
     #[test]
     fn test_with_slic_segmentation() {
-        let pixels: Vec<Rgb> = (0..400)
-            .map(|i| {
-                let x = i % 20;
-                let y = i / 20;
-                if (x < 10) ^ (y < 10) {
-                    Rgb::new(255, 0, 0)
-                } else {
-                    Rgb::new(0, 0, 255)
-                }
-            })
-            .collect();
+        let pixels: Vec<Rgb> = (0..400).map(|i| {
+            let x = i % 20;
+            let y = i / 20;
+            if (x < 10) ^ (y < 10) { Rgb::new(255, 0, 0) } else { Rgb::new(0, 0, 255) }
+        }).collect();
 
         let config = DownscaleConfig {
             palette_size: 4,
             segmentation: SegmentationMethod::Slic(SlicConfig {
-                num_superpixels: 8,
-                compactness: 10.0,
-                max_iterations: 5,
-                convergence_threshold: 1.0,
+                num_superpixels: 8, compactness: 10.0, max_iterations: 5, convergence_threshold: 1.0,
             }),
             ..Default::default()
         };
 
         let result = smart_downscale(&pixels, 20, 20, 5, 5, &config);
-
         assert!(result.segmentation.is_some());
     }
 
     #[test]
     fn test_oklab_vs_legacy() {
-        // Create a gradient that would desaturate with legacy RGB averaging
         let mut pixels = Vec::new();
-        for _ in 0..50 {
-            pixels.push(Rgb::new(255, 0, 0)); // Red
-        }
-        for _ in 0..50 {
-            pixels.push(Rgb::new(0, 255, 255)); // Cyan (opposite of red)
-        }
+        for _ in 0..50 { pixels.push(Rgb::new(255, 0, 0)); }
+        for _ in 0..50 { pixels.push(Rgb::new(0, 255, 255)); }
 
-        // With legacy RGB, red + cyan = gray
-        let legacy_palette = extract_palette_with_strategy(
-            &pixels, 1, 5, PaletteStrategy::LegacyRgb
-        );
+        let legacy_palette = extract_palette_with_strategy(&pixels, 1, 5, PaletteStrategy::LegacyRgb);
+        let oklab_palette = extract_palette_with_strategy(&pixels, 1, 5, PaletteStrategy::OklabMedianCut);
 
-        // With Oklab, should preserve more color information
-        let oklab_palette = extract_palette_with_strategy(
-            &pixels, 1, 5, PaletteStrategy::OklabMedianCut
-        );
-
-        // Legacy will produce a more desaturated result
         let legacy_chroma = legacy_palette.colors[0].to_oklab().chroma();
         let oklab_chroma = oklab_palette.colors[0].to_oklab().chroma();
-
-        // The Oklab result should generally have higher chroma
-        // (though this depends on the specific averaging behavior)
         println!("Legacy chroma: {}, Oklab chroma: {}", legacy_chroma, oklab_chroma);
     }
 }
