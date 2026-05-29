@@ -42,6 +42,12 @@ pub struct WasmDownscaleConfig {
     pub max_color_preprocess: usize,
     pub k_centroid: usize,
     pub k_centroid_iterations: usize,
+    /// Rare-color preservation: 0.0 = pure area weighting, 1.0 = strong (count^0.5).
+    pub color_rarity: f32,
+    /// Detail-color boost via local-contrast saliency. 0.0 = off.
+    pub detail_boost: f32,
+    /// Reserve N palette slots for distinct, important, under-represented colors. 0 = off.
+    pub reserve_colors: usize,
 }
 
 #[wasm_bindgen]
@@ -67,6 +73,7 @@ impl WasmDownscaleConfig {
             segmentation_method: "none".to_string(), palette_strategy: "oklab".to_string(),
             slic_superpixels: 50, slic_compactness: 10.0, hierarchy_threshold: 20.0, hierarchy_min_size: 4,
             max_resolution_mp: 1.0, max_color_preprocess: 8192, k_centroid: 1, k_centroid_iterations: 0,
+            color_rarity: 0.0, detail_boost: 0.0, reserve_colors: 0,
         }
     }
 
@@ -78,6 +85,7 @@ impl WasmDownscaleConfig {
             segmentation_method: "hierarchy".to_string(), palette_strategy: "saturation".to_string(),
             slic_superpixels: 100, slic_compactness: 10.0, hierarchy_threshold: 15.0, hierarchy_min_size: 8,
             max_resolution_mp: 2.0, max_color_preprocess: 32768, k_centroid: 2, k_centroid_iterations: 3,
+            color_rarity: 0.3, detail_boost: 0.8, reserve_colors: 4,
         }
     }
 
@@ -89,6 +97,7 @@ impl WasmDownscaleConfig {
             segmentation_method: "hierarchy_fast".to_string(), palette_strategy: "saturation".to_string(),
             slic_superpixels: 100, slic_compactness: 10.0, hierarchy_threshold: 15.0, hierarchy_min_size: 4,
             max_resolution_mp: 1.6, max_color_preprocess: 16384, k_centroid: 2, k_centroid_iterations: 2,
+            color_rarity: 0.35, detail_boost: 0.9, reserve_colors: 3,
         }
     }
 
@@ -100,6 +109,7 @@ impl WasmDownscaleConfig {
             segmentation_method: "hierarchy_fast".to_string(), palette_strategy: "medoid".to_string(),
             slic_superpixels: 100, slic_compactness: 10.0, hierarchy_threshold: 15.0, hierarchy_min_size: 4,
             max_resolution_mp: 1.6, max_color_preprocess: 16384, k_centroid: 1, k_centroid_iterations: 0,
+            color_rarity: 0.0, detail_boost: 0.0, reserve_colors: 0,
         }
     }
 }
@@ -112,6 +122,7 @@ impl Default for WasmDownscaleConfig {
             segmentation_method: "hierarchy_fast".to_string(), palette_strategy: "oklab".to_string(),
             slic_superpixels: 100, slic_compactness: 10.0, hierarchy_threshold: 15.0, hierarchy_min_size: 4,
             max_resolution_mp: 1.5, max_color_preprocess: 16384, k_centroid: 1, k_centroid_iterations: 0,
+            color_rarity: 0.0, detail_boost: 0.0, reserve_colors: 0,
         }
     }
 }
@@ -147,6 +158,8 @@ impl WasmDownscaleConfig {
             segmentation, edge_weight: self.edge_weight, palette_strategy,
             max_resolution_mp: self.max_resolution_mp, max_color_preprocess: self.max_color_preprocess,
             k_centroid: self.k_centroid, k_centroid_iterations: self.k_centroid_iterations,
+            color_rarity: self.color_rarity, detail_boost: self.detail_boost,
+            reserve_colors: self.reserve_colors,
         }
     }
 }

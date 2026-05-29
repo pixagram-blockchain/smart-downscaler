@@ -80,9 +80,11 @@ pub fn rgb_to_oklab_fixed(rgb: Rgb) -> OklabFixed {
     const N10: i32 = 129627;  const N11: i32 = -159161;  const N12: i32 = 29534;
     const N20: i32 = 1698;    const N21: i32 = 51296;    const N22: i32 = -52994;
 
-    let l_ok = (N00 * l_cbrt + N01 * m_cbrt + N02 * s_cbrt) >> 16;
-    let a_ok = (N10 * l_cbrt + N11 * m_cbrt + N12 * s_cbrt) >> 16;
-    let b_ok = (N20 * l_cbrt + N21 * m_cbrt + N22 * s_cbrt) >> 16;
+    // i64 intermediates: N*cbrt can exceed i32 range (e.g. 129627 * 65536 ≈ 8.5e9).
+    let (lc, mc, sc) = (l_cbrt as i64, m_cbrt as i64, s_cbrt as i64);
+    let l_ok = ((N00 as i64 * lc + N01 as i64 * mc + N02 as i64 * sc) >> 16) as i32;
+    let a_ok = ((N10 as i64 * lc + N11 as i64 * mc + N12 as i64 * sc) >> 16) as i32;
+    let b_ok = ((N20 as i64 * lc + N21 as i64 * mc + N22 as i64 * sc) >> 16) as i32;
 
     OklabFixed::new(l_ok, a_ok, b_ok)
 }

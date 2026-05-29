@@ -11,7 +11,7 @@
 use crate::color::{Oklab, OklabAccumulator, Rgb};
 use crate::edge::{compute_combined_edges, EdgeMap};
 use crate::hierarchy::{hierarchical_cluster, hierarchical_cluster_fast, HierarchyConfig};
-use crate::palette::{extract_palette_with_strategy, Palette, PaletteStrategy};
+use crate::palette::{extract_palette_weighted, Palette, PaletteStrategy};
 use crate::preprocess::{preprocess_image, PreprocessConfig, fast_edge_detect};
 use crate::slic::{slic_segment, Segmentation, SlicConfig};
 
@@ -35,9 +35,18 @@ pub struct DownscaleConfig {
     pub palette_strategy: PaletteStrategy,
     pub max_resolution_mp: f32,
     pub max_color_preprocess: usize,
-    /// K-Means centroid mode: 1=Avg, 2=Dominant(largest cluster), 3=Foremost(lightest cluster)
+    /// K-Means centroid mode: 1=Avg, 2=Dominant(largest cluster), 3=Foremost(lightest cluster),
+    /// 4=Salient (keep a non-trivial, distinctly-more-chromatic minority — preserves lips/eyes)
     pub k_centroid: usize,
     pub k_centroid_iterations: usize,
+    /// Rare-color preservation: 0.0 = pure area weighting, 1.0 = strong (count^0.5). Default 0.0.
+    pub color_rarity: f32,
+    /// Detail-color boost: weights palette extraction toward perceptually salient,
+    /// detail-rich colors using a local-contrast saliency map. 0.0 = off. Default 0.0.
+    pub detail_boost: f32,
+    /// Reserve N palette slots for distinct, important, under-represented source colors.
+    /// 0 = off. ~palette_size/8 recommended for faces/portraits. Default 0.
+    pub reserve_colors: usize,
 }
 
 impl Default for DownscaleConfig {
@@ -56,6 +65,9 @@ impl Default for DownscaleConfig {
             max_color_preprocess: 16384,
             k_centroid: 1,
             k_centroid_iterations: 0,
+            color_rarity: 0.0,
+            detail_boost: 0.0,
+            reserve_colors: 0,
         }
     }
 }
@@ -120,8 +132,27 @@ pub fn smart_downscale(
     let working_width = preprocessed.width;
     let working_height = preprocessed.height;
 
-    let palette = extract_palette_with_strategy(
-        working_pixels, config.palette_size, config.kmeans_iterations, config.palette_strategy,
+    // Saliency map (local Oklab contrast at the downscale radius) — boosts
+    // perceptually important, detail-rich colors (lips, eyes) during palette
+    // extraction. Only computed when detail_boost is enabled.
+    let saliency: Option<Vec<f32>> = if config.detail_boost > 0.0 {
+        let sx = (working_width as f32 / target_width as f32).max(1.0);
+        let sy = (working_height as f32 / target_height as f32).max(1.0);
+        let radius = (sx.max(sy).round() as usize).clamp(1, 8);
+        Some(compute_saliency_map(working_pixels, working_width, working_height, radius))
+    } else {
+        None
+    };
+
+    let palette = extract_palette_weighted(
+        working_pixels,
+        saliency.as_deref(),
+        config.palette_size,
+        config.kmeans_iterations,
+        config.palette_strategy,
+        config.color_rarity,
+        config.detail_boost,
+        config.reserve_colors,
     );
 
     smart_downscale_internal(
@@ -321,6 +352,30 @@ fn get_tile_color_kcentroid(
                 })
                 .map(|i| scratch.centroids[i])
                 .unwrap_or(scratch.centroids[0])
+        }
+        4 => {
+            // Mode 4: "Salient" — prefer the more chromatic cluster when it is a
+            // non-trivial, distinctly-more-colorful minority (lips, eyes, makeup),
+            // instead of snapping a mixed tile to the dominant (desaturated) color.
+            let total: usize = scratch.cluster_counts[..k].iter().sum();
+            if total == 0 {
+                return scratch.centroids[0];
+            }
+            let (big, small) = if scratch.cluster_counts[1] > scratch.cluster_counts[0] {
+                (1usize, 0usize)
+            } else {
+                (0usize, 1usize)
+            };
+            let c_big = scratch.centroids[big].chroma();
+            let c_small = scratch.centroids[small].chroma();
+            let small_share = scratch.cluster_counts[small] as f32 / total as f32;
+            // Gates (tunable): minority must be non-trivial, absolutely colorful,
+            // and distinctly more colorful than the majority.
+            if small_share >= 0.22 && c_small > 0.06 && c_small > c_big + 0.02 {
+                scratch.centroids[small]
+            } else {
+                scratch.centroids[big]
+            }
         }
         _ => {
             // Mode 2: "Dominant" — largest cluster
@@ -574,6 +629,81 @@ fn refinement_pass_oklab(
 
         if !changed { break; }
     }
+}
+
+// =============================================================================
+// Saliency (local Oklab contrast) — used for detail-color boosting
+// =============================================================================
+
+/// Per-pixel saliency = local Oklab contrast at `radius` (≈ the downscale factor).
+/// Features that are thin relative to one output pixel — the ones at risk of being
+/// averaged away — score high; smooth gradients score ~0. Fixed-scale normalization
+/// (no global max) so a single harsh edge can't wash out the rest of the image.
+pub fn compute_saliency_map(pixels: &[Rgb], width: usize, height: usize, radius: usize) -> Vec<f32> {
+    let n = width * height;
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut l = vec![0f32; n];
+    let mut a = vec![0f32; n];
+    let mut b = vec![0f32; n];
+    for (i, p) in pixels.iter().enumerate() {
+        let ok = p.to_oklab();
+        l[i] = ok.l;
+        a[i] = ok.a;
+        b[i] = ok.b;
+    }
+    let bl = box_blur(&l, width, height, radius);
+    let ba = box_blur(&a, width, height, radius);
+    let bb = box_blur(&b, width, height, radius);
+
+    let mut sal = vec![0f32; n];
+    for i in 0..n {
+        let dl = l[i] - bl[i];
+        let da = a[i] - ba[i];
+        let db = b[i] - bb[i];
+        let d = (dl * dl + da * da + db * db).sqrt();
+        sal[i] = (d * 10.0).min(1.0); // d / 0.10, clamped to [0,1]
+    }
+    sal
+}
+
+/// Separable box blur via prefix sums (O(n)), edge-clamped window.
+fn box_blur(src: &[f32], width: usize, height: usize, radius: usize) -> Vec<f32> {
+    if radius == 0 || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let n = width * height;
+    let mut tmp = vec![0f32; n];
+    let mut prefix = vec![0f32; width.max(height) + 1];
+
+    // Horizontal pass
+    for y in 0..height {
+        let row = y * width;
+        prefix[0] = 0.0;
+        for x in 0..width {
+            prefix[x + 1] = prefix[x] + src[row + x];
+        }
+        for x in 0..width {
+            let lo = x.saturating_sub(radius);
+            let hi = (x + radius + 1).min(width);
+            tmp[row + x] = (prefix[hi] - prefix[lo]) / (hi - lo) as f32;
+        }
+    }
+    // Vertical pass
+    let mut out = vec![0f32; n];
+    for x in 0..width {
+        prefix[0] = 0.0;
+        for y in 0..height {
+            prefix[y + 1] = prefix[y] + tmp[y * width + x];
+        }
+        for y in 0..height {
+            let lo = y.saturating_sub(radius);
+            let hi = (y + radius + 1).min(height);
+            out[y * width + x] = (prefix[hi] - prefix[lo]) / (hi - lo) as f32;
+        }
+    }
+    out
 }
 
 #[cfg(feature = "native")]

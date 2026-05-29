@@ -149,6 +149,142 @@ pub fn extract_palette_with_strategy(
 }
 
 // =============================================================================
+// Importance-aware extraction (rare-color preservation)
+// =============================================================================
+
+/// Importance-aware palette extraction.
+///
+/// `weights[i]` = per-pixel saliency in `[0, 1]` (`None` = area-only).
+/// `rarity` ∈ `[0, 1]`: `0` = pure area weighting (identical to
+///   [`extract_palette_with_strategy`]), `1` = strong rare-color preservation
+///   (`count^0.5`).
+/// `detail_boost` ≥ `0`: extra weight for colors that live in salient regions.
+/// `reserve_colors`: slots filled with *exact source colors* that are distinct
+///   from the base palette AND important — a hard guarantee that perceptually
+///   important rare colors (lips, eyes, highlights) survive.
+///
+/// With `(None, 0.0, 0.0, 0)` this is byte-for-byte equivalent to
+/// [`extract_palette_with_strategy`].
+pub fn extract_palette_weighted(
+    pixels: &[Rgb],
+    weights: Option<&[f32]>,
+    target_colors: usize,
+    kmeans_iterations: usize,
+    strategy: PaletteStrategy,
+    rarity: f32,
+    detail_boost: f32,
+    reserve_colors: usize,
+) -> Palette {
+    if pixels.is_empty() || target_colors == 0 {
+        return Palette::new(Vec::new());
+    }
+
+    // Aggregate per unique color: pixel count + summed saliency.
+    let mut counts: HashMap<Rgb, (u32, f32)> = HashMap::new();
+    for (i, &p) in pixels.iter().enumerate() {
+        let s = weights.and_then(|w| w.get(i)).copied().unwrap_or(0.0);
+        let e = counts.entry(p).or_insert((0, 0.0));
+        e.0 += 1;
+        e.1 += s;
+    }
+
+    let p_exp = 1.0 - 0.5 * rarity.clamp(0.0, 1.0); // 1.0 (area) .. 0.5 (rare-preserving)
+    let beta = detail_boost.max(0.0);
+    const WSCALE: f32 = 64.0; // sub-integer resolution for damped weights
+
+    // (rgb, oklab, effective_weight, weight_int)
+    let mut adjusted: Vec<(Rgb, Oklab, f32, u32)> = Vec::with_capacity(counts.len());
+    for (&rgb, &(count, sal_sum)) in counts.iter() {
+        let mean_sal = sal_sum / count as f32;
+        let damp = (count as f32).powf(p_exp);
+        let w = damp * (1.0 + beta * mean_sal);
+        let wint = ((w * WSCALE).round() as u32).max(1);
+        adjusted.push((rgb, rgb.to_oklab(), w, wint));
+    }
+
+    let reserve = reserve_colors.min(target_colors.saturating_sub(1));
+    let base_target = target_colors - reserve;
+
+    let weighted_colors: Vec<WeightedColor> = adjusted.iter()
+        .map(|&(rgb, _ok, _w, wint)| WeightedColor::new(rgb, wint as usize))
+        .collect();
+
+    let initial_centroids = match strategy {
+        PaletteStrategy::OklabMedianCut => median_cut_oklab(&weighted_colors, base_target, false),
+        PaletteStrategy::SaturationWeighted => median_cut_oklab(&weighted_colors, base_target, true),
+        PaletteStrategy::Medoid => median_cut_medoid(&weighted_colors, base_target),
+        PaletteStrategy::KMeansPlusPlus => {
+            let oklab: Vec<Oklab> = pixels.iter().map(|p| p.to_oklab()).collect();
+            kmeans_plus_plus_init(&oklab, base_target).into_iter().map(|ok| ok.to_rgb()).collect()
+        }
+        PaletteStrategy::LegacyRgb => median_cut_legacy(&weighted_colors, base_target),
+        PaletteStrategy::RgbBitmask => median_cut_rgb_bitmask(&weighted_colors, base_target),
+    };
+
+    let weighted_fixed: Vec<WeightedColorFixed> = adjusted.iter()
+        .map(|&(rgb, _ok, _w, wint)| WeightedColorFixed::new(rgb, wint))
+        .collect();
+
+    let mut centroids = kmeans_refine_weighted(&weighted_fixed, initial_centroids, kmeans_iterations);
+
+    if reserve > 0 {
+        reserve_distinct_colors(&adjusted, &mut centroids, reserve);
+    }
+
+    Palette::new(centroids)
+}
+
+/// Append up to `count` exact source colors that are both far from the current
+/// palette (distinct) and high-weight (important + not vanishingly rare).
+/// Importance-weighted farthest-point sampling on the quantization residual.
+fn reserve_distinct_colors(
+    adjusted: &[(Rgb, Oklab, f32, u32)],
+    palette: &mut Vec<Rgb>,
+    count: usize,
+) {
+    if adjusted.is_empty() {
+        return;
+    }
+    const MIN_DIST_SQ: f32 = 0.0009; // ~0.03 in Oklab: skip near-duplicates
+
+    let mut pal_oklab: Vec<Oklab> = palette.iter().map(|c| c.to_oklab()).collect();
+    let mut nearest: Vec<f32> = adjusted.iter()
+        .map(|&(_r, ok, _w, _wi)| pal_oklab.iter()
+            .map(|p| ok.distance_squared(*p))
+            .fold(f32::MAX, f32::min))
+        .collect();
+
+    for _ in 0..count {
+        let mut best: Option<usize> = None;
+        let mut best_score = 0.0f32;
+        for (i, &(_r, _ok, w, _wi)) in adjusted.iter().enumerate() {
+            let d = nearest[i];
+            if d < MIN_DIST_SQ {
+                continue;
+            }
+            let score = d * w; // distinct (residual²) × important (weight)
+            if score > best_score {
+                best_score = score;
+                best = Some(i);
+            }
+        }
+        let bi = match best {
+            Some(b) => b,
+            None => break,
+        };
+        let (rgb, ok, _w, _wi) = adjusted[bi];
+        palette.push(rgb);
+        pal_oklab.push(ok);
+        for (i, &(_r, oki, _w, _wi)) in adjusted.iter().enumerate() {
+            let dd = oki.distance_squared(ok);
+            if dd < nearest[i] {
+                nearest[i] = dd;
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Oklab Median Cut
 // =============================================================================
 
@@ -490,5 +626,40 @@ mod tests {
         let red_fixed = Rgb::new(200, 50, 50).to_oklab_fixed();
         let nearest = palette.find_nearest_oklab_fixed(&red_fixed);
         assert_eq!(nearest, 0);
+    }
+
+    #[test]
+    fn test_reservation_preserves_rare_distinct_color() {
+        // 97% near-gray skin-ish gradient + 3% distinct red "lips".
+        let mut pixels = Vec::new();
+        for i in 0..970 {
+            let v = 150 + (i % 40) as u8; // many close shades -> they eat the budget
+            pixels.push(Rgb::new(v, v.saturating_sub(20), v.saturating_sub(35)));
+        }
+        let lip = Rgb::new(200, 60, 70);
+        for _ in 0..30 { pixels.push(lip); } // 3%
+
+        let target = 8;
+        let lip_ok = lip.to_oklab();
+        let min_dist = |pal: &Palette| pal.oklab_colors.iter()
+            .map(|c| c.distance_squared(lip_ok)).fold(f32::MAX, f32::min).sqrt();
+
+        // Without reservation the rare lip color is typically merged away.
+        let plain = extract_palette_weighted(
+            &pixels, None, target, 4, PaletteStrategy::OklabMedianCut, 0.0, 0.0, 0,
+        );
+        // With 1 reserved slot it must appear (near-exactly) in the palette.
+        let reserved = extract_palette_weighted(
+            &pixels, None, target, 4, PaletteStrategy::OklabMedianCut, 0.3, 0.0, 1,
+        );
+
+        assert!(reserved.len() <= target);
+        assert!(
+            min_dist(&reserved) < 0.02,
+            "reserved palette should contain the lip color (ΔE={:.4})",
+            min_dist(&reserved)
+        );
+        // Reservation should be at least as good as plain at representing the lip.
+        assert!(min_dist(&reserved) <= min_dist(&plain) + 1e-4);
     }
 }
