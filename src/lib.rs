@@ -26,8 +26,9 @@ pub mod wasm;
 // Re-exports
 pub use color::{Lab, LinearRgb, Oklab, Rgb};
 pub use downscale::{
-    smart_downscale, smart_downscale_with_palette,
-    DownscaleConfig, DownscaleResult, SegmentationMethod,
+    prepare_image, smart_downscale, smart_downscale_prepared,
+    smart_downscale_prepared_with_palette, smart_downscale_with_palette,
+    DownscaleConfig, DownscaleResult, PreparedImage, SegmentationMethod,
 };
 pub use edge::{compute_combined_edges, compute_edge_map, EdgeMap};
 pub use hierarchy::{hierarchical_cluster, hierarchical_cluster_fast, Hierarchy, HierarchyConfig};
@@ -43,7 +44,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod prelude {
     pub use crate::color::{Lab, LinearRgb, Oklab, Rgb};
     pub use crate::downscale::{
-        smart_downscale, DownscaleConfig, DownscaleResult, SegmentationMethod,
+        prepare_image, smart_downscale, smart_downscale_prepared,
+        DownscaleConfig, DownscaleResult, PreparedImage, SegmentationMethod,
     };
     pub use crate::hierarchy::HierarchyConfig;
     pub use crate::palette::{Palette, PaletteStrategy};

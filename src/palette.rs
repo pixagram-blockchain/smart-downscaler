@@ -29,13 +29,16 @@ pub struct Palette {
     pub colors: Vec<Rgb>,
     pub oklab_colors: Vec<Oklab>,
     pub oklab_fixed_colors: Vec<OklabFixed>,
+    /// Per-entry skin classification (YCbCr heuristic), used by skin-aware quantization.
+    pub skin_flags: Vec<bool>,
 }
 
 impl Palette {
     pub fn new(colors: Vec<Rgb>) -> Self {
         let oklab_colors = colors.iter().map(|&c| c.to_oklab()).collect();
         let oklab_fixed_colors = colors.iter().map(|&c| c.to_oklab_fixed()).collect();
-        Self { colors, oklab_colors, oklab_fixed_colors }
+        let skin_flags = colors.iter().map(|&c| c.is_skin()).collect();
+        Self { colors, oklab_colors, oklab_fixed_colors, skin_flags }
     }
 
     pub fn len(&self) -> usize { self.colors.len() }
@@ -48,6 +51,27 @@ impl Palette {
         for (i, p) in self.oklab_colors.iter().enumerate() {
             let dist = oklab.distance_squared(*p);
             if dist < best_dist { best_dist = dist; best_idx = i; }
+        }
+        best_idx
+    }
+
+    /// Skin-aware nearest: a class mismatch (skin↔non-skin) inflates the distance
+    /// by `1 + penalty`, so a skin query prefers skin colors (and vice versa)
+    /// unless a cross-class color is overwhelmingly closer. `penalty <= 0` or
+    /// `query_skin < 0` reduces to [`find_nearest_oklab`].
+    pub fn find_nearest_oklab_skin(&self, oklab: &Oklab, query_skin: i8, penalty: f32) -> usize {
+        if penalty <= 0.0 || query_skin < 0 || self.skin_flags.is_empty() {
+            return self.find_nearest_oklab(oklab);
+        }
+        let want_skin = query_skin == 1;
+        let mut best_idx = 0;
+        let mut best_score = f32::MAX;
+        for (i, p) in self.oklab_colors.iter().enumerate() {
+            let mut d = oklab.distance_squared(*p);
+            if self.skin_flags[i] != want_skin {
+                d *= 1.0 + penalty;
+            }
+            if d < best_score { best_score = d; best_idx = i; }
         }
         best_idx
     }
@@ -117,54 +141,84 @@ pub fn extract_palette_with_strategy(
     kmeans_iterations: usize,
     strategy: PaletteStrategy,
 ) -> Palette {
-    // Build histogram using Rgb directly (packed u32 key)
-    let mut color_counts: HashMap<Rgb, usize> = HashMap::new();
-    for &pixel in pixels {
-        *color_counts.entry(pixel).or_insert(0) += 1;
-    }
-
-    let weighted_colors: Vec<WeightedColor> = color_counts.iter()
-        .map(|(&rgb, &count)| WeightedColor::new(rgb, count))
-        .collect();
-
-    let initial_centroids = match strategy {
-        PaletteStrategy::OklabMedianCut => median_cut_oklab(&weighted_colors, target_colors, false),
-        PaletteStrategy::SaturationWeighted => median_cut_oklab(&weighted_colors, target_colors, true),
-        PaletteStrategy::Medoid => median_cut_medoid(&weighted_colors, target_colors),
-        PaletteStrategy::KMeansPlusPlus => {
-            let oklabs: Vec<Oklab> = pixels.iter().map(|p| p.to_oklab()).collect();
-            kmeans_plus_plus_init(&oklabs, target_colors).into_iter().map(|ok| ok.to_rgb()).collect()
-        }
-        PaletteStrategy::LegacyRgb => median_cut_legacy(&weighted_colors, target_colors),
-        PaletteStrategy::RgbBitmask => median_cut_rgb_bitmask(&weighted_colors, target_colors),
-    };
-
-    // K-Means refinement on WEIGHTED HISTOGRAM
-    let weighted_fixed: Vec<WeightedColorFixed> = color_counts.into_iter()
-        .map(|(rgb, count)| WeightedColorFixed::new(rgb, count as u32))
-        .collect();
-
-    let refined = kmeans_refine_weighted(&weighted_fixed, initial_centroids, kmeans_iterations);
-    Palette::new(refined)
+    // Neutral wrapper: no saliency, no rarity, no reserve, no chroma recovery, no skin.
+    extract_palette_weighted(
+        pixels, None, target_colors, kmeans_iterations, strategy,
+        0.0, 0.0, 0, 0.0, 0.0,
+    )
 }
 
 // =============================================================================
-// Importance-aware extraction (rare-color preservation)
+// Per-color statistics
+// =============================================================================
+
+/// Aggregated stats for one unique source color.
+#[derive(Clone, Copy, Debug)]
+struct ColorStat {
+    rgb: Rgb,
+    oklab: Oklab,
+    count: u32,    // raw pixel count (faithful for chroma targets)
+    weight: f32,   // effective extraction weight (rarity × saliency adjusted)
+    weight_int: u32, // quantized weight for the integer median-cut/k-means paths
+    skin: bool,
+}
+
+/// Median-cut init + weighted k-means refine for one (sub-)population.
+/// Factored out so skin/non-skin domains can be extracted independently.
+fn extract_and_refine(
+    stats: &[ColorStat],
+    pixels: &[Rgb],
+    target: usize,
+    kmeans_iterations: usize,
+    strategy: PaletteStrategy,
+) -> Vec<Rgb> {
+    if stats.is_empty() || target == 0 {
+        return Vec::new();
+    }
+    let weighted_colors: Vec<WeightedColor> = stats.iter()
+        .map(|s| WeightedColor::new(s.rgb, s.weight_int as usize))
+        .collect();
+
+    let initial = match strategy {
+        PaletteStrategy::OklabMedianCut => median_cut_oklab(&weighted_colors, target, false),
+        PaletteStrategy::SaturationWeighted => median_cut_oklab(&weighted_colors, target, true),
+        PaletteStrategy::Medoid => median_cut_medoid(&weighted_colors, target),
+        PaletteStrategy::KMeansPlusPlus => {
+            let oklab: Vec<Oklab> = pixels.iter().map(|p| p.to_oklab()).collect();
+            kmeans_plus_plus_init(&oklab, target).into_iter().map(|ok| ok.to_rgb()).collect()
+        }
+        PaletteStrategy::LegacyRgb => median_cut_legacy(&weighted_colors, target),
+        PaletteStrategy::RgbBitmask => median_cut_rgb_bitmask(&weighted_colors, target),
+    };
+
+    let weighted_fixed: Vec<WeightedColorFixed> = stats.iter()
+        .map(|s| WeightedColorFixed::new(s.rgb, s.weight_int))
+        .collect();
+
+    kmeans_refine_weighted(&weighted_fixed, initial, kmeans_iterations)
+}
+
+// =============================================================================
+// Importance-aware extraction (rare colors + chroma recovery + skin isolation)
 // =============================================================================
 
 /// Importance-aware palette extraction.
 ///
-/// `weights[i]` = per-pixel saliency in `[0, 1]` (`None` = area-only).
-/// `rarity` ∈ `[0, 1]`: `0` = pure area weighting (identical to
-///   [`extract_palette_with_strategy`]), `1` = strong rare-color preservation
-///   (`count^0.5`).
-/// `detail_boost` ≥ `0`: extra weight for colors that live in salient regions.
-/// `reserve_colors`: slots filled with *exact source colors* that are distinct
-///   from the base palette AND important — a hard guarantee that perceptually
-///   important rare colors (lips, eyes, highlights) survive.
+/// - `weights[i]` = per-pixel saliency in `[0, 1]` (`None` = area-only).
+/// - `rarity` ∈ `[0, 1]`: `0` = pure area weighting, `1` = strong rare-color
+///   preservation (`count^0.5`).
+/// - `detail_boost` ≥ `0`: extra weight for colors in salient regions.
+/// - `reserve_colors`: slots filled with *exact source colors* (rare-color guarantee).
+/// - `chroma_recovery` ≥ `0`: restore chroma lost to averaging. Each palette color
+///   is pushed back toward the (count-weighted) mean chroma of the source colors it
+///   represents, at constant hue/lightness, gamut-clamped. `0` = off.
+/// - `skin_protection` ∈ `[0, 1]`: when `> 0`, skin and non-skin colors are extracted
+///   in **separate domains** (a bucket never mixes the two), with palette slots split
+///   by population. Also used as the skin-mismatch penalty in quantization.
 ///
-/// With `(None, 0.0, 0.0, 0)` this is byte-for-byte equivalent to
-/// [`extract_palette_with_strategy`].
+/// With `(None, 0, 0, 0, 0, 0)` this is equivalent to the plain median-cut + k-means
+/// path (modulo the new `Palette::skin_flags` field).
+#[allow(clippy::too_many_arguments)]
 pub fn extract_palette_weighted(
     pixels: &[Rgb],
     weights: Option<&[f32]>,
@@ -174,6 +228,8 @@ pub fn extract_palette_weighted(
     rarity: f32,
     detail_boost: f32,
     reserve_colors: usize,
+    chroma_recovery: f32,
+    skin_protection: f32,
 ) -> Palette {
     if pixels.is_empty() || target_colors == 0 {
         return Palette::new(Vec::new());
@@ -192,77 +248,176 @@ pub fn extract_palette_weighted(
     let beta = detail_boost.max(0.0);
     const WSCALE: f32 = 64.0; // sub-integer resolution for damped weights
 
-    // (rgb, oklab, effective_weight, weight_int)
-    let mut adjusted: Vec<(Rgb, Oklab, f32, u32)> = Vec::with_capacity(counts.len());
+    let mut stats: Vec<ColorStat> = Vec::with_capacity(counts.len());
     for (&rgb, &(count, sal_sum)) in counts.iter() {
         let mean_sal = sal_sum / count as f32;
         let damp = (count as f32).powf(p_exp);
         let w = damp * (1.0 + beta * mean_sal);
         let wint = ((w * WSCALE).round() as u32).max(1);
-        adjusted.push((rgb, rgb.to_oklab(), w, wint));
+        stats.push(ColorStat { rgb, oklab: rgb.to_oklab(), count, weight: w, weight_int: wint, skin: rgb.is_skin() });
     }
 
     let reserve = reserve_colors.min(target_colors.saturating_sub(1));
     let base_target = target_colors - reserve;
 
-    let weighted_colors: Vec<WeightedColor> = adjusted.iter()
-        .map(|&(rgb, _ok, _w, wint)| WeightedColor::new(rgb, wint as usize))
-        .collect();
+    // --- Base palette: skin-separated or single-domain ---
+    let mut centroids: Vec<Rgb> = if skin_protection > 0.0 && base_target >= 2 {
+        let (skin_stats, nonskin_stats): (Vec<ColorStat>, Vec<ColorStat>) =
+            stats.iter().partition(|s| s.skin);
 
-    let initial_centroids = match strategy {
-        PaletteStrategy::OklabMedianCut => median_cut_oklab(&weighted_colors, base_target, false),
-        PaletteStrategy::SaturationWeighted => median_cut_oklab(&weighted_colors, base_target, true),
-        PaletteStrategy::Medoid => median_cut_medoid(&weighted_colors, base_target),
-        PaletteStrategy::KMeansPlusPlus => {
-            let oklab: Vec<Oklab> = pixels.iter().map(|p| p.to_oklab()).collect();
-            kmeans_plus_plus_init(&oklab, base_target).into_iter().map(|ok| ok.to_rgb()).collect()
+        if skin_stats.is_empty() || nonskin_stats.is_empty() {
+            // Only one class present — no separation needed.
+            extract_and_refine(&stats, pixels, base_target, kmeans_iterations, strategy)
+        } else {
+            // Split slots by effective weight (so neither class is starved).
+            let skin_w: f32 = skin_stats.iter().map(|s| s.weight).sum();
+            let total_w: f32 = skin_w + nonskin_stats.iter().map(|s| s.weight).sum::<f32>();
+            let skin_slots = ((base_target as f32 * (skin_w / total_w)).round() as usize)
+                .clamp(1, base_target - 1);
+            let nonskin_slots = base_target - skin_slots;
+
+            let mut skin_cent = extract_and_refine(&skin_stats, pixels, skin_slots, kmeans_iterations, strategy);
+            let mut nonskin_cent = extract_and_refine(&nonskin_stats, pixels, nonskin_slots, kmeans_iterations, strategy);
+
+            // Chroma recovery within each domain (members must match domain).
+            if chroma_recovery > 0.0 {
+                recover_chroma(&mut skin_cent, &skin_stats, chroma_recovery);
+                recover_chroma(&mut nonskin_cent, &nonskin_stats, chroma_recovery);
+            }
+
+            skin_cent.extend(nonskin_cent);
+            skin_cent
         }
-        PaletteStrategy::LegacyRgb => median_cut_legacy(&weighted_colors, base_target),
-        PaletteStrategy::RgbBitmask => median_cut_rgb_bitmask(&weighted_colors, base_target),
+    } else {
+        let mut c = extract_and_refine(&stats, pixels, base_target, kmeans_iterations, strategy);
+        if chroma_recovery > 0.0 {
+            recover_chroma(&mut c, &stats, chroma_recovery);
+        }
+        c
     };
 
-    let weighted_fixed: Vec<WeightedColorFixed> = adjusted.iter()
-        .map(|&(rgb, _ok, _w, wint)| WeightedColorFixed::new(rgb, wint))
-        .collect();
-
-    let mut centroids = kmeans_refine_weighted(&weighted_fixed, initial_centroids, kmeans_iterations);
-
+    // --- Reserve exact source colors (rare-color guarantee) ---
     if reserve > 0 {
-        reserve_distinct_colors(&adjusted, &mut centroids, reserve);
+        reserve_distinct_colors(&stats, &mut centroids, reserve);
     }
 
     Palette::new(centroids)
+}
+
+/// Restore chroma lost to averaging. For each centroid, the target is the
+/// count-weighted mean chroma of the source colors nearest to it; the centroid's
+/// chroma is scaled toward that target at constant hue/lightness (gamut-clamped).
+/// Recovery only ever *increases* chroma — it never desaturates.
+fn recover_chroma(centroids: &mut [Rgb], members: &[ColorStat], strength: f32) {
+    if strength <= 0.0 || centroids.is_empty() || members.is_empty() {
+        return;
+    }
+    let cen_ok: Vec<Oklab> = centroids.iter().map(|c| c.to_oklab()).collect();
+    let mut chroma_sum = vec![0f64; centroids.len()];
+    let mut wsum = vec![0f64; centroids.len()];
+
+    for m in members {
+        let mut bi = 0usize;
+        let mut bd = f32::MAX;
+        for (i, c) in cen_ok.iter().enumerate() {
+            let d = m.oklab.distance_squared(*c);
+            if d < bd { bd = d; bi = i; }
+        }
+        let w = m.count as f64;
+        chroma_sum[bi] += m.oklab.chroma() as f64 * w;
+        wsum[bi] += w;
+    }
+
+    for i in 0..centroids.len() {
+        if wsum[i] <= 0.0 { continue; }
+        let target = (chroma_sum[i] / wsum[i]) as f32;
+        let boosted = boost_chroma_in_gamut(cen_ok[i], target, strength);
+        centroids[i] = boosted.to_rgb();
+    }
+}
+
+#[inline]
+fn scale_chroma(ok: Oklab, factor: f32) -> Oklab {
+    Oklab { l: ok.l, a: ok.a * factor, b: ok.b * factor }
+}
+
+/// Unclamped Oklab→linear-sRGB (for gamut testing; `Oklab::to_linear_rgb` clamps).
+#[inline]
+fn oklab_linear_unclamped(ok: Oklab) -> (f32, f32, f32) {
+    let l_ = ok.l + 0.3963377774 * ok.a + 0.2158037573 * ok.b;
+    let m_ = ok.l - 0.1055613458 * ok.a - 0.0638541728 * ok.b;
+    let s_ = ok.l - 0.0894841775 * ok.a - 1.2914855480 * ok.b;
+    let l = l_ * l_ * l_;
+    let m = m_ * m_ * m_;
+    let s = s_ * s_ * s_;
+    (
+        4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+        -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+        -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,
+    )
+}
+
+#[inline]
+fn oklab_scaled_in_gamut(ok: Oklab, factor: f32) -> bool {
+    let (r, g, b) = oklab_linear_unclamped(scale_chroma(ok, factor));
+    const EPS: f32 = 1e-3;
+    (-EPS..=1.0 + EPS).contains(&r)
+        && (-EPS..=1.0 + EPS).contains(&g)
+        && (-EPS..=1.0 + EPS).contains(&b)
+}
+
+/// Scale chroma toward `target` by `strength`, but never past the sRGB gamut
+/// boundary (binary-searched) and never below the current chroma.
+fn boost_chroma_in_gamut(ok: Oklab, target_chroma: f32, strength: f32) -> Oklab {
+    let cur = ok.chroma();
+    if cur < 1e-4 {
+        return ok; // achromatic — nothing to boost in a stable direction
+    }
+    let desired = cur + strength * (target_chroma - cur);
+    if desired <= cur {
+        return ok; // recovery only increases saturation
+    }
+    let max_factor = desired / cur;
+    if oklab_scaled_in_gamut(ok, max_factor) {
+        return scale_chroma(ok, max_factor);
+    }
+    // Largest in-gamut factor in [1, max_factor].
+    let mut lo = 1.0f32;
+    let mut hi = max_factor;
+    for _ in 0..12 {
+        let mid = 0.5 * (lo + hi);
+        if oklab_scaled_in_gamut(ok, mid) { lo = mid; } else { hi = mid; }
+    }
+    scale_chroma(ok, lo)
 }
 
 /// Append up to `count` exact source colors that are both far from the current
 /// palette (distinct) and high-weight (important + not vanishingly rare).
 /// Importance-weighted farthest-point sampling on the quantization residual.
 fn reserve_distinct_colors(
-    adjusted: &[(Rgb, Oklab, f32, u32)],
+    stats: &[ColorStat],
     palette: &mut Vec<Rgb>,
     count: usize,
 ) {
-    if adjusted.is_empty() {
+    if stats.is_empty() {
         return;
     }
     const MIN_DIST_SQ: f32 = 0.0009; // ~0.03 in Oklab: skip near-duplicates
 
     let mut pal_oklab: Vec<Oklab> = palette.iter().map(|c| c.to_oklab()).collect();
-    let mut nearest: Vec<f32> = adjusted.iter()
-        .map(|&(_r, ok, _w, _wi)| pal_oklab.iter()
-            .map(|p| ok.distance_squared(*p))
-            .fold(f32::MAX, f32::min))
+    let mut nearest: Vec<f32> = stats.iter()
+        .map(|s| pal_oklab.iter().map(|p| s.oklab.distance_squared(*p)).fold(f32::MAX, f32::min))
         .collect();
 
     for _ in 0..count {
         let mut best: Option<usize> = None;
         let mut best_score = 0.0f32;
-        for (i, &(_r, _ok, w, _wi)) in adjusted.iter().enumerate() {
+        for (i, s) in stats.iter().enumerate() {
             let d = nearest[i];
             if d < MIN_DIST_SQ {
                 continue;
             }
-            let score = d * w; // distinct (residual²) × important (weight)
+            let score = d * s.weight; // distinct (residual²) × important (weight)
             if score > best_score {
                 best_score = score;
                 best = Some(i);
@@ -272,11 +427,11 @@ fn reserve_distinct_colors(
             Some(b) => b,
             None => break,
         };
-        let (rgb, ok, _w, _wi) = adjusted[bi];
-        palette.push(rgb);
-        pal_oklab.push(ok);
-        for (i, &(_r, oki, _w, _wi)) in adjusted.iter().enumerate() {
-            let dd = oki.distance_squared(ok);
+        let s = stats[bi];
+        palette.push(s.rgb);
+        pal_oklab.push(s.oklab);
+        for (i, st) in stats.iter().enumerate() {
+            let dd = st.oklab.distance_squared(s.oklab);
             if dd < nearest[i] {
                 nearest[i] = dd;
             }
@@ -621,11 +776,68 @@ mod tests {
     }
 
     #[test]
-    fn test_oklab_fixed_palette_matching() {
-        let palette = Palette::new(vec![Rgb::new(255,0,0), Rgb::new(0,255,0), Rgb::new(0,0,255)]);
-        let red_fixed = Rgb::new(200, 50, 50).to_oklab_fixed();
-        let nearest = palette.find_nearest_oklab_fixed(&red_fixed);
-        assert_eq!(nearest, 0);
+    fn test_chroma_recovery_increases_saturation() {
+        // Two saturated colors that median-cut will average into a duller centroid.
+        // 50% vivid red-orange, 50% vivid magenta-ish: their Oklab mean has lower
+        // chroma than the members. Recovery should push the palette chroma back up.
+        let mut pixels = Vec::new();
+        for _ in 0..500 { pixels.push(Rgb::new(230, 60, 40)); }
+        for _ in 0..500 { pixels.push(Rgb::new(220, 40, 160)); }
+
+        // One color forces one cluster -> guaranteed averaging.
+        let plain = extract_palette_weighted(
+            &pixels, None, 1, 4, PaletteStrategy::OklabMedianCut, 0.0, 0.0, 0, 0.0, 0.0,
+        );
+        let recovered = extract_palette_weighted(
+            &pixels, None, 1, 4, PaletteStrategy::OklabMedianCut, 0.0, 0.0, 0, 1.0, 0.0,
+        );
+
+        let c_plain = plain.colors[0].to_oklab().chroma();
+        let c_rec = recovered.colors[0].to_oklab().chroma();
+        assert!(
+            c_rec > c_plain,
+            "chroma recovery should raise saturation: plain={c_plain:.4} recovered={c_rec:.4}"
+        );
+    }
+
+    #[test]
+    fn test_skin_protection_keeps_both_domains() {
+        // ~70% skin tones (varied) + ~30% vivid blue (non-skin). With skin
+        // protection on, the palette must contain BOTH a skin color and a
+        // non-skin color (domains are extracted separately).
+        let mut pixels = Vec::new();
+        for i in 0..700 {
+            let v = (i % 30) as u8;
+            pixels.push(Rgb::new(235 - v, 188 - v / 2, 166 - v / 2)); // skin-ish
+        }
+        for _ in 0..300 {
+            pixels.push(Rgb::new(20, 40, 200)); // clearly non-skin blue
+        }
+
+        let pal = extract_palette_weighted(
+            &pixels, None, 8, 4, PaletteStrategy::OklabMedianCut, 0.0, 0.0, 0, 0.0, 0.5,
+        );
+
+        let has_skin = pal.colors.iter().any(|c| c.is_skin());
+        let has_nonskin = pal.colors.iter().any(|c| !c.is_skin());
+        assert!(has_skin, "palette should retain a skin color");
+        assert!(has_nonskin, "palette should retain a non-skin color");
+
+        // Every palette entry is cleanly one class (no muddy skin/non-skin blend
+        // is *required*, but at least the two source clusters are represented).
+        let blue_ok = Rgb::new(20, 40, 200).to_oklab();
+        let nearest_blue = pal.colors.iter()
+            .map(|c| c.to_oklab().distance_squared(blue_ok)).fold(f32::MAX, f32::min).sqrt();
+        assert!(nearest_blue < 0.1, "non-skin blue should be well represented (ΔE={nearest_blue:.4})");
+    }
+
+    #[test]
+    fn test_skin_classification() {
+        assert!(Rgb::new(235, 190, 165).is_skin(), "typical light skin should classify as skin");
+        assert!(Rgb::new(198, 134, 110).is_skin(), "mid skin tone should classify as skin");
+        assert!(!Rgb::new(20, 40, 200).is_skin(), "blue is not skin");
+        assert!(!Rgb::new(30, 200, 60).is_skin(), "green is not skin");
+        assert!(!Rgb::new(128, 128, 128).is_skin(), "gray is not skin");
     }
 
     #[test]
@@ -646,11 +858,11 @@ mod tests {
 
         // Without reservation the rare lip color is typically merged away.
         let plain = extract_palette_weighted(
-            &pixels, None, target, 4, PaletteStrategy::OklabMedianCut, 0.0, 0.0, 0,
+            &pixels, None, target, 4, PaletteStrategy::OklabMedianCut, 0.0, 0.0, 0, 0.0, 0.0,
         );
         // With 1 reserved slot it must appear (near-exactly) in the palette.
         let reserved = extract_palette_weighted(
-            &pixels, None, target, 4, PaletteStrategy::OklabMedianCut, 0.3, 0.0, 1,
+            &pixels, None, target, 4, PaletteStrategy::OklabMedianCut, 0.3, 0.0, 1, 0.0, 0.0,
         );
 
         assert!(reserved.len() <= target);

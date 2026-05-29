@@ -9,10 +9,9 @@
 //! - Integrated with Cow-based PreprocessResult
 
 use crate::color::{Oklab, OklabAccumulator, Rgb};
-use crate::edge::{compute_combined_edges, EdgeMap};
 use crate::hierarchy::{hierarchical_cluster, hierarchical_cluster_fast, HierarchyConfig};
 use crate::palette::{extract_palette_weighted, Palette, PaletteStrategy};
-use crate::preprocess::{preprocess_image, PreprocessConfig, fast_edge_detect};
+use crate::preprocess::{preprocess_image, PreprocessConfig};
 use crate::slic::{slic_segment, Segmentation, SlicConfig};
 
 use std::collections::HashMap;
@@ -47,6 +46,12 @@ pub struct DownscaleConfig {
     /// Reserve N palette slots for distinct, important, under-represented source colors.
     /// 0 = off. ~palette_size/8 recommended for faces/portraits. Default 0.
     pub reserve_colors: usize,
+    /// Restore chroma lost to color merging/averaging (constant hue, gamut-clamped).
+    /// 0.0 = off, ~0.6 = natural, 1.0 = full restoration to source mean chroma. Default 0.0.
+    pub chroma_recovery: f32,
+    /// Isolate skin tones from non-skin during palette extraction and quantization
+    /// (separate domains + mismatch penalty). 0.0 = off, ~0.5 typical. Default 0.0.
+    pub skin_protection: f32,
 }
 
 impl Default for DownscaleConfig {
@@ -68,6 +73,8 @@ impl Default for DownscaleConfig {
             color_rarity: 0.0,
             detail_boost: 0.0,
             reserve_colors: 0,
+            chroma_recovery: 0.0,
+            skin_protection: 0.0,
         }
     }
 }
@@ -111,7 +118,108 @@ impl DownscaleResult {
     }
 }
 
-/// Main downscaling function
+/// Target-independent preparation: resolution capping, color pre-quantization,
+/// and region segmentation. **Reuse this across many target sizes / palette sizes**
+/// (e.g. generating multiple preview resolutions) to avoid repeating the most
+/// expensive, size-independent work.
+///
+/// The segmentation is computed from `config.segmentation`. If you later change
+/// resolution, color-preprocess, or segmentation settings, call [`prepare_image`]
+/// again; palette size, target dimensions, and all per-target knobs may vary freely
+/// between [`smart_downscale_prepared`] calls.
+#[derive(Clone, Debug)]
+pub struct PreparedImage {
+    pub pixels: Vec<Rgb>,
+    pub width: usize,
+    pub height: usize,
+    pub resolution_capped: bool,
+    pub colors_reduced: bool,
+    pub segmentation: Option<Segmentation>,
+}
+
+fn preprocess_config_from(config: &DownscaleConfig) -> PreprocessConfig {
+    PreprocessConfig {
+        max_resolution_mp: config.max_resolution_mp,
+        max_color_preprocess: config.max_color_preprocess,
+        enabled: config.max_resolution_mp > 0.0 || config.max_color_preprocess > 0,
+    }
+}
+
+/// Run all target-independent work once. See [`PreparedImage`].
+pub fn prepare_image(
+    source_pixels: &[Rgb],
+    source_width: usize,
+    source_height: usize,
+    config: &DownscaleConfig,
+) -> PreparedImage {
+    let pc = preprocess_config_from(config);
+    let pre = preprocess_image(source_pixels, source_width, source_height, &pc);
+
+    let resolution_capped = pre.resolution_capped;
+    let colors_reduced = pre.colors_reduced;
+    let pixels = pre.pixels.into_owned();
+    let width = pre.width;
+    let height = pre.height;
+
+    let segmentation = perform_segmentation(&pixels, width, height, &config.segmentation);
+
+    PreparedImage { pixels, width, height, resolution_capped, colors_reduced, segmentation }
+}
+
+/// Downscale from an already-prepared image (palette extraction + assignment).
+/// Cheap to call repeatedly with different `palette_size` / target sizes.
+pub fn smart_downscale_prepared(
+    prepared: &PreparedImage,
+    target_width: u32,
+    target_height: u32,
+    config: &DownscaleConfig,
+) -> DownscaleResult {
+    let palette = extract_palette_for(prepared, target_width, target_height, config);
+    finalize_downscale(prepared, target_width, target_height, palette, config)
+}
+
+/// Same as [`smart_downscale_prepared`] but with a caller-supplied palette.
+pub fn smart_downscale_prepared_with_palette(
+    prepared: &PreparedImage,
+    target_width: u32,
+    target_height: u32,
+    palette: Palette,
+    config: &DownscaleConfig,
+) -> DownscaleResult {
+    finalize_downscale(prepared, target_width, target_height, palette, config)
+}
+
+/// Extract a palette from prepared pixels (saliency + weighting + recovery + skin).
+fn extract_palette_for(
+    prepared: &PreparedImage,
+    target_width: u32,
+    target_height: u32,
+    config: &DownscaleConfig,
+) -> Palette {
+    let saliency: Option<Vec<f32>> = if config.detail_boost > 0.0 {
+        let sx = (prepared.width as f32 / target_width as f32).max(1.0);
+        let sy = (prepared.height as f32 / target_height as f32).max(1.0);
+        let radius = (sx.max(sy).round() as usize).clamp(1, 8);
+        Some(compute_saliency_map(&prepared.pixels, prepared.width, prepared.height, radius))
+    } else {
+        None
+    };
+
+    extract_palette_weighted(
+        &prepared.pixels,
+        saliency.as_deref(),
+        config.palette_size,
+        config.kmeans_iterations,
+        config.palette_strategy,
+        config.color_rarity,
+        config.detail_boost,
+        config.reserve_colors,
+        config.chroma_recovery,
+        config.skin_protection,
+    )
+}
+
+/// Main downscaling function (prepares + downscales in one call).
 pub fn smart_downscale(
     source_pixels: &[Rgb],
     source_width: usize,
@@ -120,49 +228,11 @@ pub fn smart_downscale(
     target_height: u32,
     config: &DownscaleConfig,
 ) -> DownscaleResult {
-    let preprocess_config = PreprocessConfig {
-        max_resolution_mp: config.max_resolution_mp,
-        max_color_preprocess: config.max_color_preprocess,
-        enabled: config.max_resolution_mp > 0.0 || config.max_color_preprocess > 0,
-    };
-
-    let preprocessed = preprocess_image(source_pixels, source_width, source_height, &preprocess_config);
-
-    let working_pixels = &preprocessed.pixels;
-    let working_width = preprocessed.width;
-    let working_height = preprocessed.height;
-
-    // Saliency map (local Oklab contrast at the downscale radius) — boosts
-    // perceptually important, detail-rich colors (lips, eyes) during palette
-    // extraction. Only computed when detail_boost is enabled.
-    let saliency: Option<Vec<f32>> = if config.detail_boost > 0.0 {
-        let sx = (working_width as f32 / target_width as f32).max(1.0);
-        let sy = (working_height as f32 / target_height as f32).max(1.0);
-        let radius = (sx.max(sy).round() as usize).clamp(1, 8);
-        Some(compute_saliency_map(working_pixels, working_width, working_height, radius))
-    } else {
-        None
-    };
-
-    let palette = extract_palette_weighted(
-        working_pixels,
-        saliency.as_deref(),
-        config.palette_size,
-        config.kmeans_iterations,
-        config.palette_strategy,
-        config.color_rarity,
-        config.detail_boost,
-        config.reserve_colors,
-    );
-
-    smart_downscale_internal(
-        working_pixels, working_width, working_height,
-        target_width, target_height, palette, config,
-        preprocessed.resolution_capped || preprocessed.colors_reduced,
-    )
+    let prepared = prepare_image(source_pixels, source_width, source_height, config);
+    smart_downscale_prepared(&prepared, target_width, target_height, config)
 }
 
-/// Downscale using a pre-existing palette
+/// Downscale using a pre-existing palette.
 pub fn smart_downscale_with_palette(
     source_pixels: &[Rgb],
     source_width: usize,
@@ -172,73 +242,51 @@ pub fn smart_downscale_with_palette(
     palette: Palette,
     config: &DownscaleConfig,
 ) -> DownscaleResult {
-    let preprocess_config = PreprocessConfig {
-        max_resolution_mp: config.max_resolution_mp,
-        max_color_preprocess: config.max_color_preprocess,
-        enabled: config.max_resolution_mp > 0.0 || config.max_color_preprocess > 0,
-    };
-
-    let preprocessed = preprocess_image(source_pixels, source_width, source_height, &preprocess_config);
-
-    smart_downscale_internal(
-        &preprocessed.pixels, preprocessed.width, preprocessed.height,
-        target_width, target_height, palette, config,
-        preprocessed.resolution_capped || preprocessed.colors_reduced,
-    )
+    let prepared = prepare_image(source_pixels, source_width, source_height, config);
+    finalize_downscale(&prepared, target_width, target_height, palette, config)
 }
 
-fn smart_downscale_internal(
-    working_pixels: &[Rgb],
-    working_width: usize,
-    working_height: usize,
+/// Tile assignment + refinement (shared by all entry points).
+fn finalize_downscale(
+    prepared: &PreparedImage,
     target_width: u32,
     target_height: u32,
     palette: Palette,
     config: &DownscaleConfig,
-    is_preprocessed: bool,
 ) -> DownscaleResult {
-    // Edge map
-    let edge_map = if is_preprocessed {
-        let fast_edges = fast_edge_detect(working_pixels, working_width, working_height);
-        EdgeMap {
-            width: working_width,
-            height: working_height,
-            data: fast_edges.iter().map(|&e| e as f32 / 65535.0).collect(),
-            max_value: 1.0,
-        }
-    } else {
-        compute_combined_edges(working_pixels, working_width, working_height, 1.0, config.edge_weight)
-    };
+    let working_pixels = &prepared.pixels;
+    let working_width = prepared.width;
+    let working_height = prepared.height;
+    let segmentation = &prepared.segmentation;
 
-    // Segmentation
-    let segmentation = perform_segmentation(
-        working_pixels, working_width, working_height, &config.segmentation,
-    );
-
-    // Initial assignment
     let scale_x = working_width as f32 / target_width as f32;
     let scale_y = working_height as f32 / target_height as f32;
 
-    let (mut assignments, tile_oklabs) = initial_assignment(
+    let (mut assignments, tile_oklabs, tile_skin) = initial_assignment(
         working_pixels, working_width, working_height,
-        target_width, target_height, &palette, &edge_map,
+        target_width, target_height, &palette,
         segmentation.as_ref(), config, scale_x, scale_y,
     );
 
-    // Refinement
     if config.two_pass_refinement {
         refinement_pass_oklab(
-            &mut assignments, &tile_oklabs,
+            &mut assignments, &tile_oklabs, &tile_skin,
             target_width as usize, target_height as usize,
             &palette, config.neighbor_weight, config.refinement_iterations,
+            config.skin_protection,
         );
     }
 
     let pixels: Vec<Rgb> = assignments.iter().map(|&idx| palette.colors[idx as usize]).collect();
 
     DownscaleResult {
-        width: target_width, height: target_height,
-        pixels, palette, palette_indices: assignments, segmentation,
+        width: target_width,
+        height: target_height,
+        pixels,
+        palette,
+        palette_indices: assignments,
+        // Clone segmentation into the result (kept for API compatibility).
+        segmentation: segmentation.clone(),
     }
 }
 
@@ -398,12 +446,11 @@ fn initial_assignment(
     target_width: u32,
     target_height: u32,
     palette: &Palette,
-    _edge_map: &EdgeMap,
     segmentation: Option<&Segmentation>,
     config: &DownscaleConfig,
     scale_x: f32,
     scale_y: f32,
-) -> (Vec<u8>, Vec<Oklab>) {
+) -> (Vec<u8>, Vec<Oklab>, Vec<i8>) {
     // Cache Oklab conversions — Rgb is a u32 key, so hashing is fast
     let source_oklabs: Vec<Oklab> = if config.max_color_preprocess > 0 {
         let mut cache: HashMap<Rgb, Oklab> = HashMap::with_capacity(
@@ -421,6 +468,9 @@ fn initial_assignment(
 
     let mut assignments = vec![0u8; tw * th];
     let mut tile_oklabs = vec![Oklab::default(); tw * th];
+    let skin_penalty = config.skin_protection;
+    let skin_on = skin_penalty > 0.0;
+    let mut tile_skin = if skin_on { vec![-1i8; tw * th] } else { Vec::new() };
 
     let max_segments = segmentation.map(|s| s.num_segments).unwrap_or(0);
     let mut segment_counts = vec![0usize; max_segments.max(1)];
@@ -475,6 +525,14 @@ fn initial_assignment(
             );
             tile_oklabs[tidx] = avg_oklab;
 
+            let query_skin: i8 = if skin_on {
+                let s = if avg_oklab.to_rgb().is_skin() { 1 } else { 0 };
+                tile_skin[tidx] = s;
+                s
+            } else {
+                -1
+            };
+
             // Collect neighbor palette indices
             neighbor_indices.clear();
             if tx > 0 { neighbor_indices.push(assignments[ty * tw + (tx - 1)] as usize); }
@@ -509,16 +567,18 @@ fn initial_assignment(
             let best_idx = find_best_palette_match_oklab_fast(
                 &avg_oklab, palette, &neighbor_indices,
                 same_region_count, config.neighbor_weight, config.region_weight,
+                query_skin, skin_penalty,
             );
 
             assignments[tidx] = best_idx as u8;
         }
     }
 
-    (assignments, tile_oklabs)
+    (assignments, tile_oklabs, tile_skin)
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn find_best_palette_match_oklab_fast(
     target: &Oklab,
     palette: &Palette,
@@ -526,9 +586,18 @@ fn find_best_palette_match_oklab_fast(
     same_region_count: usize,
     neighbor_weight: f32,
     region_weight: f32,
+    query_skin: i8,
+    skin_penalty: f32,
 ) -> usize {
+    let skin_active = skin_penalty > 0.0 && query_skin >= 0 && !palette.skin_flags.is_empty();
+    let want_skin = query_skin == 1;
+    // Per-candidate skin multiplier (1.0 when inactive or class matches).
+    let skin_mult = |i: usize| -> f32 {
+        if skin_active && palette.skin_flags[i] != want_skin { 1.0 + skin_penalty } else { 1.0 }
+    };
+
     if neighbor_indices.is_empty() {
-        return palette.find_nearest_oklab(target);
+        return palette.find_nearest_oklab_skin(target, query_skin, skin_penalty);
     }
 
     let palette_len = palette.colors.len();
@@ -546,7 +615,7 @@ fn find_best_palette_match_oklab_fast(
         let mut best_score = f32::MAX;
 
         for (i, oklab) in palette.oklab_colors.iter().enumerate() {
-            let dist = target.distance_squared(*oklab);
+            let dist = target.distance_squared(*oklab) * skin_mult(i);
             let neighbor_bias = (neighbor_counts[i] as f32 / max_neighbor) * neighbor_weight;
             let total_bias = (neighbor_bias + region_bonus).min(0.9);
             let score = dist * (1.0 - total_bias);
@@ -566,8 +635,8 @@ fn find_best_palette_match_oklab_fast(
 
     palette.oklab_colors.iter().enumerate()
         .min_by(|(i, a), (j, b)| {
-            let dist_a = target.distance_squared(**a);
-            let dist_b = target.distance_squared(**b);
+            let dist_a = target.distance_squared(**a) * skin_mult(*i);
+            let dist_b = target.distance_squared(**b) * skin_mult(*j);
             let nb_a = (neighbor_counts[*i] as f32 / max_neighbor) * neighbor_weight;
             let nb_b = (neighbor_counts[*j] as f32 / max_neighbor) * neighbor_weight;
             let s_a = dist_a * (1.0 - (nb_a + region_bonus).min(0.9));
@@ -581,14 +650,17 @@ fn find_best_palette_match_oklab_fast(
 // Refinement — FIX: hoisted neighbor_indices allocation
 // =============================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn refinement_pass_oklab(
     assignments: &mut [u8],
     tile_oklabs: &[Oklab],
+    tile_skin: &[i8],
     width: usize,
     height: usize,
     palette: &Palette,
     neighbor_weight: f32,
     max_iterations: usize,
+    skin_penalty: f32,
 ) {
     // FIX: Allocate once, reuse across all iterations and pixels
     let mut neighbor_indices = Vec::with_capacity(8);
@@ -602,6 +674,7 @@ fn refinement_pass_oklab(
             for x in 0..width {
                 let idx = y * width + x;
                 let tile_oklab = tile_oklabs[idx];
+                let query_skin = tile_skin.get(idx).copied().unwrap_or(-1);
 
                 neighbor_indices.clear();
                 for dy in -1i32..=1 {
@@ -618,6 +691,7 @@ fn refinement_pass_oklab(
 
                 let new_idx = find_best_palette_match_oklab_fast(
                     &tile_oklab, palette, &neighbor_indices, 0, neighbor_weight, 0.0,
+                    query_skin, skin_penalty,
                 ) as u8;
 
                 if new_idx != assignments[idx] {

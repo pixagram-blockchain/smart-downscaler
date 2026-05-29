@@ -84,6 +84,27 @@ impl Rgb {
         let oklab = self.to_oklab();
         (oklab.a * oklab.a + oklab.b * oklab.b).sqrt()
     }
+
+    /// Convert to YCbCr (BT.601, full-range, center 128).
+    #[inline]
+    pub fn to_ycbcr(self) -> (u8, u8, u8) {
+        let r = self.r() as f32;
+        let g = self.g() as f32;
+        let b = self.b() as f32;
+        let y = 0.299 * r + 0.587 * g + 0.114 * b;
+        let cb = 128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+        let cr = 128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+        (clamp_u8_f32(y), clamp_u8_f32(cb), clamp_u8_f32(cr))
+    }
+
+    /// Heuristic skin-tone test in YCbCr chroma plane.
+    /// Skin clusters tightly in Cb/Cr regardless of luminance:
+    /// `80 ≤ Cb ≤ 120` and `133 ≤ Cr ≤ 173`.
+    #[inline]
+    pub fn is_skin(self) -> bool {
+        let (_y, cb, cr) = self.to_ycbcr();
+        (80..=120).contains(&cb) && (133..=173).contains(&cr)
+    }
 }
 
 #[cfg(feature = "native")]

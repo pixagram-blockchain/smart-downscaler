@@ -4,7 +4,7 @@ A high-performance Rust library for intelligent image downscaling with pixel art
 
 **Available as a native Rust library and WebAssembly module for browser/Node.js.**
 
-[![Version](https://img.shields.io/badge/version-0.5.0-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-0.6.0-blue.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-green.svg)]()
 
 ---
@@ -35,6 +35,10 @@ A high-performance Rust library for intelligent image downscaling with pixel art
 | **Edge-Aware Processing** | Sobel/Scharr detection preserves boundaries |
 | **Spatial Coherence** | Neighbor and region voting for smooth results |
 | **K-Centroid Tile Logic** | Advanced dominant color extraction per tile |
+| **Rare-Color Preservation** | Saliency weighting + slot reservation keeps small important colors (lips, eyes) |
+| **Chroma Recovery** | Restores saturation lost to color merging, by perceptual difference |
+| **Skin-Tone Isolation** | Keeps skin and non-skin colors in separate palette domains |
+| **Reusable Preprocessing** | Prepare an image once, downscale to many sizes cheaply |
 | **Performance Preprocessing** | Resolution capping and color pre-quantization |
 | **WebAssembly Support** | Full browser compatibility with near-native speed |
 
@@ -46,7 +50,7 @@ A high-performance Rust library for intelligent image downscaling with pixel art
 
 ```toml
 [dependencies]
-smart-downscaler = "0.5.0"
+smart-downscaler = "0.6.0"
 ```
 
 ### WebAssembly (npm)
@@ -59,7 +63,7 @@ npm install smart-downscaler
 
 ```html
 <script type="module">
-  import init, { downscale_rgba, WasmDownscaleConfig } from 'https://unpkg.com/smart-downscaler@0.5.0/smart_downscaler.js';
+  import init, { downscale_rgba, WasmDownscaleConfig } from 'https://unpkg.com/smart-downscaler@0.6.0/smart_downscaler.js';
 </script>
 ```
 
@@ -168,8 +172,14 @@ println!("Palette: {} colors", result.palette.len());
 | `max_resolution_mp` | `f32` | `1.6` | `0.0-10.0` | Resolution cap in megapixels (0 = disabled) |
 | `max_color_preprocess` | `usize` | `16384` | `0-65536` | Pre-quantization limit (0 = disabled) |
 | **Tile Processing** |||||
-| `k_centroid` | `usize` | `1` | `1`, `2`, `3` | Tile color extraction mode |
+| `k_centroid` | `usize` | `1` | `1`, `2`, `3`, `4` | Tile color extraction mode |
 | `k_centroid_iterations` | `usize` | `0` | `0-10` | K-Means iterations for tile color |
+| **Rare-Color & Saturation** |||||
+| `color_rarity` | `f32` | `0.0` | `0.0-1.0` | Damps frequency vote so flat areas stop dominating (`0`=area, `1`=`count^0.5`) |
+| `detail_boost` | `f32` | `0.0` | `0.0-2.0` | Boosts colors in detail-rich regions via local-contrast saliency (`0`=off) |
+| `reserve_colors` | `usize` | `0` | `0 - palette_size` | Reserve N slots for distinct, important, under-represented source colors (`0`=off) |
+| `chroma_recovery` | `f32` | `0.0` | `0.0-1.0+` | Restore chroma lost to merging toward source mean chroma, constant hue, gamut-clamped (`0`=off) |
+| `skin_protection` | `f32` | `0.0` | `0.0-1.0` | Isolate skin vs non-skin into separate palette domains + quantization penalty (`0`=off) |
 
 ---
 
@@ -224,6 +234,9 @@ Controls how each source tile is reduced to a single representative color:
 | **Average** | `1` | Simple weighted average of all pixels | Smooth gradients, noise reduction |
 | **Dominant** | `2` | K-Means (k=2), uses largest cluster | Sharp edges, foreground/background separation |
 | **Foremost** | `3` | K-Means (k=3), finer dominant detection | Complex textures, detailed sprites |
+| **Salient** | `4` | K-Means (k=2), keeps a distinctly-more-chromatic minority | Thin colorful features (lips, eyes, makeup) |
+
+> **Note:** Mode `2` (Dominant) snaps a mixed tile to its *larger* cluster, discarding thin minority colors — a tile that is 60% skin / 40% lip becomes pure skin. For faces and artwork with small colorful features, prefer mode `4`, which keeps the colorful minority when it is non-trivial (≥22% of the tile) and clearly more chromatic than the majority.
 
 ```javascript
 // Mode 1: Average (default) - smooth results
@@ -237,6 +250,10 @@ config.k_centroid_iterations = 2;
 // Mode 3: Foremost - detailed preservation
 config.k_centroid = 3;
 config.k_centroid_iterations = 3;
+
+// Mode 4: Salient - preserve thin colorful features (lips, eyes)
+config.k_centroid = 4;
+config.k_centroid_iterations = 2;
 ```
 
 ---
@@ -308,6 +325,36 @@ const result = downscale_with_palette(
   config
 );
 ```
+
+---
+
+### Prepare / Reuse Functions
+
+#### `prepare(data, width, height, config?)` / `prepare_rgba(data, width, height, config?)`
+
+Run target-independent work (resolution cap, color pre-quantization, segmentation)
+once and return a reusable handle. `prepare` takes `Uint8Array`; `prepare_rgba` takes
+`Uint8ClampedArray` (from canvas `getImageData`).
+
+```javascript
+const prepared = prepare_rgba(imageData.data, imageData.width, imageData.height, config);
+// prepared.width / prepared.height — dimensions after any resolution cap
+prepared.free(); // release WASM memory when finished
+```
+
+#### `downscale_prepared(prepared, targetWidth, targetHeight, config?)`
+
+Downscale a prepared image. The optional `config` overrides per-target knobs
+(`palette_size`, `k_centroid`, `chroma_recovery`, `skin_protection`, …); preprocess
+and segmentation settings always come from prepare time.
+
+```javascript
+const result = downscale_prepared(prepared, 128, 128, sizeConfig);
+```
+
+#### `downscale_prepared_with_palette(prepared, targetWidth, targetHeight, palette, config?)`
+
+As above, with a caller-supplied `Uint8Array` RGB palette.
 
 ---
 
@@ -447,7 +494,7 @@ const dist = color_distance(255, 0, 0, 0, 255, 0);  // Red vs Green
 Get library version.
 
 ```javascript
-console.log(version());  // "0.5.0"
+console.log(version());  // "0.6.0"
 ```
 
 ---
@@ -496,17 +543,140 @@ const exact = WasmDownscaleConfig.exact_colors();
 
 ### Preset Comparison
 
-| Preset | Palette | K-Means | Segmentation | K-Centroid | Speed |
-|--------|---------|---------|--------------|------------|-------|
-| `fast()` | 16 | 3 | none | 1 (avg) | ⚡⚡⚡ |
-| `default` | 16 | 5 | hierarchy_fast | 1 (avg) | ⚡⚡ |
-| `vibrant()` | 24 | 8 | hierarchy_fast | 2 (dom) | ⚡ |
-| `quality()` | 32 | 10 | hierarchy | 2 (dom) | 🐢 |
-| `exact_colors()` | 16 | 0 | hierarchy_fast | 1 (avg) | ⚡⚡ |
+| Preset | Palette | K-Means | Segmentation | K-Centroid | Rare/Sat/Skin¹ | Speed |
+|--------|---------|---------|--------------|------------|----------------|-------|
+| `fast()` | 16 | 3 | none | 1 (avg) | off | ⚡⚡⚡ |
+| `default` | 16 | 5 | hierarchy_fast | 1 (avg) | off | ⚡⚡ |
+| `vibrant()` | 24 | 8 | hierarchy_fast | 2 (dom) | reserve+rarity+chroma(0.7) | ⚡ |
+| `quality()` | 32 | 10 | hierarchy | 2 (dom) | reserve+rarity+chroma(0.6)+skin(0.5) | 🐢 |
+| `exact_colors()` | 16 | 0 | hierarchy_fast | 1 (avg) | off | ⚡⚡ |
+
+¹ For the strongest thin-feature retention on faces, additionally set `k_centroid = 4`.
 
 ---
 
 ## Advanced Usage
+
+### Reusing Preprocessing Across Sizes (Performance)
+
+Resolution capping, color pre-quantization, and region segmentation depend only on
+the **source** image, not the target size. When you downscale the same source to
+several sizes (e.g. multiple previews), repeating that work each time is wasted.
+`prepare` runs it **once**; `downscale_prepared` then only does palette extraction
+and tiling per size.
+
+```javascript
+import init, { prepare_rgba, downscale_prepared, WasmDownscaleConfig } from 'smart-downscaler';
+await init();
+
+const base = new WasmDownscaleConfig();
+base.segmentation_method = 'hierarchy_fast';
+base.max_resolution_mp = 2.048;
+base.max_color_preprocess = 4096;
+
+// Once per source image:
+const prepared = prepare_rgba(imageData.data, imageData.width, imageData.height, base);
+
+// Many times, cheaply — palette_size and target size may differ each call:
+for (const { w, h, colors } of sizes) {
+  const cfg = new WasmDownscaleConfig();
+  cfg.palette_size = colors;
+  cfg.k_centroid = 4;
+  cfg.reserve_colors = Math.round(colors / 8);
+  cfg.chroma_recovery = 0.6;
+  cfg.skin_protection = 0.5;
+  const result = downscale_prepared(prepared, w, h, cfg);
+  // ... use result ...
+}
+
+prepared.free(); // release WASM memory when done (also freed on GC)
+```
+
+**Contract:** the prepared image fixes `max_resolution_mp`, `max_color_preprocess`,
+and `segmentation_*` at prepare time. `downscale_prepared` overlays per-target knobs
+(`palette_size`, `k_centroid`, `chroma_recovery`, `skin_protection`, …) but never
+re-runs preprocessing or segmentation. Change any of the prepare-time settings →
+call `prepare` again. `prepare` / `prepare_rgba` and `downscale_prepared` /
+`downscale_prepared_with_palette` mirror the one-shot functions.
+
+In Rust:
+
+```rust
+use smart_downscaler::{prepare_image, smart_downscale_prepared, DownscaleConfig};
+
+let prepared = prepare_image(&pixels, w, h, &config);          // once
+let small = smart_downscale_prepared(&prepared, 128, 128, &config_s);  // reuse
+let large = smart_downscale_prepared(&prepared, 256, 256, &config_l);  // reuse
+```
+
+### Preserving Rare / Important Colors
+
+Palette extraction is **area-weighted**: a color covering a large region gets many
+"votes", so small but important colors — lips, eyes, a logo, a highlight — easily
+merge into dominant tones at low palette sizes (16–64). Counteract this with:
+
+| Knob | What it does | When to raise it |
+|------|--------------|------------------|
+| `reserve_colors` | **Hard guarantee.** Reserves N slots filled with exact source colors that are far from the rest of the palette *and* important. Most reliable fix. | Always, for portraits. ~`palette_size / 8`. |
+| `detail_boost` | Weights extraction toward **detail-rich regions** via a local-contrast saliency map (measured at the downscale radius, so it targets features thin enough to be averaged away). | When the important color is in a high-detail area. `0.8–1.0`. |
+| `color_rarity` | Damps the frequency vote (`count^p`, `p = 1 − 0.5·rarity`) so large flat regions stop monopolizing the palette. | Mild assist alongside the above. `0.3–0.4`. |
+
+Pair these with `k_centroid = 4` (Salient) so the *tile* stage doesn't discard the
+same minority colors a correct palette preserved.
+
+### Restoring Saturation (Chroma Recovery)
+
+Averaging colors in Oklab during median-cut/k-means pulls the result *inward* — the
+mean of two hues is less colorful than either. `chroma_recovery` undoes this **by
+perceptual difference**: each palette color is pushed back toward the count-weighted
+**mean chroma of the source colors it represents**, at constant hue and lightness,
+then clamped to the sRGB gamut. It only ever *increases* saturation, never reduces it.
+
+```javascript
+config.chroma_recovery = 0.6;  // 0 = off, ~0.6 natural, 1.0 = full restoration, >1 = punchy
+```
+
+This is a global de-wash that fixes the "muddy" look of low-palette output; it is
+independent of (and composes with) the rare-color knobs above.
+
+### Isolating Skin Tones
+
+Skin clusters tightly in the YCbCr chroma plane (`80 ≤ Cb ≤ 120`, `133 ≤ Cr ≤ 173`).
+With `skin_protection > 0`, skin and non-skin colors are extracted in **separate
+domains** — a single palette bucket never mixes the two, so skin never picks up a
+muddy blend with hair/background and vice-versa. Palette slots are split between the
+domains by population (each guaranteed at least one). The same value also acts as a
+**quantization penalty**: a skin tile prefers skin palette colors, a non-skin tile
+prefers non-skin.
+
+```javascript
+config.skin_protection = 0.5;  // 0 = off, ~0.5 typical
+```
+
+> Lips are reddish and usually pass the skin test, so they live in the *skin* domain
+> — `skin_protection` won't separate lips from skin. Use `reserve_colors` /
+> `k_centroid = 4` for that; they operate *within* the skin domain, so the two
+> features compose: skin gets its own budget, and a distinct lip is preserved inside it.
+
+### Recommended Config for Faces / Portraits
+
+```javascript
+const config = new WasmDownscaleConfig();
+config.palette_size      = 32;
+config.palette_strategy  = 'oklab';     // honors color_rarity / detail_boost
+config.k_centroid        = 4;           // salient tile color
+config.k_centroid_iterations = 2;
+config.reserve_colors    = 4;           // ~palette_size / 8 — the guarantee
+config.detail_boost      = 0.9;         // saliency targeting
+config.color_rarity      = 0.35;        // frequency damping
+config.chroma_recovery   = 0.6;         // restore saturation lost to merging
+config.skin_protection   = 0.5;         // separate skin / non-skin
+config.neighbor_weight   = 0.18;        // lower = less erosion of thin features
+```
+
+> **Strategy note:** `bitmask` ignores frequency weights during its initial split, so
+> with `bitmask` only `reserve_colors` is active. Use `oklab` (or `saturation`) if you
+> also want `color_rarity` / `detail_boost` to shape the main palette.
 
 ### Custom Palette Workflow
 
@@ -705,7 +875,7 @@ smart-downscaler input.png --extract-palette palette.hex -c 16
 | `--colors` | `-c` | `16` | Palette size |
 | `--strategy` | `-s` | `oklab` | Palette strategy |
 | `--segmentation` | | `hierarchy_fast` | Segmentation method |
-| `--k-centroid` | | `1` | Tile color mode |
+| `--k-centroid` | | `1` | Tile color mode (1=avg, 2=dominant, 3=foremost, 4=salient) |
 | `--k-centroid-iterations` | | `0` | Tile refinement |
 | `--no-refinement` | | false | Disable two-pass |
 | `--preset` | `-p` | | Use preset (fast/quality/vibrant) |

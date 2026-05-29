@@ -12,7 +12,10 @@ use js_sys::{Uint8Array, Uint8ClampedArray};
 use serde::{Deserialize, Serialize};
 
 use crate::color::Rgb;
-use crate::downscale::{smart_downscale, DownscaleConfig, SegmentationMethod, smart_downscale_with_palette};
+use crate::downscale::{
+    prepare_image, smart_downscale, smart_downscale_prepared, smart_downscale_prepared_with_palette,
+    smart_downscale_with_palette, DownscaleConfig, PreparedImage, SegmentationMethod,
+};
 use crate::hierarchy::HierarchyConfig;
 use crate::palette::{extract_palette_with_strategy, Palette, PaletteStrategy};
 use crate::slic::SlicConfig;
@@ -48,6 +51,10 @@ pub struct WasmDownscaleConfig {
     pub detail_boost: f32,
     /// Reserve N palette slots for distinct, important, under-represented colors. 0 = off.
     pub reserve_colors: usize,
+    /// Restore chroma lost to merging (constant hue, gamut-clamped). 0.0 = off, ~0.6 natural.
+    pub chroma_recovery: f32,
+    /// Isolate skin tones from non-skin (separate domains + mismatch penalty). 0.0 = off, ~0.5.
+    pub skin_protection: f32,
 }
 
 #[wasm_bindgen]
@@ -73,7 +80,7 @@ impl WasmDownscaleConfig {
             segmentation_method: "none".to_string(), palette_strategy: "oklab".to_string(),
             slic_superpixels: 50, slic_compactness: 10.0, hierarchy_threshold: 20.0, hierarchy_min_size: 4,
             max_resolution_mp: 1.0, max_color_preprocess: 8192, k_centroid: 1, k_centroid_iterations: 0,
-            color_rarity: 0.0, detail_boost: 0.0, reserve_colors: 0,
+            color_rarity: 0.0, detail_boost: 0.0, reserve_colors: 0, chroma_recovery: 0.0, skin_protection: 0.0,
         }
     }
 
@@ -85,7 +92,7 @@ impl WasmDownscaleConfig {
             segmentation_method: "hierarchy".to_string(), palette_strategy: "saturation".to_string(),
             slic_superpixels: 100, slic_compactness: 10.0, hierarchy_threshold: 15.0, hierarchy_min_size: 8,
             max_resolution_mp: 2.0, max_color_preprocess: 32768, k_centroid: 2, k_centroid_iterations: 3,
-            color_rarity: 0.3, detail_boost: 0.8, reserve_colors: 4,
+            color_rarity: 0.3, detail_boost: 0.8, reserve_colors: 4, chroma_recovery: 0.6, skin_protection: 0.5,
         }
     }
 
@@ -97,7 +104,7 @@ impl WasmDownscaleConfig {
             segmentation_method: "hierarchy_fast".to_string(), palette_strategy: "saturation".to_string(),
             slic_superpixels: 100, slic_compactness: 10.0, hierarchy_threshold: 15.0, hierarchy_min_size: 4,
             max_resolution_mp: 1.6, max_color_preprocess: 16384, k_centroid: 2, k_centroid_iterations: 2,
-            color_rarity: 0.35, detail_boost: 0.9, reserve_colors: 3,
+            color_rarity: 0.35, detail_boost: 0.9, reserve_colors: 3, chroma_recovery: 0.7, skin_protection: 0.0,
         }
     }
 
@@ -109,7 +116,7 @@ impl WasmDownscaleConfig {
             segmentation_method: "hierarchy_fast".to_string(), palette_strategy: "medoid".to_string(),
             slic_superpixels: 100, slic_compactness: 10.0, hierarchy_threshold: 15.0, hierarchy_min_size: 4,
             max_resolution_mp: 1.6, max_color_preprocess: 16384, k_centroid: 1, k_centroid_iterations: 0,
-            color_rarity: 0.0, detail_boost: 0.0, reserve_colors: 0,
+            color_rarity: 0.0, detail_boost: 0.0, reserve_colors: 0, chroma_recovery: 0.0, skin_protection: 0.0,
         }
     }
 }
@@ -122,7 +129,7 @@ impl Default for WasmDownscaleConfig {
             segmentation_method: "hierarchy_fast".to_string(), palette_strategy: "oklab".to_string(),
             slic_superpixels: 100, slic_compactness: 10.0, hierarchy_threshold: 15.0, hierarchy_min_size: 4,
             max_resolution_mp: 1.5, max_color_preprocess: 16384, k_centroid: 1, k_centroid_iterations: 0,
-            color_rarity: 0.0, detail_boost: 0.0, reserve_colors: 0,
+            color_rarity: 0.0, detail_boost: 0.0, reserve_colors: 0, chroma_recovery: 0.0, skin_protection: 0.0,
         }
     }
 }
@@ -160,6 +167,7 @@ impl WasmDownscaleConfig {
             k_centroid: self.k_centroid, k_centroid_iterations: self.k_centroid_iterations,
             color_rarity: self.color_rarity, detail_boost: self.detail_boost,
             reserve_colors: self.reserve_colors,
+            chroma_recovery: self.chroma_recovery, skin_protection: self.skin_protection,
         }
     }
 }
@@ -210,6 +218,119 @@ pub fn downscale_rgba(
 ) -> Result<WasmDownscaleResult, JsValue> {
     let data = Uint8Array::new(image_data.as_ref());
     downscale(&data, width, height, target_width, target_height, config)
+}
+
+// =============================================================================
+// Prepare / reuse: run target-independent work (preprocess + segmentation) once,
+// then downscale to many sizes cheaply. Big win when generating multiple previews.
+// =============================================================================
+
+/// Opaque handle holding the prepared (preprocessed + segmented) source image.
+/// Build with [`prepare`] / [`prepare_rgba`], reuse with [`downscale_prepared`].
+///
+/// The segmentation is fixed at prepare time from the config you pass. Palette
+/// size and target dimensions may differ on every [`downscale_prepared`] call.
+/// If you change resolution / color-preprocess / segmentation settings, prepare again.
+#[wasm_bindgen]
+pub struct WasmPreparedImage {
+    inner: PreparedImage,
+    // The config used at prepare time (segmentation/preprocess settings live here).
+    base: DownscaleConfig,
+}
+
+#[wasm_bindgen]
+impl WasmPreparedImage {
+    #[wasm_bindgen(getter)] pub fn width(&self) -> u32 { self.inner.width as u32 }
+    #[wasm_bindgen(getter)] pub fn height(&self) -> u32 { self.inner.height as u32 }
+}
+
+/// Prepare from a `Uint8Array` (RGBA).
+#[wasm_bindgen]
+pub fn prepare(
+    image_data: &Uint8Array, width: u32, height: u32, config: Option<WasmDownscaleConfig>,
+) -> Result<WasmPreparedImage, JsValue> {
+    let config = config.unwrap_or_default();
+    let data = image_data.to_vec();
+    if data.len() % 4 != 0 { return Err(JsValue::from_str("Input must be RGBA")); }
+    let pixels: Vec<Rgb> = data.chunks(4).map(|c| Rgb::new(c[0], c[1], c[2])).collect();
+    let base = config.to_internal();
+    let inner = prepare_image(&pixels, width as usize, height as usize, &base);
+    Ok(WasmPreparedImage { inner, base })
+}
+
+/// Prepare from a `Uint8ClampedArray` (canvas `getImageData`).
+#[wasm_bindgen]
+pub fn prepare_rgba(
+    image_data: &Uint8ClampedArray, width: u32, height: u32, config: Option<WasmDownscaleConfig>,
+) -> Result<WasmPreparedImage, JsValue> {
+    let data = Uint8Array::new(image_data.as_ref());
+    prepare(&data, width, height, config)
+}
+
+/// Downscale a prepared image. Pass an optional `config` to override per-target
+/// knobs (palette_size, k_centroid, chroma_recovery, skin_protection, …). The
+/// preprocess/segmentation settings always come from prepare time. When `config`
+/// is omitted, the prepare-time config is reused as-is.
+#[wasm_bindgen]
+pub fn downscale_prepared(
+    prepared: &WasmPreparedImage, target_width: u32, target_height: u32,
+    config: Option<WasmDownscaleConfig>,
+) -> Result<WasmDownscaleResult, JsValue> {
+    // Start from prepare-time settings; overlay per-target knobs if a config is given.
+    let mut cfg = prepared.base.clone();
+    if let Some(c) = config {
+        let c = c.to_internal();
+        cfg.palette_size = c.palette_size;
+        cfg.kmeans_iterations = c.kmeans_iterations;
+        cfg.neighbor_weight = c.neighbor_weight;
+        cfg.region_weight = c.region_weight;
+        cfg.two_pass_refinement = c.two_pass_refinement;
+        cfg.refinement_iterations = c.refinement_iterations;
+        cfg.palette_strategy = c.palette_strategy;
+        cfg.k_centroid = c.k_centroid;
+        cfg.k_centroid_iterations = c.k_centroid_iterations;
+        cfg.color_rarity = c.color_rarity;
+        cfg.detail_boost = c.detail_boost;
+        cfg.reserve_colors = c.reserve_colors;
+        cfg.chroma_recovery = c.chroma_recovery;
+        cfg.skin_protection = c.skin_protection;
+        // NOTE: max_resolution_mp / max_color_preprocess / segmentation are intentionally
+        // NOT overridden — they belong to the prepared image.
+    }
+
+    let result = smart_downscale_prepared(&prepared.inner, target_width, target_height, &cfg);
+    let rgba_data = result.to_rgba_bytes();
+    let palette_data: Vec<u8> = result.palette.colors.iter().flat_map(|p| [p.r(), p.g(), p.b()]).collect();
+
+    Ok(WasmDownscaleResult {
+        width: result.width, height: result.height,
+        data: rgba_data, palette: palette_data, indices: result.palette_indices,
+    })
+}
+
+/// Downscale a prepared image with a caller-supplied palette.
+#[wasm_bindgen]
+pub fn downscale_prepared_with_palette(
+    prepared: &WasmPreparedImage, target_width: u32, target_height: u32,
+    palette_data: &Uint8Array, config: Option<WasmDownscaleConfig>,
+) -> Result<WasmDownscaleResult, JsValue> {
+    let pal_vec = palette_data.to_vec();
+    if pal_vec.len() % 3 != 0 { return Err(JsValue::from_str("Palette must be RGB")); }
+    let colors: Vec<Rgb> = pal_vec.chunks(3).map(|c| Rgb::new(c[0], c[1], c[2])).collect();
+    let palette = Palette::new(colors);
+
+    let cfg = match config {
+        Some(c) => c.to_internal(),
+        None => prepared.base.clone(),
+    };
+    let result = smart_downscale_prepared_with_palette(&prepared.inner, target_width, target_height, palette, &cfg);
+    let rgba_data = result.to_rgba_bytes();
+    let palette_data: Vec<u8> = result.palette.colors.iter().flat_map(|p| [p.r(), p.g(), p.b()]).collect();
+
+    Ok(WasmDownscaleResult {
+        width: result.width, height: result.height,
+        data: rgba_data, palette: palette_data, indices: result.palette_indices,
+    })
 }
 
 #[wasm_bindgen]
