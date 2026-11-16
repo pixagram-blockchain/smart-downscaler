@@ -1,211 +1,106 @@
-//! Benchmarks for smart-downscaler
+//! Criterion benchmarks.
+//!
+//! ```text
+//! cargo bench                       # everything
+//! cargo bench -- full/balanced      # one group
+//! ```
+//!
+//! Inputs are the procedural charts of `smart_downscaler::synth`, so runs are reproducible
+//! anywhere. For a quick legacy-vs-PAX table without criterion see `examples/bench_compare.rs`.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use smart_downscaler::prelude::*;
+use smart_downscaler::synth;
+use smart_downscaler::Palette;
 
-fn generate_test_image(width: usize, height: usize) -> Vec<Rgb> {
-    let mut pixels = Vec::with_capacity(width * height);
-    for y in 0..height {
-        for x in 0..width {
-            // Create a pattern with distinct regions
-            let r = ((x * 255) / width) as u8;
-            let g = ((y * 255) / height) as u8;
-            let b = (((x + y) * 128) / (width + height)) as u8;
-            pixels.push(Rgb::new(r, g, b));
+fn presets() -> Vec<(&'static str, DownscaleConfig)> {
+    vec![
+        ("fast", DownscaleConfig::fast()),
+        ("balanced", DownscaleConfig::balanced()),
+        ("high", DownscaleConfig::high()),
+        ("maximum", DownscaleConfig::maximum()),
+        ("legacy_noseg", DownscaleConfig { segmentation: SegmentationMethod::None, ..DownscaleConfig::legacy() }),
+        (
+            "legacy_hierarchy_fast",
+            DownscaleConfig {
+                segmentation: SegmentationMethod::HierarchyFast { color_threshold: 15.0 },
+                ..DownscaleConfig::legacy()
+            },
+        ),
+    ]
+}
+
+/// The complete call: prepare + downscale.
+fn bench_full(c: &mut Criterion) {
+    let mut g = c.benchmark_group("full");
+    g.sample_size(20);
+    for side in [256usize, 512, 1024] {
+        let px = synth::portrait(side, side);
+        g.throughput(Throughput::Elements((side * side) as u64));
+        for (name, cfg) in presets() {
+            g.bench_with_input(BenchmarkId::new(name, side), &px, |b, px| {
+                b.iter(|| black_box(smart_downscale(px, side, side, 64, 64, &cfg)))
+            });
         }
     }
-    pixels
+    g.finish();
 }
 
-fn bench_palette_extraction(c: &mut Criterion) {
-    let mut group = c.benchmark_group("palette_extraction");
-    
-    for size in [64, 128, 256, 512].iter() {
-        let pixels = generate_test_image(*size, *size);
-        
-        group.bench_with_input(
-            BenchmarkId::new("median_cut_kmeans", size),
-            size,
-            |b, _| {
-                b.iter(|| {
-                    smart_downscaler::extract_palette(
-                        black_box(&pixels),
-                        black_box(16),
-                        black_box(5),
-                    )
-                })
-            },
-        );
+/// The reusable part: resolution cap, colour preprocessing, working-space conversion and
+/// structural analysis.
+fn bench_prepare(c: &mut Criterion) {
+    let mut g = c.benchmark_group("prepare");
+    g.sample_size(20);
+    for (chart, px) in [("portrait", synth::portrait(512, 512)), ("illustration", synth::illustration(512, 512)), ("texture", synth::texture(512, 512))] {
+        g.throughput(Throughput::Elements(512 * 512));
+        g.bench_with_input(BenchmarkId::new("balanced", chart), &px, |b, px| {
+            b.iter(|| black_box(prepare_image(px, 512, 512, &DownscaleConfig::balanced())))
+        });
     }
-    
-    group.finish();
+    g.finish();
 }
 
-fn bench_edge_detection(c: &mut Criterion) {
-    let mut group = c.benchmark_group("edge_detection");
-    
-    for size in [64, 128, 256, 512].iter() {
-        let pixels = generate_test_image(*size, *size);
-        
-        group.bench_with_input(
-            BenchmarkId::new("sobel", size),
-            size,
-            |b, &size| {
-                b.iter(|| {
-                    smart_downscaler::compute_edge_map(
-                        black_box(&pixels),
-                        black_box(size),
-                        black_box(size),
-                    )
-                })
-            },
-        );
-        
-        group.bench_with_input(
-            BenchmarkId::new("combined", size),
-            size,
-            |b, &size| {
-                b.iter(|| {
-                    smart_downscaler::compute_combined_edges(
-                        black_box(&pixels),
-                        black_box(size),
-                        black_box(size),
-                        black_box(1.0),
-                        black_box(0.5),
-                    )
-                })
-            },
-        );
-    }
-    
-    group.finish();
-}
-
-fn bench_segmentation(c: &mut Criterion) {
-    let mut group = c.benchmark_group("segmentation");
-    group.sample_size(20); // Fewer samples for slower benchmarks
-    
-    for size in [64, 128, 256].iter() {
-        let pixels = generate_test_image(*size, *size);
-        
-        group.bench_with_input(
-            BenchmarkId::new("slic", size),
-            size,
-            |b, &size| {
-                b.iter(|| {
-                    smart_downscaler::slic_segment(
-                        black_box(&pixels),
-                        black_box(size),
-                        black_box(size),
-                        black_box(&SlicConfig {
-                            num_superpixels: 50,
-                            ..Default::default()
-                        }),
-                    )
-                })
-            },
-        );
-        
-        group.bench_with_input(
-            BenchmarkId::new("hierarchy_fast", size),
-            size,
-            |b, &size| {
-                b.iter(|| {
-                    smart_downscaler::hierarchical_cluster_fast(
-                        black_box(&pixels),
-                        black_box(size),
-                        black_box(size),
-                        black_box(15.0),
-                    )
-                })
-            },
-        );
-    }
-    
-    group.finish();
-}
-
-fn bench_full_downscale(c: &mut Criterion) {
-    let mut group = c.benchmark_group("full_downscale");
-    group.sample_size(10); // Fewer samples for slow benchmarks
-    
-    let configs = vec![
-        ("no_seg", SegmentationMethod::None),
-        ("hierarchy_fast", SegmentationMethod::HierarchyFast { color_threshold: 15.0 }),
-    ];
-    
-    for size in [128, 256].iter() {
-        let pixels = generate_test_image(*size, *size);
-        let target = size / 4;
-        
-        for (name, seg_method) in &configs {
-            group.bench_with_input(
-                BenchmarkId::new(*name, size),
-                size,
-                |b, &size| {
-                    let config = DownscaleConfig {
-                        palette_size: 16,
-                        segmentation: seg_method.clone(),
-                        two_pass_refinement: true,
-                        refinement_iterations: 2,
-                        ..Default::default()
-                    };
-                    
-                    b.iter(|| {
-                        smart_downscaler::smart_downscale(
-                            black_box(&pixels),
-                            black_box(size),
-                            black_box(size),
-                            black_box(target as u32),
-                            black_box(target as u32),
-                            black_box(&config),
-                        )
-                    })
-                },
-            );
+/// What a second target size or palette costs once the image is prepared.
+fn bench_prepared(c: &mut Criterion) {
+    let mut g = c.benchmark_group("prepared");
+    g.sample_size(30);
+    let px = synth::portrait(512, 512);
+    for (name, cfg) in presets().into_iter().take(4) {
+        let prepared = prepare_image(&px, 512, 512, &cfg);
+        for target in [32u32, 64, 128] {
+            g.bench_with_input(BenchmarkId::new(name, target), &target, |b, &t| {
+                b.iter(|| black_box(smart_downscale_prepared(&prepared, t, t, &cfg)))
+            });
         }
     }
-    
-    group.finish();
-}
-
-fn bench_refinement(c: &mut Criterion) {
-    let mut group = c.benchmark_group("refinement");
-    
-    let size = 64usize;
-    let pixels = generate_test_image(size, size);
-    let palette = smart_downscaler::extract_palette(&pixels, 16, 3);
-    
-    // Create initial assignment
-    let tile_labs: Vec<Lab> = pixels.iter().map(|p| p.to_lab()).collect();
-    let mut assignments: Vec<usize> = tile_labs
-        .iter()
-        .map(|lab| palette.find_nearest(lab))
-        .collect();
-    
-    group.bench_function("two_pass_iteration", |b| {
-        b.iter(|| {
-            let mut test_assignments = assignments.clone();
-            smart_downscaler::downscale::refinement_pass(
-                black_box(&mut test_assignments),
-                black_box(&tile_labs),
-                black_box(size),
-                black_box(size),
-                black_box(&palette),
-                black_box(0.3),
-            )
-        })
+    let cfg = DownscaleConfig::balanced();
+    let prepared = prepare_image(&px, 512, 512, &cfg);
+    for k in [2usize, 8, 32, 64] {
+        let c2 = DownscaleConfig { palette_size: k, ..cfg.clone() };
+        g.bench_with_input(BenchmarkId::new("balanced_colors", k), &k, |b, _| {
+            b.iter(|| black_box(smart_downscale_prepared(&prepared, 64, 64, &c2)))
+        });
+    }
+    let pico: Vec<Rgb> = [0x000000u32, 0x1d2b53, 0x7e2553, 0x008751, 0xab5236, 0x5f574f, 0xc2c3c7, 0xfff1e8, 0xff004d, 0xffa300, 0xffec27, 0x00e436, 0x29adff, 0x83769c, 0xff77a8, 0xffccaa]
+        .iter().map(|v| Rgb::new((v >> 16) as u8, (v >> 8) as u8, *v as u8)).collect();
+    g.bench_function("balanced_fixed_palette/64", |b| {
+        b.iter(|| black_box(smart_downscale_prepared_with_palette(&prepared, 64, 64, Palette::new(pico.clone()), &cfg)))
     });
-    
-    group.finish();
+    g.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_palette_extraction,
-    bench_edge_detection,
-    bench_segmentation,
-    bench_full_downscale,
-);
+/// Transparency handling.
+fn bench_rgba(c: &mut Criterion) {
+    let mut g = c.benchmark_group("rgba");
+    g.sample_size(20);
+    for soft in [false, true] {
+        let rgba = synth::sprite_rgba(512, 512, soft);
+        g.bench_with_input(BenchmarkId::new("balanced", if soft { "soft" } else { "hard" }), &rgba, |b, rgba| {
+            b.iter(|| black_box(smart_downscale_rgba(rgba, 512, 512, 64, 64, &DownscaleConfig::balanced())))
+        });
+    }
+    g.finish();
+}
 
+criterion_group!(benches, bench_full, bench_prepare, bench_prepared, bench_rgba);
 criterion_main!(benches);

@@ -6,10 +6,9 @@
 //! - Integer Manhattan distance for edge detection
 //! - Low-level bit operations (Morton codes)
 //!
-//! # v0.4 Changes
-//! - Removed dead code: LabFixed LUTs, SQ_DIFF_LUT, CBRT_LUT, compute_edges_fixed,
-//!   compute_tile_average_fixed, spatial_hash (Lab), get_cell_center_lab
-//! - All Rgb field access updated to method calls (packed u32)
+//! # 1.0
+//! - Look-up tables and cube roots use the deterministic helpers in [`crate::math`], so the
+//!   fixed-point path gives the same values on every platform.
 
 use crate::color::{Rgb, OklabFixed};
 use std::collections::HashMap;
@@ -26,12 +25,7 @@ pub fn init_luts() {
     SRGB_TO_LINEAR.get_or_init(|| {
         let mut lut = [0.0f32; 256];
         for i in 0..256 {
-            let v = i as f32 / 255.0;
-            lut[i] = if v > 0.04045 {
-                ((v + 0.055) / 1.055).powf(2.4)
-            } else {
-                v / 12.92
-            };
+            lut[i] = crate::math::srgb_to_linear64(i as f64 / 255.0) as f32;
         }
         lut
     });
@@ -39,12 +33,7 @@ pub fn init_luts() {
     SRGB_TO_LINEAR_FIXED.get_or_init(|| {
         let mut lut = [0i32; 256];
         for i in 0..256 {
-            let v = i as f32 / 255.0;
-            let linear = if v > 0.04045 {
-                ((v + 0.055) / 1.055).powf(2.4)
-            } else {
-                v / 12.92
-            };
+            let linear = crate::math::srgb_to_linear64(i as f64 / 255.0);
             lut[i] = (linear * 1048576.0) as i32;
         }
         lut
@@ -71,9 +60,10 @@ pub fn rgb_to_oklab_fixed(rgb: Rgb) -> OklabFixed {
     let s_lms = (M20 * r + M21 * g + M22 * b) >> 20;
 
     // Cube root (float for now, can be LUT-optimized)
-    let l_cbrt = ((l_lms as f32 / 1048576.0).max(0.0).cbrt() * 65536.0) as i32;
-    let m_cbrt = ((m_lms as f32 / 1048576.0).max(0.0).cbrt() * 65536.0) as i32;
-    let s_cbrt = ((s_lms as f32 / 1048576.0).max(0.0).cbrt() * 65536.0) as i32;
+    let cbrt = crate::math::cbrt_det;
+    let l_cbrt = (cbrt((l_lms as f32 / 1048576.0).max(0.0)) * 65536.0) as i32;
+    let m_cbrt = (cbrt((m_lms as f32 / 1048576.0).max(0.0)) * 65536.0) as i32;
+    let s_cbrt = (cbrt((s_lms as f32 / 1048576.0).max(0.0)) * 65536.0) as i32;
 
     // LMS' to Oklab (coefficients scaled by 2^16)
     const N00: i32 = 13792;   const N01: i32 = 52017;   const N02: i32 = -267;

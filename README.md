@@ -1,906 +1,473 @@
 # Smart Pixel Art Downscaler
 
-A high-performance Rust library for intelligent image downscaling with pixel art quality preservation.
+Structure-preserving, perceptually optimised downscaling for pixel art, written in Rust with
+WebAssembly bindings. Give it an image of any size and aspect ratio, a target size and a colour
+budget; it returns indexed pixel art that keeps the source's edges, thin features, colours and
+contrast instead of averaging them away.
 
-**Available as a native Rust library and WebAssembly module for browser/Node.js.**
+![source, legacy engine and the three PAX quality modes on five charts](docs/img/regression.png)
 
-[![Version](https://img.shields.io/badge/version-0.6.0-blue.svg)]()
-[![License](https://img.shields.io/badge/license-MIT-green.svg)]()
+*Left to right: source, the 0.x pipeline with its defaults, and 1.0 in `fast`, `balanced` and
+`high` quality. Every row is produced by `cargo run --release --example regression`.*
 
----
+**Version 1.0.0** replaces the 0.x pipeline with **PAX — Perceptual Adaptive eXtraction**
+(adaptive K-Centroid sampling, a palette built from what the sampling selected, automatic
+colour compensation and artifact validation). The 0.x pipeline is still included
+(`Engine::Legacy`) and every 0.x API keeps working. See [What changed](#migrating-from-0x)
+and [CHANGELOG.md](CHANGELOG.md); the design is documented in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## Table of Contents
+## Contents
 
-- [Features](#features)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Configuration Reference](#configuration-reference)
-- [API Reference](#api-reference)
-- [Presets](#presets)
-- [Advanced Usage](#advanced-usage)
-- [Performance Tips](#performance-tips)
-- [Why Oklab?](#why-oklab)
-- [CLI Reference](#cli-reference)
-- [License](#license)
+- [Install and build](#install-and-build) · [Quick start](#quick-start) · [How it works](#how-it-works)
+- [Quality modes](#quality-modes) · [Configuration reference](#configuration-reference) · [Diagnostics](#diagnostics)
+- [API reference](#api-reference) · [Recipes](#recipes) · [Performance](#performance)
+- [Determinism](#determinism) · [Testing](#testing) · [Migrating from 0.x](#migrating-from-0x)
+- [Known limitations](#known-limitations) · [CLI](#cli) · [License and credits](#license-and-credits)
 
----
+## Install and build
 
-## Features
-
-| Feature | Description |
-|---------|-------------|
-| **Oklab Color Space** | Modern perceptual color space with superior hue linearity |
-| **Multiple Palette Strategies** | 6 different extraction methods for various use cases |
-| **Region Segmentation** | SLIC superpixels, hierarchical clustering, or fast union-find |
-| **Edge-Aware Processing** | Sobel/Scharr detection preserves boundaries |
-| **Spatial Coherence** | Neighbor and region voting for smooth results |
-| **K-Centroid Tile Logic** | Advanced dominant color extraction per tile |
-| **Rare-Color Preservation** | Saliency weighting + slot reservation keeps small important colors (lips, eyes) |
-| **Chroma Recovery** | Restores saturation lost to color merging, by perceptual difference |
-| **Skin-Tone Isolation** | Keeps skin and non-skin colors in separate palette domains |
-| **Reusable Preprocessing** | Prepare an image once, downscale to many sizes cheaply |
-| **Performance Preprocessing** | Resolution capping and color pre-quantization |
-| **WebAssembly Support** | Full browser compatibility with near-native speed |
-
----
-
-## Installation
-
-### Rust (Native)
+**Rust**
 
 ```toml
 [dependencies]
-smart-downscaler = "0.6.0"
+smart-downscaler = "1.0"                                                        # library + CLI, multi-threaded
+smart-downscaler = { version = "1.0", default-features = false }                # no image I/O, no rayon, no dependencies beyond ordered-float
+smart-downscaler = { version = "1.0", default-features = false, features = ["parallel"] }
 ```
 
-### WebAssembly (npm)
+| Feature | Default | Adds |
+|---|---|---|
+| `native` | yes | `image` (CLI, `to_image`, `downscale(&RgbImage, …)`) and `parallel` |
+| `parallel` | via `native` | rayon-based footprint extraction. **Output is identical with or without it.** |
+| `wasm` | no | wasm-bindgen exports (build with `--no-default-features --features wasm`) |
+
+**WebAssembly**
 
 ```bash
-npm install smart-downscaler
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.130 --locked   # the version Cargo.lock pins
+./build-wasm.sh              # pkg/web, pkg/bundler, pkg/nodejs + pkg/package.json
+node scripts/check-wasm.mjs  # proves the build reproduces the native library bit for bit
 ```
 
-### WebAssembly (CDN)
+Each `pkg/<target>` folder contains the generated bindings (`smart_downscaler.js`) and the
+high-level wrapper (`smart-downscaler.js`, `.mjs` for Node). `examples/demo.html` is a small
+page that uses the wrapper; serve the repository over HTTP to try it.
 
-```html
-<script type="module">
-  import init, { downscale_rgba, WasmDownscaleConfig } from 'https://unpkg.com/smart-downscaler@0.6.0/smart_downscaler.js';
-</script>
+## Quick start
+
+**Rust**
+
+```rust
+use smart_downscaler::prelude::*;
+
+let img = image::open("input.png")?.to_rgba8();
+let config = DownscaleConfig { palette_size: 16, ..Default::default() };   // PAX, Balanced
+let result = smart_downscale_rgba(img.as_raw(), img.width() as usize, img.height() as usize, 64, 64, &config);
+
+result.to_rgba_image().save("output.png")?;      // alpha preserved when the source has any
+println!("{} colours used, edge retention {:.2}",
+    result.colors_used(), result.diagnostics.as_ref().unwrap().edge_retention);
 ```
 
----
+Opaque `&[Rgb]` input goes through `smart_downscale`; `try_smart_downscale*` return a
+`DownscaleError` instead of panicking on mismatched sizes.
 
-## Quick Start
+**JavaScript (wrapper)**
 
-### JavaScript/TypeScript (Browser)
+```js
+import * as sd from './pkg/web/smart-downscaler.js';
+await sd.init();
 
-```javascript
-import init, { downscale_rgba, WasmDownscaleConfig } from 'smart-downscaler';
+const out = sd.downscale(canvasOrImageOrImageData, 64, 64, { paletteSize: 16, quality: 'high' });
+ctx.putImageData(out.imageData, 0, 0);
+console.log(out.colorsUsed, out.diagnostics.edge_retention, out.digest);
 
-// Initialize WASM module (required once)
+// Many sizes or palettes from one source: prepare once.
+const prepared = sd.prepare(image, { quality: 'balanced' });
+const icon = prepared.downscale(32, 32, { paletteSize: 8 });
+const pico = prepared.downscaleWithPalette(96, 96, sd.getPresetPalette('pico8'));
+prepared.free();
+```
+
+**JavaScript (raw bindings, as in 0.x)**
+
+```js
+import init, { WasmDownscaleConfig, downscale_rgba } from './pkg/web/smart_downscaler.js';
 await init();
-
-// Get image data from canvas
-const canvas = document.getElementById('myCanvas');
-const ctx = canvas.getContext('2d');
-const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-
-// Create configuration
-const config = new WasmDownscaleConfig();
+const config = WasmDownscaleConfig.high();
 config.palette_size = 16;
-config.palette_strategy = 'oklab';
-
-// Downscale to 64x64
-const result = downscale_rgba(
-  imageData.data,        // Uint8ClampedArray (RGBA)
-  imageData.width,       // Source width
-  imageData.height,      // Source height
-  64,                    // Target width
-  64,                    // Target height
-  config                 // Optional config
-);
-
-// Draw result
-const outputData = new ImageData(result.data, result.width, result.height);
-outputCtx.putImageData(outputData, 0, 0);
-
-// Access palette and indices
-console.log('Palette colors:', result.palette_size);
-console.log('Palette RGB data:', result.palette);     // Uint8Array
-console.log('Pixel indices:', result.indices);        // Uint8Array
+const result = downscale_rgba(imageData.data, imageData.width, imageData.height, 64, 64, config);
+const output = new ImageData(result.data, result.width, result.height);
 ```
 
-### Rust (Native)
-
-```rust
-use smart_downscaler::{smart_downscale, DownscaleConfig, Rgb};
-use smart_downscaler::palette::PaletteStrategy;
-
-// Create pixel data (from image crate or manually)
-let pixels: Vec<Rgb> = image.pixels()
-    .map(|p| Rgb::new(p[0], p[1], p[2]))
-    .collect();
-
-// Configure
-let config = DownscaleConfig {
-    palette_size: 16,
-    palette_strategy: PaletteStrategy::OklabMedianCut,
-    ..Default::default()
-};
-
-// Downscale
-let result = smart_downscale(
-    &pixels,
-    source_width,
-    source_height,
-    target_width,
-    target_height,
-    &config,
-);
-
-// Use result
-println!("Output: {}x{}", result.width, result.height);
-println!("Palette: {} colors", result.palette.len());
-```
-
----
-
-## Configuration Reference
-
-### Complete Parameter List
-
-| Parameter | Type | Default | Range/Values | Description |
-|-----------|------|---------|--------------|-------------|
-| **Palette Settings** |||||
-| `palette_size` | `usize` | `16` | `1-256` | Number of colors in output palette |
-| `palette_strategy` | `string` | `"oklab"` | See [Palette Strategies](#palette-strategies) | Algorithm for palette extraction |
-| `kmeans_iterations` | `usize` | `5` | `0-20` | K-Means refinement passes (0 = disabled) |
-| **Spatial Coherence** |||||
-| `neighbor_weight` | `f32` | `0.3` | `0.0-1.0` | Bias toward colors used by neighboring tiles |
-| `region_weight` | `f32` | `0.2` | `0.0-1.0` | Bias toward colors used in same region |
-| **Refinement** |||||
-| `two_pass_refinement` | `bool` | `true` | `true/false` | Enable iterative smoothing pass |
-| `refinement_iterations` | `usize` | `3` | `0-10` | Number of refinement passes |
-| **Edge Detection** |||||
-| `edge_weight` | `f32` | `0.5` | `0.0-1.0` | Balance between luminance and color edges |
-| **Segmentation** |||||
-| `segmentation_method` | `string` | `"hierarchy_fast"` | See [Segmentation Methods](#segmentation-methods) | Region detection algorithm |
-| `slic_superpixels` | `usize` | `100` | `10-1000` | Number of superpixels (SLIC only) |
-| `slic_compactness` | `f32` | `10.0` | `1.0-40.0` | Shape regularity (SLIC only) |
-| `hierarchy_threshold` | `f32` | `15.0` | `5.0-50.0` | Color distance merge threshold |
-| `hierarchy_min_size` | `usize` | `4` | `1-100` | Minimum region size in pixels |
-| **Performance** |||||
-| `max_resolution_mp` | `f32` | `1.6` | `0.0-10.0` | Resolution cap in megapixels (0 = disabled) |
-| `max_color_preprocess` | `usize` | `16384` | `0-65536` | Pre-quantization limit (0 = disabled) |
-| **Tile Processing** |||||
-| `k_centroid` | `usize` | `1` | `1`, `2`, `3`, `4` | Tile color extraction mode |
-| `k_centroid_iterations` | `usize` | `0` | `0-10` | K-Means iterations for tile color |
-| **Rare-Color & Saturation** |||||
-| `color_rarity` | `f32` | `0.0` | `0.0-1.0` | Damps frequency vote so flat areas stop dominating (`0`=area, `1`=`count^0.5`) |
-| `detail_boost` | `f32` | `0.0` | `0.0-2.0` | Boosts colors in detail-rich regions via local-contrast saliency (`0`=off) |
-| `reserve_colors` | `usize` | `0` | `0 - palette_size` | Reserve N slots for distinct, important, under-represented source colors (`0`=off) |
-| `chroma_recovery` | `f32` | `0.0` | `0.0-1.0+` | Restore chroma lost to merging toward source mean chroma, constant hue, gamut-clamped (`0`=off) |
-| `skin_protection` | `f32` | `0.0` | `0.0-1.0` | Isolate skin vs non-skin into separate palette domains + quantization penalty (`0`=off) |
-
----
-
-### Palette Strategies
-
-| Strategy | String Value | Description | Best For |
-|----------|--------------|-------------|----------|
-| **Oklab Median Cut** | `"oklab"` | Perceptually uniform color space | General use, balanced results |
-| **Saturation Weighted** | `"saturation"` | Preserves vibrant colors | Colorful artwork, game sprites |
-| **Medoid** | `"medoid"` | Uses only exact source colors | Pixel-perfect reproduction |
-| **K-Means++** | `"kmeans"` | Statistical clustering | Small palettes (4-8 colors) |
-| **Legacy RGB** | `"legacy"` | Classic RGB median cut | Compatibility, comparison |
-| **RGB Bitmask** | `"bitmask"` | Bit-masked clustering | Fast processing, high color counts |
-
-```javascript
-// Examples
-config.palette_strategy = 'oklab';      // Default, recommended
-config.palette_strategy = 'saturation'; // Vibrant colors
-config.palette_strategy = 'medoid';     // Exact source colors only
-config.palette_strategy = 'kmeans';     // Good for tiny palettes
-config.palette_strategy = 'legacy';     // RGB-space (not recommended)
-config.palette_strategy = 'bitmask';    // Fast approximate
-```
-
----
-
-### Segmentation Methods
-
-| Method | String Value | Description | Performance | Quality |
-|--------|--------------|-------------|-------------|---------|
-| **None** | `"none"` | No region detection | ⚡⚡⚡ Fastest | Basic |
-| **Hierarchy Fast** | `"hierarchy_fast"` | Union-find clustering | ⚡⚡ Fast | Good |
-| **Hierarchy** | `"hierarchy"` | Full hierarchical merge | ⚡ Medium | Better |
-| **SLIC** | `"slic"` | Superpixel segmentation | ⚡ Medium | Best edges |
-
-```javascript
-// Examples
-config.segmentation_method = 'none';           // Speed priority
-config.segmentation_method = 'hierarchy_fast'; // Default, balanced
-config.segmentation_method = 'hierarchy';      // Quality priority
-config.segmentation_method = 'slic';           // Best for photos
-```
-
----
-
-### K-Centroid Tile Modes
-
-Controls how each source tile is reduced to a single representative color:
-
-| Mode | Value | Description | Best For |
-|------|-------|-------------|----------|
-| **Average** | `1` | Simple weighted average of all pixels | Smooth gradients, noise reduction |
-| **Dominant** | `2` | K-Means (k=2), uses largest cluster | Sharp edges, foreground/background separation |
-| **Foremost** | `3` | K-Means (k=3), finer dominant detection | Complex textures, detailed sprites |
-| **Salient** | `4` | K-Means (k=2), keeps a distinctly-more-chromatic minority | Thin colorful features (lips, eyes, makeup) |
-
-> **Note:** Mode `2` (Dominant) snaps a mixed tile to its *larger* cluster, discarding thin minority colors — a tile that is 60% skin / 40% lip becomes pure skin. For faces and artwork with small colorful features, prefer mode `4`, which keeps the colorful minority when it is non-trivial (≥22% of the tile) and clearly more chromatic than the majority.
-
-```javascript
-// Mode 1: Average (default) - smooth results
-config.k_centroid = 1;
-config.k_centroid_iterations = 0;
-
-// Mode 2: Dominant - sharper edges
-config.k_centroid = 2;
-config.k_centroid_iterations = 2;
-
-// Mode 3: Foremost - detailed preservation
-config.k_centroid = 3;
-config.k_centroid_iterations = 3;
-
-// Mode 4: Salient - preserve thin colorful features (lips, eyes)
-config.k_centroid = 4;
-config.k_centroid_iterations = 2;
-```
-
----
-
-## API Reference
-
-### Core Functions
-
-#### `downscale(data, width, height, targetWidth, targetHeight, config?)`
-
-Main downscale function accepting `Uint8Array` (RGBA).
-
-```javascript
-const result = downscale(
-  rgbaData,      // Uint8Array - RGBA pixel data
-  800,           // number - Source width
-  600,           // number - Source height  
-  64,            // number - Target width
-  48,            // number - Target height
-  config         // WasmDownscaleConfig? - Optional configuration
-);
-```
-
-#### `downscale_rgba(data, width, height, targetWidth, targetHeight, config?)`
-
-Same as `downscale` but accepts `Uint8ClampedArray` (from canvas `getImageData`).
-
-```javascript
-const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-const result = downscale_rgba(
-  imageData.data,  // Uint8ClampedArray
-  imageData.width,
-  imageData.height,
-  64, 64,
-  config
-);
-```
-
-#### `downscale_simple(data, width, height, targetWidth, targetHeight, numColors)`
-
-Simplified API with minimal parameters.
-
-```javascript
-const result = downscale_simple(
-  rgbaData,
-  800, 600,
-  64, 48,
-  16  // Number of palette colors
-);
-```
-
-#### `downscale_with_palette(data, width, height, targetWidth, targetHeight, palette, config?)`
-
-Downscale using a pre-defined palette.
-
-```javascript
-const palette = new Uint8Array([
-  255, 0, 0,      // Red
-  0, 255, 0,      // Green
-  0, 0, 255,      // Blue
-  255, 255, 255,  // White
-]);
-
-const result = downscale_with_palette(
-  rgbaData,
-  800, 600,
-  64, 48,
-  palette,  // Uint8Array - RGB, 3 bytes per color
-  config
-);
-```
-
----
-
-### Prepare / Reuse Functions
-
-#### `prepare(data, width, height, config?)` / `prepare_rgba(data, width, height, config?)`
-
-Run target-independent work (resolution cap, color pre-quantization, segmentation)
-once and return a reusable handle. `prepare` takes `Uint8Array`; `prepare_rgba` takes
-`Uint8ClampedArray` (from canvas `getImageData`).
-
-```javascript
-const prepared = prepare_rgba(imageData.data, imageData.width, imageData.height, config);
-// prepared.width / prepared.height — dimensions after any resolution cap
-prepared.free(); // release WASM memory when finished
-```
-
-#### `downscale_prepared(prepared, targetWidth, targetHeight, config?)`
-
-Downscale a prepared image. The optional `config` overrides per-target knobs
-(`palette_size`, `k_centroid`, `chroma_recovery`, `skin_protection`, …); preprocess
-and segmentation settings always come from prepare time.
-
-```javascript
-const result = downscale_prepared(prepared, 128, 128, sizeConfig);
-```
-
-#### `downscale_prepared_with_palette(prepared, targetWidth, targetHeight, palette, config?)`
-
-As above, with a caller-supplied `Uint8Array` RGB palette.
-
----
-
-### Palette Functions
-
-#### `extract_palette_from_image(data, width, height, numColors, iterations, strategy?)`
-
-Extract palette without downscaling.
-
-```javascript
-const palette = extract_palette_from_image(
-  rgbaData,      // Uint8Array - RGBA pixel data
-  800,           // number - Image width (unused but required)
-  600,           // number - Image height (unused but required)
-  16,            // number - Number of colors to extract
-  5,             // number - K-Means iterations
-  'saturation'   // string? - Strategy (optional)
-);
-// Returns: Uint8Array - RGB palette (numColors * 3 bytes)
-```
-
-#### `quantize_to_palette(data, width, height, palette)`
-
-Quantize image to palette without resizing.
-
-```javascript
-const result = quantize_to_palette(
-  rgbaData,      // Uint8Array - RGBA pixel data
-  800,           // number - Image width
-  600,           // number - Image height
-  palette        // Uint8Array - RGB palette
-);
-// Returns: WasmDownscaleResult (same size, quantized colors)
-```
-
-#### `get_palette_strategies()`
-
-Get list of available palette strategies.
-
-```javascript
-const strategies = get_palette_strategies();
-// Returns: ['oklab', 'saturation', 'medoid', 'kmeans', 'legacy', 'bitmask']
-```
-
----
-
-### Color Analysis Functions
-
-#### `analyze_colors(data, maxColors, sortMethod)`
-
-Analyze unique colors in an image.
-
-```javascript
-const analysis = analyze_colors(
-  rgbaData,      // Uint8Array - RGBA pixel data
-  1000,          // number - Max colors to track
-  'frequency'    // string - Sort: 'frequency', 'morton', 'hilbert'
-);
-
-if (analysis.success) {
-  console.log('Unique colors:', analysis.color_count);
-  console.log('Total pixels:', analysis.total_pixels);
-  
-  // Get individual color
-  const color = analysis.get_color(0);
-  console.log(`Most common: ${color.hex} (${color.percentage.toFixed(1)}%)`);
-  
-  // Get as JSON array
-  const colors = analysis.to_json();
-}
-```
-
-**ColorEntry Properties:**
-| Property | Type | Description |
-|----------|------|-------------|
-| `r` | `u8` | Red component (0-255) |
-| `g` | `u8` | Green component (0-255) |
-| `b` | `u8` | Blue component (0-255) |
-| `count` | `u32` | Number of pixels |
-| `percentage` | `f32` | Percentage of image |
-| `hex` | `string` | Hex color code (`#rrggbb`) |
-
----
-
-### Utility Functions
-
-#### `rgb_to_oklab(r, g, b)`
-
-Convert RGB to Oklab color space.
-
-```javascript
-const oklab = rgb_to_oklab(255, 128, 64);
-// Returns: Float32Array [L, a, b]
-// L: 0.0-1.0 (lightness)
-// a: ~-0.4 to 0.4 (green-red)
-// b: ~-0.4 to 0.4 (blue-yellow)
-```
-
-#### `oklab_to_rgb(l, a, b)`
-
-Convert Oklab to RGB.
-
-```javascript
-const rgb = oklab_to_rgb(0.7, 0.1, 0.05);
-// Returns: Uint8Array [r, g, b]
-```
-
-#### `get_chroma(r, g, b)`
-
-Get color saturation/colorfulness.
-
-```javascript
-const chroma = get_chroma(255, 0, 0);  // Pure red = high chroma
-const gray_chroma = get_chroma(128, 128, 128);  // Gray = 0 chroma
-```
-
-#### `get_lightness(r, g, b)`
-
-Get perceptual lightness (0.0-1.0).
-
-```javascript
-const lightness = get_lightness(255, 255, 255);  // White = 1.0
-const dark = get_lightness(0, 0, 0);  // Black = 0.0
-```
-
-#### `color_distance(r1, g1, b1, r2, g2, b2)`
-
-Compute perceptual distance between two colors.
-
-```javascript
-const dist = color_distance(255, 0, 0, 0, 255, 0);  // Red vs Green
-// Returns: f32 - Euclidean distance in Oklab space
-```
-
-#### `version()`
-
-Get library version.
-
-```javascript
-console.log(version());  // "0.6.0"
-```
-
----
-
-### Result Object
-
-`WasmDownscaleResult` properties:
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `width` | `u32` | Output image width |
-| `height` | `u32` | Output image height |
-| `data` | `Uint8ClampedArray` | RGBA pixel data |
-| `palette` | `Uint8Array` | RGB palette (3 bytes per color) |
-| `indices` | `Uint8Array` | Palette index per pixel |
-| `palette_size` | `usize` | Number of colors in palette |
-
-**Methods:**
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `rgb_data()` | `Uint8Array` | Get RGB data (no alpha) |
-
----
-
-## Presets
-
-### Built-in Configuration Presets
-
-```javascript
-// Speed optimized
-const fast = WasmDownscaleConfig.fast();
-// palette_size: 16, kmeans_iterations: 3, no refinement, no segmentation
-
-// Best quality
-const quality = WasmDownscaleConfig.quality();
-// palette_size: 32, kmeans_iterations: 10, hierarchy segmentation, k_centroid: 2
-
-// Preserve vibrant colors
-const vibrant = WasmDownscaleConfig.vibrant();
-// palette_size: 24, saturation strategy, k_centroid: 2
-
-// Use only exact source colors
-const exact = WasmDownscaleConfig.exact_colors();
-// medoid strategy, no k-means refinement
-```
-
-### Preset Comparison
-
-| Preset | Palette | K-Means | Segmentation | K-Centroid | Rare/Sat/Skin¹ | Speed |
-|--------|---------|---------|--------------|------------|----------------|-------|
-| `fast()` | 16 | 3 | none | 1 (avg) | off | ⚡⚡⚡ |
-| `default` | 16 | 5 | hierarchy_fast | 1 (avg) | off | ⚡⚡ |
-| `vibrant()` | 24 | 8 | hierarchy_fast | 2 (dom) | reserve+rarity+chroma(0.7) | ⚡ |
-| `quality()` | 32 | 10 | hierarchy | 2 (dom) | reserve+rarity+chroma(0.6)+skin(0.5) | 🐢 |
-| `exact_colors()` | 16 | 0 | hierarchy_fast | 1 (avg) | off | ⚡⚡ |
-
-¹ For the strongest thin-feature retention on faces, additionally set `k_centroid = 4`.
-
----
-
-## Advanced Usage
-
-### Reusing Preprocessing Across Sizes (Performance)
-
-Resolution capping, color pre-quantization, and region segmentation depend only on
-the **source** image, not the target size. When you downscale the same source to
-several sizes (e.g. multiple previews), repeating that work each time is wasted.
-`prepare` runs it **once**; `downscale_prepared` then only does palette extraction
-and tiling per size.
-
-```javascript
-import init, { prepare_rgba, downscale_prepared, WasmDownscaleConfig } from 'smart-downscaler';
-await init();
-
-const base = new WasmDownscaleConfig();
-base.segmentation_method = 'hierarchy_fast';
-base.max_resolution_mp = 2.048;
-base.max_color_preprocess = 4096;
-
-// Once per source image:
-const prepared = prepare_rgba(imageData.data, imageData.width, imageData.height, base);
-
-// Many times, cheaply — palette_size and target size may differ each call:
-for (const { w, h, colors } of sizes) {
-  const cfg = new WasmDownscaleConfig();
-  cfg.palette_size = colors;
-  cfg.k_centroid = 4;
-  cfg.reserve_colors = Math.round(colors / 8);
-  cfg.chroma_recovery = 0.6;
-  cfg.skin_protection = 0.5;
-  const result = downscale_prepared(prepared, w, h, cfg);
-  // ... use result ...
-}
-
-prepared.free(); // release WASM memory when done (also freed on GC)
-```
-
-**Contract:** the prepared image fixes `max_resolution_mp`, `max_color_preprocess`,
-and `segmentation_*` at prepare time. `downscale_prepared` overlays per-target knobs
-(`palette_size`, `k_centroid`, `chroma_recovery`, `skin_protection`, …) but never
-re-runs preprocessing or segmentation. Change any of the prepare-time settings →
-call `prepare` again. `prepare` / `prepare_rgba` and `downscale_prepared` /
-`downscale_prepared_with_palette` mirror the one-shot functions.
-
-In Rust:
-
-```rust
-use smart_downscaler::{prepare_image, smart_downscale_prepared, DownscaleConfig};
-
-let prepared = prepare_image(&pixels, w, h, &config);          // once
-let small = smart_downscale_prepared(&prepared, 128, 128, &config_s);  // reuse
-let large = smart_downscale_prepared(&prepared, 256, 256, &config_l);  // reuse
-```
-
-### Preserving Rare / Important Colors
-
-Palette extraction is **area-weighted**: a color covering a large region gets many
-"votes", so small but important colors — lips, eyes, a logo, a highlight — easily
-merge into dominant tones at low palette sizes (16–64). Counteract this with:
-
-| Knob | What it does | When to raise it |
-|------|--------------|------------------|
-| `reserve_colors` | **Hard guarantee.** Reserves N slots filled with exact source colors that are far from the rest of the palette *and* important. Most reliable fix. | Always, for portraits. ~`palette_size / 8`. |
-| `detail_boost` | Weights extraction toward **detail-rich regions** via a local-contrast saliency map (measured at the downscale radius, so it targets features thin enough to be averaged away). | When the important color is in a high-detail area. `0.8–1.0`. |
-| `color_rarity` | Damps the frequency vote (`count^p`, `p = 1 − 0.5·rarity`) so large flat regions stop monopolizing the palette. | Mild assist alongside the above. `0.3–0.4`. |
-
-Pair these with `k_centroid = 4` (Salient) so the *tile* stage doesn't discard the
-same minority colors a correct palette preserved.
-
-### Restoring Saturation (Chroma Recovery)
-
-Averaging colors in Oklab during median-cut/k-means pulls the result *inward* — the
-mean of two hues is less colorful than either. `chroma_recovery` undoes this **by
-perceptual difference**: each palette color is pushed back toward the count-weighted
-**mean chroma of the source colors it represents**, at constant hue and lightness,
-then clamped to the sRGB gamut. It only ever *increases* saturation, never reduces it.
-
-```javascript
-config.chroma_recovery = 0.6;  // 0 = off, ~0.6 natural, 1.0 = full restoration, >1 = punchy
-```
-
-This is a global de-wash that fixes the "muddy" look of low-palette output; it is
-independent of (and composes with) the rare-color knobs above.
-
-### Isolating Skin Tones
-
-Skin clusters tightly in the YCbCr chroma plane (`80 ≤ Cb ≤ 120`, `133 ≤ Cr ≤ 173`).
-With `skin_protection > 0`, skin and non-skin colors are extracted in **separate
-domains** — a single palette bucket never mixes the two, so skin never picks up a
-muddy blend with hair/background and vice-versa. Palette slots are split between the
-domains by population (each guaranteed at least one). The same value also acts as a
-**quantization penalty**: a skin tile prefers skin palette colors, a non-skin tile
-prefers non-skin.
-
-```javascript
-config.skin_protection = 0.5;  // 0 = off, ~0.5 typical
-```
-
-> Lips are reddish and usually pass the skin test, so they live in the *skin* domain
-> — `skin_protection` won't separate lips from skin. Use `reserve_colors` /
-> `k_centroid = 4` for that; they operate *within* the skin domain, so the two
-> features compose: skin gets its own budget, and a distinct lip is preserved inside it.
-
-### Recommended Config for Faces / Portraits
-
-```javascript
-const config = new WasmDownscaleConfig();
-config.palette_size      = 32;
-config.palette_strategy  = 'oklab';     // honors color_rarity / detail_boost
-config.k_centroid        = 4;           // salient tile color
-config.k_centroid_iterations = 2;
-config.reserve_colors    = 4;           // ~palette_size / 8 — the guarantee
-config.detail_boost      = 0.9;         // saliency targeting
-config.color_rarity      = 0.35;        // frequency damping
-config.chroma_recovery   = 0.6;         // restore saturation lost to merging
-config.skin_protection   = 0.5;         // separate skin / non-skin
-config.neighbor_weight   = 0.18;        // lower = less erosion of thin features
-```
-
-> **Strategy note:** `bitmask` ignores frequency weights during its initial split, so
-> with `bitmask` only `reserve_colors` is active. Use `oklab` (or `saturation`) if you
-> also want `color_rarity` / `detail_boost` to shape the main palette.
-
-### Custom Palette Workflow
-
-```javascript
-// 1. Extract palette from reference image
-const referencePalette = extract_palette_from_image(
-  referenceImageData, w, h, 16, 10, 'saturation'
-);
-
-// 2. Apply palette to multiple images
-const results = images.map(img => 
-  downscale_with_palette(
-    img.data, img.width, img.height,
-    64, 64,
-    referencePalette,
-    config
-  )
-);
-```
-
-### Batch Processing with Progress
-
-```javascript
-async function batchDownscale(images, config, onProgress) {
-  const results = [];
-  
-  for (let i = 0; i < images.length; i++) {
-    const img = images[i];
-    const result = downscale_rgba(
-      img.data, img.width, img.height,
-      64, 64, config
-    );
-    results.push(result);
-    
-    onProgress((i + 1) / images.length * 100);
-    
-    // Allow UI to update
-    await new Promise(r => setTimeout(r, 0));
-  }
-  
-  return results;
-}
-```
-
-### Analyzing Before Downscaling
-
-```javascript
-// Check image characteristics first
-const analysis = analyze_colors(imageData, 10000, 'frequency');
-
-if (!analysis.success) {
-  console.log('Image has more than 10,000 unique colors');
-}
-
-// Adjust config based on analysis
-const config = new WasmDownscaleConfig();
-
-if (analysis.color_count < 256) {
-  // Already low-color image - use medoid for exact colors
-  config.palette_strategy = 'medoid';
-  config.kmeans_iterations = 0;
-} else {
-  // High-color image - use saturation weighting
-  config.palette_strategy = 'saturation';
-  config.kmeans_iterations = 8;
-}
-```
-
----
-
-## Performance Tips
-
-### 1. Use Resolution Capping
-
-For images larger than ~2MP, enable resolution capping:
-
-```javascript
-config.max_resolution_mp = 1.5;  // Cap at 1.5 megapixels
-```
-
-### 2. Enable Color Pre-quantization
-
-Reduces processing time significantly for high-color images:
-
-```javascript
-config.max_color_preprocess = 16384;  // Pre-quantize to 16K colors
-```
-
-### 3. Choose Appropriate Segmentation
-
-| Image Type | Recommended Segmentation |
-|------------|-------------------------|
-| Icons, sprites | `"none"` |
-| Game art | `"hierarchy_fast"` |
-| Photos | `"slic"` |
-| Complex illustrations | `"hierarchy"` |
-
-### 4. Reduce Iterations for Speed
-
-```javascript
-// Fast settings
-config.kmeans_iterations = 3;      // Instead of 5
-config.refinement_iterations = 1;  // Instead of 3
-config.k_centroid_iterations = 1;  // Instead of 2
-```
-
-### 5. Use Presets
-
-```javascript
-// For real-time preview
-const previewConfig = WasmDownscaleConfig.fast();
-
-// For final export
-const exportConfig = WasmDownscaleConfig.quality();
-```
-
----
-
-## Why Oklab?
-
-### The Problem: RGB Averaging
-
-When averaging colors in RGB space, saturated colors become desaturated:
-
-```
-Red   [255,   0,   0]
-Cyan  [  0, 255, 255]
-─────────────────────
-RGB Average → Gray [127, 127, 127] ❌
-```
-
-This is why traditional downscalers produce "washed out" results.
-
-### The Solution: Oklab Color Space
-
-Oklab is a **perceptually uniform** color space where:
-
-- Euclidean distance = perceived color difference
-- Averaging preserves hue and saturation
-- Interpolations look natural
-
-```
-Red  (Oklab)  L=0.63, a=0.22, b=0.13
-Cyan (Oklab)  L=0.91, a=-0.15, b=-0.09
-─────────────────────────────────────
-Oklab Average → Preserves colorfulness ✓
-```
-
-### Visual Comparison
-
-| Method | Result | Issue |
-|--------|--------|-------|
-| RGB Average | Muddy grays | Desaturation |
-| Lab Average | Better, some hue shift | Non-uniform |
-| **Oklab Average** | Vibrant, natural | ✓ Best |
-
----
-
-## CLI Reference
+**CLI**
 
 ```bash
-# Basic usage
-smart-downscaler input.png output.png -w 64 -h 64
-
-# With palette size
-smart-downscaler input.png output.png -w 64 -h 64 -c 16
-
-# Quality preset
-smart-downscaler input.png output.png -w 64 -h 64 --preset quality
-
-# Custom configuration
-smart-downscaler input.png output.png \
-  --width 64 \
-  --height 64 \
-  --colors 24 \
-  --strategy saturation \
-  --segmentation hierarchy_fast \
-  --k-centroid 2 \
-  --k-centroid-iterations 2
-
-# Fast mode (no refinement)
-smart-downscaler input.png output.png -w 64 -h 64 \
-  --segmentation none \
-  --no-refinement
-
-# Extract palette only
-smart-downscaler input.png --extract-palette palette.hex -c 16
+smart-downscaler photo.jpg sprite.png -w 64 -c 16
+smart-downscaler art.png small.png -s 0.25 -q high --diagnostics --preview 8
 ```
 
-### CLI Options
+## How it works
 
-| Option | Short | Default | Description |
-|--------|-------|---------|-------------|
-| `--width` | `-w` | *required* | Target width |
-| `--height` | `-h` | *required* | Target height |
-| `--colors` | `-c` | `16` | Palette size |
-| `--strategy` | `-s` | `oklab` | Palette strategy |
-| `--segmentation` | | `hierarchy_fast` | Segmentation method |
-| `--k-centroid` | | `1` | Tile color mode (1=avg, 2=dominant, 3=foremost, 4=salient) |
-| `--k-centroid-iterations` | | `0` | Tile refinement |
-| `--no-refinement` | | false | Disable two-pass |
-| `--preset` | `-p` | | Use preset (fast/quality/vibrant) |
-| `--extract-palette` | | | Output palette only |
+Classic pipelines average each tile, extract a palette from the averages and snap pixels to
+it. Averaging blurs edges, deletes thin features and washes colours out before the palette is
+even built; later sharpening or saturation filters then amplify the damage. PAX never averages
+across structures in the first place, and it measures what it loses.
 
----
+| Stage | What happens |
+|---|---|
+| **01 Source analysis** | Resolution cap, alpha classification, colour statistics. The image is converted once to the working space (Oklab with a perceptual lightness toe) with deterministic arithmetic. |
+| **02 Structural analysis** | Per pixel: edge strength and a *transition score* that tells anti-aliasing and blur pixels (a blend of their neighbours) from real colours, plus the image's noise floor. |
+| **03 Adaptive K-Centroid extraction** | Every output pixel owns an exact fractional source footprint. Its samples are clustered into 1–6 colour candidates — as many as the footprint really contains — with deterministic seeding and a perceptual distance; blend pixels are discounted, so candidates are pure colours. The footprint then picks the candidate with the highest *importance* (area × saliency × chroma × feature evidence), not simply the largest. Thin features are kept one pixel wide, never doubled; one-pixel gaps in contours are closed. |
+| **04 Global palette construction** | The palette is built from the selected colours, weighted by perceptual importance. Colours are grouped into *families* (ramps of one material); a tint is not allowed to be represented by a grey just because greys dominate the picture. Under-served colours get their own entry when that gains more than it costs. |
+| **05 Automatic colour compensation (APC)** | Chroma, contrast and lightness-distribution losses are measured per palette entry and restored by moving palette entries — hue preserved, gamut mapped, highlights and shadows protected, bounded per entry. A joint objective decides how much; nothing is done without evidence. |
+| **06 Pixel reconstruction** | Every output pixel is assigned a palette entry: nearest match, then an edge-aware coherence pass that never smooths across boundaries and never moves a pixel to a visibly different colour. |
+| **07 Artifact validation (AAS)** | Isolated pixels that have no source evidence are repaired, intentional ones are kept; structure and colour error are measured and reported. |
 
-## License
+The complete description, with every formula and constant, is in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-MIT License
+## Quality modes
 
----
+| | `fast` | `balanced` (default) | `high` | `maximum` |
+|---|---|---|---|---|
+| Use for | previews, live sliders | general use | exports | offline, hardest inputs |
+| Candidates per footprint (max) | 2 | 3 | 4 | 6 |
+| Transition (anti-aliasing) analysis | off | on | on | on |
+| Footprint samples (max) | 256 | 1 024 | 4 096 | all |
+| Clustering passes | 1 | 1 | 2 | 2 |
+| Neighbourhood saliency | basic | full | full | full |
+| Contour bridging | off | on | on | on |
+| Palette optimisation iterations | 1 | 2 | 4 | 8 |
+| Palette split–merge | off | off | on | on |
+| Assignment refinement passes | 1 | 2 | 3 | until stable (≤ 12) |
+| Isolated-pixel validation | single pixels | single pixels | pairs | pairs |
+| Working resolution cap | 1.0 MP | 1.6 MP | 2.0 MP | 4.0 MP |
+| Colour preprocess threshold | 8 192 | 16 384 | 32 768 | 32 768 |
 
-## Credits
+`DownscaleConfig::fast()/balanced()/high()/maximum()` (Rust), `WasmDownscaleConfig.fast()` …
+(bindings), `{ quality: 'high' }` (wrapper), `-q high` (CLI).
 
-- **Oklab color space** by Björn Ottosson
-- **SLIC superpixels** algorithm
-- **K-Means++** initialization
-- **VTracer** hierarchical clustering approach
+## Configuration reference
 
----
+`DownscaleConfig` (Rust) ↔ `WasmDownscaleConfig` properties (bindings) ↔ wrapper options.
+Every field has a default; `..Default::default()` keeps 0.x code compiling.
 
-## Links
+### General
 
-- [GitHub Repository](https://github.com/user/smart-downscaler)
-- [npm Package](https://www.npmjs.com/package/smart-downscaler)
-- [Crates.io](https://crates.io/crates/smart-downscaler)
-- [API Documentation](https://docs.rs/smart-downscaler)
+| Rust | Bindings / wrapper | Default | Meaning |
+|---|---|---|---|
+| `engine` | `engine` / `engine` | `Pax` | `Pax` or `Legacy` (the 0.x pipeline) |
+| `quality_mode` | `quality_mode` / `quality` | `Balanced` | See [Quality modes](#quality-modes) |
+| `palette_size` | `palette_size` / `paletteSize` | 16 | Colours, 1–256 |
+| `palette_strategy` | `palette_strategy` / `paletteStrategy` | `OklabMedianCut` | How the palette is first cut: `oklab`, `saturation`, `medoid` (exact source colours), `kmeans`, `legacy`, `bitmask` |
+| `kmeans_iterations` | `kmeans_iterations` / `kmeansIterations` | 5 | Palette refinement iterations |
+| `max_resolution_mp` | `max_resolution_mp` / `maxResolutionMp` | 1.6 | Sources above this many megapixels are area-reduced first (0 = never) |
+| `max_color_preprocess` | `max_color_preprocess` / `maxColorPreprocess` | 16 384 | Sources with more distinct colours are reduced to ≤ 32 768 first (0 = never) |
+| `edge_weight` | `edge_weight` / `edgeWeight` | 0.5 | Structural analysis: 0 = lightness edges only, 1 = colour edges only |
+| `segmentation` | `segmentation_method` (+ `slic_*`, `hierarchy_*`) / `segmentation` | `None` | Optional source segmentation; when present, palette smoothing does not cross segment borders |
+| `color_rarity` | `color_rarity` / `colorRarity` | 0 | 0–1: flatten the area weighting so rare colours pull harder |
+| `detail_boost` | `detail_boost` / `detailBoost` | 0 | 0–1: extra palette weight for colours on edges |
+| `reserve_colors` | `reserve_colors` / `reserveColors` | 0 | Minimum number of slots given to distinct, under-served colours (reservation is automatic; this forces a floor) |
+| `skin_protection` | `skin_protection` / `skinProtection` | 0 | 0–1: treat skin tones as a class of their own (extra weight, no mixing with non-skin entries) |
+
+### Adaptive K-Centroid — `centroid: CentroidConfig`
+
+| Rust | Bindings / wrapper | Default | Meaning |
+|---|---|---|---|
+| `max_centroids` | `max_centroids` / `maxCentroids` | 0 | Upper bound on candidates per footprint, 1–6; 0 = from the quality mode |
+| `min_centroids` | `min_centroids` / `minCentroids` | 1 | Used when `adaptive` is off |
+| `adaptive` | `adaptive_centroids` / `adaptiveCentroids` | true | Choose the count from the footprint's content (uniform → 1, boundary → 2, …) |
+| `deterministic` | `deterministic` | true | false = reference-style pseudo-random seeding (still reproducible: fixed seed) |
+| `edge_weight` | `centroid_edge_weight` / `centroidEdgeWeight` | 0.85 | How strongly blend (anti-aliasing) pixels are discounted when clustering |
+| `saliency_weight` | `saliency_weight` / `saliencyWeight` | 1.0 | Exponent of local saliency in the importance |
+| `chroma_weight` | `chroma_weight` / `chromaWeight` | 0.5 | Exponent of chroma in the importance |
+| `metric` | — | see below | `PerceptualMetric { w_l: 1, w_c: 6, w_h: 6, k_c: 12, k_h: 5, w_e: 0.008 }` |
+
+### Colour compensation — `compensation: CompensationConfig`
+
+| Rust | Bindings / wrapper | Default | Meaning |
+|---|---|---|---|
+| `automatic` | `auto_compensation` / `autoCompensation` | true | Master switch for the `Automatic` modes |
+| `chroma` | `chroma_compensation` / `chromaCompensation` | `Automatic` | `Off`, `Automatic`, `Manual(gain)`. Bindings: negative = auto, 0 = off, > 0 = gain. Wrapper: `'auto'`, `'off'`, number |
+| `contrast` | `contrast_compensation` / `contrastCompensation` | `Automatic` | as above |
+| `luminosity` | `luminosity_compensation` / `luminosityCompensation` | `Automatic` | as above (lightness distribution: shadows, mid-tones, highlights) |
+| `strength` | `compensation_strength` / `compensationStrength` | 1.0 | Scales all three, 0–2 |
+| `preserve_hue` | `preserve_hue` / `preserveHue` | true | Chroma changes move along the entry's own hue |
+| `preserve_highlights`, `preserve_shadows` | same / `preserveHighlights`, `preserveShadows` | true | Soft limits at the source's own extremes |
+| `local_adaptation` | `local_adaptation` / `localAdaptation` | true | Use edge-contrast evidence and the reduction ratio when deciding the amount |
+| `gamut_mapping` | `gamut_mapping` / `gamutMapping` | `Perceptual` | `Perceptual` keeps hue and lightness and reduces chroma; `Clip` clamps channels |
+| `color_preservation` | `color_preservation` / `colorPreservation` | `High` | Maximum move of a palette entry: `High` 0.05, `Medium` 0.08, `Low` 0.12 (working-space units) |
+
+`CompensationConfig::off()` disables everything. Compensation is not applied to caller-supplied
+palettes or in exact-colour mode.
+
+### Structure — `structure: StructureConfig`
+
+| Rust | Bindings / wrapper | Default | Meaning |
+|---|---|---|---|
+| `edge_preservation` | `edge_preservation` / `edgePreservation` | 0.8 | 1 = always the pure winning colour; lower values blend footprints toward their true mixture |
+| `thin_feature_preservation` | `thin_feature_preservation` / `thinFeaturePreservation` | 0.6 | How much a coherent small cluster (line, dot, outline) can outweigh a larger one |
+| `contour_preservation` | `contour_preservation` / `contourPreservation` | 0.7 | Willingness to close one-pixel gaps in thin contours |
+| `spatial_coherence` | `spatial_coherence` / `spatialCoherence` | 0.5 | Edge-aware smoothing of palette assignments (0 = nearest colour only) |
+
+### Artifact avoidance — `artifacts: ArtifactConfig`
+
+| Rust | Bindings / wrapper | Default | Meaning |
+|---|---|---|---|
+| `validate` | `validate` | true | Isolated-pixel validation and the structure measurements |
+| `prevent_color_bleeding` | `prevent_color_bleeding` / `preventColorBleeding` | true | Smoothing may only move a pixel to a near-equivalent colour |
+| `prevent_halos` | `prevent_halos` / `preventHalos` | true | Back off contrast compensation that would overshoot across edges |
+| `preserve_alpha` | `preserve_alpha` / `preserveAlpha` | true | Honour source transparency (false = 0.x behaviour) |
+| `alpha_mode` | `alpha_mode` / `alphaMode` | `Auto` | `Auto`: binary output for hard-edged sources, partial otherwise; `Binary`; `Preserve` |
+| `alpha_threshold` | `alpha_threshold` / `alphaThreshold` | 0.5 | Coverage needed for an output pixel to be visible |
+
+### Legacy engine only
+
+`neighbor_weight`, `region_weight`, `two_pass_refinement`, `refinement_iterations`, `k_centroid`
+(1 average, 2 dominant, 3 foremost), `k_centroid_iterations`, `chroma_recovery`. PAX ignores
+them: its footprint clustering, coherence pass and compensation replace them.
+
+## Diagnostics
+
+`DownscaleResult::diagnostics` (`result.diagnostics` in JS; `--diagnostics` on the CLI) reports
+what the pipeline measured. Colour quantities are in working-space units, comparable to ΔE in
+Oklab: about 0.02 is one just-noticeable difference.
+
+| Field | Meaning |
+|---|---|
+| `source_colorfulness`, `output_colorfulness` | Mean chroma of source and output |
+| `source_contrast`, `output_contrast` | Standard deviation of lightness |
+| `source_lightness`, `output_lightness` | Mean lightness |
+| `chroma_loss`, `contrast_loss`, `luminosity_drift` | What the uncompensated palette had lost |
+| `chroma_recovered`, `contrast_recovered`, `luminosity_recovered` | Share of that loss restored, 0–1 |
+| `structural_error` | Edge disagreement between source and output at output resolution, 0 (best) – 1 |
+| `edge_retention` | Share of the source's edge evidence present in the output |
+| `color_error` | RMS distance between the colour each pixel was meant to show and the colour it got |
+| `hue_shift_deg` | Mean hue rotation caused by compensation |
+| `objective_before`, `objective_after`, `optimization_iterations` | The joint objective around compensation |
+| `palette_used`, `mean_candidates`, `noise_floor` | Palette entries in use, candidates per footprint, estimated source noise |
+| `artifacts` | `features_kept`, `features_thinned`, `contour_gaps_bridged`, `coherence_flips`, `isolated_examined/removed/kept`, `bleeding_prevented`, `halo_edges`, `drift_limited_entries`, `gamut_limited_entries` |
+
+## API reference
+
+### Rust
+
+| Function | Purpose |
+|---|---|
+| `smart_downscale(&[Rgb], w, h, tw, th, &cfg)` | Opaque input |
+| `smart_downscale_rgba(&[u8], w, h, tw, th, &cfg)` | RGBA input (straight alpha) |
+| `smart_downscale_with_palette`, `smart_downscale_rgba_with_palette` | Fixed palette, used verbatim |
+| `prepare_image`, `prepare_image_rgba` → `PreparedImage` | Size-independent work, done once |
+| `smart_downscale_prepared`, `smart_downscale_prepared_with_palette` | Any number of sizes / palettes from a prepared image |
+| `try_smart_downscale`, `try_smart_downscale_rgba` | `Result<_, DownscaleError>` instead of panics |
+| `downscale(&RgbImage, …)`, `downscale_rgba(&RgbaImage, …)` | `image` crate convenience (`native`) |
+| `palette::extract_palette*` | Palette extraction without downscaling (0.x API) |
+
+`DownscaleResult { width, height, pixels, palette, palette_indices, segmentation, alpha,
+diagnostics }` with `to_image()`, `to_rgba_image()`, `to_rgba_bytes()`, `to_rgb_bytes()`,
+`colors_used()`, `digest()`. `smart_downscaler::synth` holds the procedural test charts.
+
+### WebAssembly bindings
+
+Unchanged from 0.x: `downscale`, `downscale_rgba`, `downscale_simple`, `downscale_with_palette`,
+`prepare`, `prepare_rgba`, `downscale_prepared`, `downscale_prepared_with_palette`,
+`extract_palette_from_image`, `quantize_to_palette`, `analyze_colors`, `get_palette_strategies`,
+`rgb_to_oklab`, `oklab_to_rgb`, `get_chroma`, `get_lightness`, `color_distance`, `version`,
+`log`, and the classes `WasmDownscaleConfig`, `WasmDownscaleResult`, `WasmPreparedImage`,
+`ColorEntry`, `ColorAnalysisResult`.
+
+New in 1.0: `get_quality_modes()`, `get_engines()`, `test_chart(name, w, h)`;
+`WasmDownscaleConfig.balanced()/high()/maximum()/legacy()`, `.clone()` and the properties in
+the tables above; `WasmDownscaleResult.alpha`, `.has_alpha`, `.colors_used`, `.diagnostics`,
+`.digest`; `WasmPreparedImage.source_width`, `.source_height`, `.resolution_capped`,
+`.has_alpha`. Invalid input now throws an `Error` with a message instead of trapping.
+
+### JavaScript wrapper (`smart-downscaler.js`)
+
+`init`, `isReady`, `downscale`, `downscaleSimple`, `downscalePreset`, `downscaleWithPalette`,
+`prepare`, `extractPalette`, `quantize`, `analyzeColors`, `createConfig`, `version`,
+`getPaletteStrategies`, `getQualityModes`, `getEngines`, `getPresets`, `getPresetPalette`
+(`gameboy`, `nes`, `cga`, `pico8`, `commodore64`, `apple2`), `getPresetPaletteNames`,
+`rgbToOklab`, `oklabToRgb`, `getChroma`, `getLightness`, `colorDistance`, `testChart`.
+Sources may be `ImageData`, any `{data, width, height}`, canvases, `OffscreenCanvas`, images,
+`ImageBitmap` or video elements. Typings: `smart-downscaler.d.ts`.
+
+### Presets
+
+| Preset | What it is |
+|---|---|
+| `fast`, `balanced`, `high`, `maximum` | The quality modes |
+| `quality` | `high` with 32 colours and 10 palette iterations |
+| `vibrant` | 24 colours, saturation-weighted cut, chroma gain 1.35, `Medium` colour preservation |
+| `exact_colors` | Medoid palette: every output colour exists in the source; no compensation, no colour preprocessing |
+| `legacy` | The 0.x pipeline with its 0.x defaults (hierarchical segmentation, averaged tiles) |
+
+## Recipes
+
+**Faces and portraits.** The defaults already keep skin apart from neutral backgrounds (colour
+families). For the last bit: `high` quality and, if the palette is very small, `skin_protection: 0.5`.
+
+**A sprite that was exported too large.** Downscale back to its logical size: flat-colour
+footprints are recovered exactly (see `upscaled_pixel_art_is_recovered_exactly` in the tests).
+Use `exact_colors()` if no colour may change at all.
+
+**A fixed palette (PICO-8, NES, your own).** `smart_downscale_with_palette` /
+`sd.downscaleWithPalette(img, w, h, sd.getPresetPalette('pico8'))` /
+`--use-palette pico8.png`. Structure extraction and assignment still apply; the palette is not touched.
+
+**Transparency.** Pass RGBA. Fully transparent pixels never influence colour (whatever their
+RGB), hard-edged sprites get hard-edged output, soft sources keep partial alpha.
+`alpha_mode: Binary` forces a hard edge; `preserve_alpha: false` ignores alpha.
+
+**Punchier output.** `vibrant()`, or `compensation.chroma = Manual(1.3)`. Prefer this to
+filtering the result afterwards: compensation works per palette entry, respects gamut and hue,
+and cannot create halos.
+
+**Previews at many sizes.** `prepare_image` once (more than half the cost of a call), then
+`smart_downscale_prepared` per size or palette.
+
+## Performance
+
+Best of several runs, complete call (prepare + downscale) to 64 px wide and 16 colours, on a
+2-core x86-64 VM (Rust 1.97, `--release`; WebAssembly in Node 22). Reproduce with
+`cargo run --release --example bench_compare` and `cargo bench`.
+
+| Source | Configuration | Native ms | WASM ms |
+|---|---|---:|---:|
+| 512 × 512 | 0.x, no segmentation (`fast()` of 0.x) | 8.2 | 12.3 |
+| | 0.x, `hierarchy_fast` (0.x WASM default) | 57.8 | 55.4 |
+| | 0.x, `hierarchy` (0.x Rust default) | 2 336 | — |
+| | **PAX fast** | 17.1 | 33.6 |
+| | **PAX balanced (default)** | 21.7 | 38.6 |
+| | **PAX high** | 24.2 | 45.1 |
+| | **PAX maximum** | 31.8 | 56.6 |
+| 1024 × 1024 | 0.x, no segmentation | 32.4 | 44.8 |
+| | 0.x, `hierarchy_fast` | 252 | 252 |
+| | **PAX fast / balanced / high / maximum** | 55 / 72 / 64 / 74 | 98 / 131 / 138 / 137 |
+| 1280 × 720 | 0.x, no segmentation | 25.9 | 38.7 |
+| | 0.x, `hierarchy_fast` | 204 | 204 |
+| | **PAX fast / balanced / high / maximum** | 41 / 46 / 53 / 51 | 57 / 75 / 78 / 83 |
+
+Reading the table:
+
+- Against the **defaults of 0.x** (both use a segmentation), the 1.0 default is 2.7–4.4× faster
+  natively and 1.4–2.7× faster in WebAssembly — and about 100× faster than the 0.x Rust
+  default.
+- Against the **cheapest 0.x configuration** (no segmentation, averaged tiles), PAX balanced is
+  about 1.8–2.7× slower natively and about 2–3× slower in WebAssembly. That configuration does
+  none of the structural work; it remains available as `Engine::Legacy` with
+  `SegmentationMethod::None`.
+- 55–75 % of a PAX call is `prepare` (conversion and structural analysis, ≈ 35–45 ns per source
+  pixel). A second size or palette from a `PreparedImage` costs roughly 5–35 ms at these sizes.
+- Above the resolution cap the source is reduced first, so cost stops growing with source size.
+
+Implementation notes: contiguous buffers; 8-byte working pixels; conversion memoised by exact
+colour; per-thread scratch reused across footprints (no per-footprint heap allocation, no hash
+maps in clustering loops); fixed-size candidate arrays; precomputed footprint spans; footprint
+rows extracted in parallel and concatenated in row order.
+
+## Determinism
+
+Output is a pure function of the input and the configuration. Decision paths use no platform
+math (`cbrt`, `pow`, `atan2` are computed with fixed arithmetic), no random numbers and no
+hash-order-dependent iteration, and parallel work is reduced in a fixed order. As a result:
+
+- repeated runs, single- and multi-threaded builds, and **native and WebAssembly builds
+  produce bit-identical results** (`DownscaleResult::digest()` / `result.digest`);
+- `cargo run --release --example digest` and `node scripts/check-wasm.mjs` print and compare
+  the digests of every preset on every built-in chart (combined digest of 1.0.0:
+  `9e38d13c08509990`).
+
+The legacy engine is deterministic as well in 1.0 (0.6 native builds were not: palette
+extraction depended on hash-map iteration order).
+
+## Testing
+
+```bash
+cargo test --release                       # 168 unit tests, 24 release gates, doc tests
+cargo run --release --example regression   # measurements + contact sheets in regression-out/
+cargo run --release --example digest       # determinism table
+cargo bench                                # criterion benchmarks
+```
+
+`tests/release_gates.rs` encodes the acceptance criteria on procedural charts with known
+content: determinism; exact recovery of enlarged pixel art; compensation never increasing
+chroma / contrast / lightness drift; crisper edges and more accurate structure than the legacy
+engine; thin-line retention without invented features; checkerboards and gradients; alpha
+correctness (no colour contamination, no fringes, hard edges stay hard); all aspect ratios,
+extreme and non-integer reductions, tiny palettes and degenerate inputs; fixed and exact-colour
+palettes; 0.x configuration compatibility.
+
+## Migrating from 0.x
+
+Nothing has to change to compile: all 0.x functions, fields, bindings and CLI flags are still
+there. What behaves differently by default:
+
+| | 0.x | 1.0 | To get the old behaviour |
+|---|---|---|---|
+| Pipeline | averaged tiles + neighbour refinement | PAX | `engine: Engine::Legacy`, `DownscaleConfig::legacy()`, `WasmDownscaleConfig.legacy()`, `--engine legacy` |
+| Default segmentation | `Hierarchy` (Rust), `hierarchy_fast` (WASM) | `None` | set `segmentation` explicitly |
+| Alpha | ignored | honoured | `artifacts.preserve_alpha = false` / `--alpha ignore` |
+| `k_centroid`, `neighbor_weight`, `region_weight`, `two_pass_refinement`, `refinement_iterations`, `chroma_recovery` | used | used by the legacy engine only | select the legacy engine |
+| Unknown strategy / segmentation names in the bindings | silently replaced by a default | throw | — |
+| CLI `-w` alone | height stayed a quarter of the source | aspect ratio kept | pass `-h` too |
+| Colour rounding | truncating | rounding | — |
+| `DownscaleResult` | 6 fields | + `alpha`, `diagnostics` | add `..` when destructuring |
+
+Fixes that apply to both engines: deterministic palette extraction, RGBA handling in
+`quantize_to_palette` / `extract_palette_from_image`, a compiling benchmark, wrapper functions
+that the typings declared but the module did not export, and the wrapper's import path.
+
+## Known limitations
+
+- **"Artifact-free" is a design goal, not a guarantee.** The validation stage removes or
+  prevents the artifact classes listed in the architecture document and reports what it did;
+  a 16-colour image of a photograph still bands in smooth gradients.
+- **Regular patterns near the sampling limit** (a 3-pixel checkerboard reduced 4×) cannot be
+  represented; the result is a regular pattern rather than blotches, but its mean brightness
+  can be off.
+- **Small palettes on busy photographs** force choices. Families and reservation decide in
+  favour of distinct colours over extra shades; raise `palette_size` if a ramp looks coarse.
+- **Colour families use a fixed separation threshold.** Two materials whose chromaticities are
+  closer than about one just-noticeable difference are treated as one family.
+- **`prepare` is single-threaded**; only footprint extraction is parallel.
+- **No dithering.** Output is flat indexed colour by design.
+- The demo page was syntax-checked and its code paths were exercised in Node, not in a browser.
+
+## CLI
+
+```text
+smart-downscaler [OPTIONS] <INPUT> <OUTPUT>
+
+  -w, --width <PX>   -h, --height <PX>   -s, --scale <FACTOR>     size (default: a quarter of the source)
+  -c, --colors <N>   (alias -p, --palette)                         palette size, default 16
+      --palette-strategy <oklab|saturation|medoid|kmeans|legacy|bitmask>
+      --use-palette <image | "hex,hex,…">     --save-palette <FILE>
+      --reserve-colors <N>   --color-rarity <0..1>   --skin-protection <0..1>
+  -q, --quality <fast|balanced|high|maximum>   --preset <NAME>   --engine <pax|legacy>   --max-mp <MP>
+      --chroma|--contrast|--luminosity <auto|off|GAIN>   --strength <0..2>
+      --color-preservation <low|medium|high>   --no-compensation
+      --edge-preservation|--thin-features|--contours|--coherence <0..1>   --no-validation
+      --alpha <auto|binary|preserve|ignore>   --alpha-threshold <0..1>
+      --preview <N>   --diagnostics   --quiet   -V, --version   --help
+  legacy engine: -n, --neighbor-weight  -r, --region-weight  --no-refinement
+                 --segmentation <none|slic|hierarchy|hierarchy-fast>  --k-centroid  --k-centroid-iterations
+```
+
+Options are applied in order, so `--preset high -c 8 --chroma 1.2` refines a preset.
+
+## License and credits
+
+MIT — see [LICENSE](LICENSE).
+
+- Oklab and its lightness estimate `Lr` by Björn Ottosson.
+- The K-Centroid idea (per-tile clustering, pick a cluster) from Astropulse's K-Centroid
+  scaler for Aseprite; 1.0 generalises it to fractional footprints, adaptive counts,
+  perceptual distances and importance-based selection.
+- SLIC superpixels (Achanta et al.) and VTracer-style hierarchical clustering for the optional
+  segmentations.
+
+Repository: <https://github.com/pixagram-blockchain/smart-downscaler>

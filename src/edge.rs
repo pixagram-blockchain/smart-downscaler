@@ -1,14 +1,11 @@
-//! Edge detection for boundary-aware processing.
+//! Stand-alone edge detectors (Sobel / Scharr / colour gradient).
 //!
-//! # v0.4 Changes
-//! - All Rgb field access via methods (packed u32)
+//! These are utility functions for callers and for the benchmarks. The PAX engine does its own
+//! structural analysis in the working space ([`crate::analysis::structural`]), which also
+//! distinguishes pure pixels from blends — something a gradient magnitude cannot do.
 
 use crate::color::Rgb;
 use crate::fast::{fast_luminance, fast_magnitude};
-
-#[cfg(feature = "parallel")]
-#[allow(unused_imports)]
-use rayon::prelude::*;
 
 /// Edge map storing gradient magnitudes (f32)
 #[derive(Clone, Debug)]
