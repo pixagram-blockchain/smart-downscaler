@@ -29,6 +29,7 @@ use crate::centroid::reconstruction::{flags, Reconstruction};
 use crate::color::{ColorAux, PerceptualMetric};
 use crate::math::linstep;
 use crate::palette::families::ClassPenalty;
+use crate::palette::merging::LightnessIndex;
 
 /// Palette entries with the per-entry metric terms pre-computed.
 #[derive(Clone, Debug, Default)]
@@ -118,32 +119,19 @@ pub fn nearest(
         return out;
     }
     let classes = pix_class.filter(|_| !p.class_penalty.is_none() && pal.class.len() == k);
+    // Exhaustive in effect, not in cost: see `LightnessIndex`.
+    let (index, pen) = match classes {
+        Some(_) => (LightnessIndex::new(&pal.lab, Some(&pal.class), &p.metric), p.class_penalty),
+        None => (LightnessIndex::new(&pal.lab, None, &p.metric), ClassPenalty::NONE),
+    };
     for j in 0..n {
         if rec.flags[j] & flags::TRANSPARENT != 0 {
             continue;
         }
         let t = rec.target[j];
         let ta = p.metric.aux(t);
-        let (mut b1, mut d1, mut b2, mut d2) = (0usize, f32::MAX, 0usize, f32::MAX);
-        for i in 0..k {
-            let mut d = pal.dist2(&p.metric, t, ta, i);
-            if let Some(pc) = classes {
-                d *= p.class_penalty.factor(pc[j], pal.class[i]);
-            }
-            if d < d1 {
-                b2 = b1;
-                d2 = d1;
-                b1 = i;
-                d1 = d;
-            } else if d < d2 {
-                b2 = i;
-                d2 = d;
-            }
-        }
-        if k == 1 {
-            b2 = b1;
-        }
-        let _ = d2;
+        let class = classes.map(|pc| pc[j]).unwrap_or(0);
+        let (b1, d1, b2, _d2) = index.nearest2(&p.metric, t, ta, class, pen);
         out.idx[j] = b1 as u8;
         out.dist[j] = d1;
         out.best[j] = b1 as u8;
@@ -193,18 +181,51 @@ pub fn coherence(
         (-1, -1, 0.7), (1, -1, 0.7), (-1, 1, 0.7), (1, 1, 0.7),
     ];
 
+    // Metric terms of every target, computed once (the affinity loop compares each pixel with
+    // its eight neighbours).
+    let taux: Vec<ColorAux> = rec.target.iter().map(|t| p.metric.aux(*t)).collect();
+    // A pixel's decision depends only on its own label and its neighbours' labels, and
+    // re-evaluating it with both unchanged cannot change it. So after the first sweep only the
+    // neighbourhoods of pixels that flipped are looked at again: later sweeps cost what they
+    // change, and the result is the one a full re-scan would give.
+    let mut dirty = vec![true; n];
+
     for sweep in 0..max_sweeps {
         let mut flips = 0u32;
         // Alternate sweep direction so no corner of the image is systematically favoured.
         let reverse = sweep % 2 == 1;
         for step in 0..n {
             let j = if reverse { n - 1 - step } else { step };
+            if !dirty[j] {
+                continue;
+            }
+            dirty[j] = false;
             if rec.flags[j] & flags::TRANSPARENT != 0 {
                 continue;
             }
             let (x, y) = ((j % w) as i32, (j / w) as i32);
+            // Interior of a flat area: the pixel has its best entry and every neighbour agrees.
+            // No candidate can beat it (the only other one, the runner-up, has no support and a
+            // larger distance), so skip the affinity computation altogether.
+            if asg.idx[j] == asg.best[j] {
+                let c = asg.idx[j];
+                let mut unanimous = true;
+                for &(dx, dy, _) in &OFFS {
+                    let (qx, qy) = (x + dx, y + dy);
+                    if qx < 0 || qy < 0 || qx as usize >= w || qy as usize >= h {
+                        continue;
+                    }
+                    if asg.idx[qy as usize * w + qx as usize] != c {
+                        unanimous = false;
+                        break;
+                    }
+                }
+                if unanimous {
+                    continue;
+                }
+            }
             let t = rec.target[j];
-            let ta = p.metric.aux(t);
+            let ta = taux[j];
 
             // Neighbour labels with their affinities.
             let mut lab = [0u8; 8];
@@ -224,7 +245,7 @@ pub fn coherence(
                         continue;
                     }
                 }
-                let d = p.metric.distance2(t, rec.target[q]).sqrt();
+                let d = p.metric.dist2(t, ta, rec.target[q], taux[q]).sqrt();
                 let a = wgt * (1.0 - linstep(p.tau_affinity, 2.5 * p.tau_affinity, d));
                 if a > 0.0 {
                     lab[m] = asg.idx[q];
@@ -297,6 +318,13 @@ pub fn coherence(
                 asg.idx[j] = best_i;
                 asg.dist[j] = best_d;
                 flips += 1;
+                // The neighbours' situation changed: they are evaluated again.
+                for &(dx, dy, _) in &OFFS {
+                    let (qx, qy) = (x + dx, y + dy);
+                    if qx >= 0 && qy >= 0 && (qx as usize) < w && (qy as usize) < h {
+                        dirty[qy as usize * w + qx as usize] = true;
+                    }
+                }
             }
         }
         stats.flips += flips;

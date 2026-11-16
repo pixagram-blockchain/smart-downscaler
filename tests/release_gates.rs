@@ -264,11 +264,13 @@ fn thin_features_are_kept_without_inventing_any() {
     assert!(recall > 0.55, "thin-line recall {recall}");
     assert!(false_pos < 0.02, "features invented on empty ground: {false_pos}");
 
-    // No regression against the 0.x salient mode (k_centroid = 2).
-    let salient = DownscaleConfig { palette_size: 4, k_centroid: 2, k_centroid_iterations: 2, ..DownscaleConfig::legacy() };
-    let old = smart_downscale(&px, 256, 256, 64, 64, &salient);
-    let (old_recall, _) = line_score(&px, &mask, 256, 256, &old);
-    assert!(recall >= old_recall - 0.05, "recall {recall} vs legacy salient {old_recall}");
+    // The 0.x tile modes keep far fewer of these (dark, unsaturated) lines.
+    for k_centroid in [2usize, 4] {
+        let cfg = DownscaleConfig { palette_size: 4, k_centroid, k_centroid_iterations: 2, ..DownscaleConfig::legacy() };
+        let old = smart_downscale(&px, 256, 256, 64, 64, &cfg);
+        let (old_recall, _) = line_score(&px, &mask, 256, 256, &old);
+        assert!(recall >= old_recall, "recall {recall} vs legacy k_centroid={k_centroid} {old_recall}");
+    }
 
     // Lines must stay continuous: in the horizontal quadrant a kept line row is dark throughout.
     let fg = px[mask.iter().position(|&m| m).unwrap()];
@@ -283,6 +285,111 @@ fn thin_features_are_kept_without_inventing_any() {
         }
     }
     assert!(broken <= 2, "{broken} horizontal lines are broken");
+}
+
+/// Line statistics on the `thin_lines` chart reduced by an integer factor: coverage-weighted
+/// recall per quadrant (horizontal, vertical, "/" diagonal, "\" diagonal + dots), the ink
+/// ratio (share of output pixels drawn in the feature colour ÷ share of source pixels that are
+/// feature) and the number of horizontal / vertical lines drawn without a gap.
+struct LineStats {
+    recall: [f32; 4],
+    ink_ratio: f32,
+    continuous: u32,
+    lines: u32,
+}
+
+fn line_stats(px: &[Rgb], mask: &[bool], sw: usize, r: &DownscaleResult) -> LineStats {
+    let tw = r.width as usize;
+    let f = sw / tw;
+    let fg = px[mask.iter().position(|&m| m).unwrap()];
+    let bg = px[mask.iter().position(|&m| !m).unwrap()];
+    let on = |tx: usize, ty: usize| dist(r.pixels[ty * tw + tx], fg) < dist(r.pixels[ty * tw + tx], bg);
+    let half = tw / 2;
+    let (mut wsum, mut whit, mut ink) = ([0.0f32; 4], [0.0f32; 4], 0u32);
+    for ty in 0..tw {
+        for tx in 0..tw {
+            let mut cover = 0u32;
+            for y in ty * f..(ty + 1) * f {
+                for x in tx * f..(tx + 1) * f {
+                    cover += mask[y * sw + x] as u32;
+                }
+            }
+            let c = cover as f32 / (f * f) as f32;
+            let q = (tx >= half) as usize + 2 * (ty >= half) as usize;
+            wsum[q] += c;
+            if on(tx, ty) {
+                whit[q] += c;
+                ink += 1;
+            }
+        }
+    }
+    let true_share = mask.iter().filter(|&&m| m).count() as f32 / mask.len() as f32;
+    let (mut lines, mut continuous) = (0u32, 0u32);
+    for t in 0..half {
+        // horizontal quadrant: is output row `t` crossed by a line? (probe a source column)
+        if (t * f..(t + 1) * f).any(|y| mask[y * sw + 2 * f]) {
+            lines += 1;
+            continuous += (1..half - 1).all(|tx| on(tx, t)) as u32;
+        }
+        // vertical quadrant: output column `half + t`
+        if ((half + t) * f..(half + t + 1) * f).any(|x| mask[2 * f * sw + x]) {
+            lines += 1;
+            continuous += (1..half - 1).all(|ty| on(half + t, ty)) as u32;
+        }
+    }
+    LineStats {
+        recall: [whit[0] / wsum[0], whit[1] / wsum[1], whit[2] / wsum[2], whit[3] / wsum[3]],
+        ink_ratio: (ink as f32 / (tw * tw) as f32) / true_share,
+        continuous,
+        lines,
+    }
+}
+
+#[test]
+fn colourful_thin_features_hold_up_against_the_legacy_salient_mode() {
+    // The 0.x "salient" tile mode (k_centroid = 4) exists to keep colourful minorities — lips,
+    // eyes, makeup — that the dominant colour of a tile would erase. Same job, same chart:
+    // saturated lines on a muted ground, 1 to 3 source pixels wide, reduced 4×.
+    for (fg, bg) in [
+        (Rgb::new(196, 48, 60), Rgb::new(214, 178, 156)), // red on skin
+        (Rgb::new(40, 90, 200), Rgb::new(190, 182, 170)), // blue on warm grey
+    ] {
+        for thickness in [1usize, 2, 3] {
+            let (px, mask) = synth::thin_lines_with(256, 256, thickness, 16, fg, bg);
+            let salient = DownscaleConfig {
+                palette_size: 4, k_centroid: 4, k_centroid_iterations: 2,
+                segmentation: SegmentationMethod::None, ..DownscaleConfig::legacy()
+            };
+            let old = line_stats(&px, &mask, 256, &smart_downscale(&px, 256, 256, 64, 64, &salient));
+            for cfg in [DownscaleConfig::fast(), DownscaleConfig::balanced(), DownscaleConfig::high()] {
+                let mode = cfg.quality_mode;
+                let r = smart_downscale(&px, 256, 256, 64, 64, &DownscaleConfig { palette_size: 4, ..cfg });
+                let new = line_stats(&px, &mask, 256, &r);
+                let ctx = format!("{thickness}px {mode:?}: PAX {:?} ink {:.2} vs salient {:?} ink {:.2}", new.recall, new.ink_ratio, old.recall, old.ink_ratio);
+                // Every line the salient mode draws without a gap, PAX draws without a gap.
+                assert_eq!(new.lines, new.continuous, "{ctx}");
+                assert!(new.continuous >= old.continuous, "{ctx}");
+                // No orientation is lost (the salient mode loses one-pixel "/" diagonals).
+                // At three pixels the "/" lines of this chart straddle two output diagonals
+                // exactly (6 of 16 source pixels in each): a one-pixel-wide rendering has to
+                // pick one of them, which is half of the coverage by construction.
+                let min_recall = if thickness == 3 { 0.5 } else { 0.6 };
+                assert!(new.recall.iter().all(|&q| q > min_recall), "{ctx}");
+                // Nothing is invented on empty ground.
+                assert!(line_score(&px, &mask, 256, 256, &r).1 < 0.02, "{ctx}");
+                // Lines are never drawn thicker than the salient mode draws them. From two pixels
+                // up the salient mode paints diagonals two output pixels wide; PAX keeps them one
+                // pixel wide, so it covers fewer feature pixels there (by design) and more at one.
+                assert!(new.ink_ratio <= old.ink_ratio * if thickness == 1 { 1.4 } else { 1.0 }, "{ctx}");
+                let total = |s: &LineStats| s.recall.iter().sum::<f32>() / 4.0;
+                if thickness == 1 {
+                    assert!(total(&new) > total(&old), "{ctx}");
+                } else {
+                    assert!(total(&new) > 0.75, "{ctx}");
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -487,6 +594,34 @@ fn exact_colour_mode_only_uses_source_colours() {
         assert!(source.binary_search(c).is_ok(), "{c:?} is not a source colour");
     }
     check_well_formed(&r, 32, 32, 12);
+}
+
+#[test]
+fn exact_colour_mode_holds_when_the_source_is_capped_or_colour_rich() {
+    // Selecting the medoid strategy alone (not the preset) on a source that exceeds the
+    // resolution cap and the colour-preprocess threshold: neither step may invent a colour.
+    let (w, h) = (640usize, 480usize);
+    let px = synth::portrait(w, h);
+    let mut source: Vec<Rgb> = px.clone();
+    source.sort_unstable();
+    source.dedup();
+    assert!(source.len() > 256);
+    for base in [DownscaleConfig::fast(), DownscaleConfig::balanced(), DownscaleConfig::high()] {
+        let cfg = DownscaleConfig {
+            palette_strategy: PaletteStrategy::Medoid,
+            palette_size: 24,
+            max_resolution_mp: 0.1,
+            max_color_preprocess: 256,
+            ..base
+        };
+        let prepared = prepare_image(&px, w, h, &cfg);
+        assert!(prepared.resolution_capped && !prepared.colors_reduced);
+        for r in [smart_downscale(&px, w, h, 80, 60, &cfg), smart_downscale_prepared(&prepared, 64, 48, &cfg)] {
+            for c in &r.palette.colors {
+                assert!(source.binary_search(c).is_ok(), "{:?}: {c:?} is not a source colour", cfg.quality_mode);
+            }
+        }
+    }
 }
 
 #[test]

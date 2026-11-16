@@ -10,12 +10,14 @@ contrast instead of averaging them away.
 *Left to right: source, the 0.x pipeline with its defaults, and 1.0 in `fast`, `balanced` and
 `high` quality. Every row is produced by `cargo run --release --example regression`.*
 
-**Version 1.0.0** replaces the 0.x pipeline with **PAX — Perceptual Adaptive eXtraction**
+**Version 1.0** replaces the 0.x pipeline with **PAX — Perceptual Adaptive eXtraction**
 (adaptive K-Centroid sampling, a palette built from what the sampling selected, automatic
 colour compensation and artifact validation). The 0.x pipeline is still included
 (`Engine::Legacy`) and every 0.x API keeps working. See [What changed](#migrating-from-0x)
 and [CHANGELOG.md](CHANGELOG.md); the design is documented in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The current release is 1.0.1: the palette stages
+are 1.4–2.2× faster on large outputs with identical results, and `fast` now bridges contour
+gaps like the other modes.
 
 ## Contents
 
@@ -34,6 +36,7 @@ and [CHANGELOG.md](CHANGELOG.md); the design is documented in
 smart-downscaler = "1.0"                                                        # library + CLI, multi-threaded
 smart-downscaler = { version = "1.0", default-features = false }                # no image I/O, no rayon, no dependencies beyond ordered-float
 smart-downscaler = { version = "1.0", default-features = false, features = ["parallel"] }
+smart-downscaler = { git = "https://github.com/pixagram-blockchain/smart-downscaler" }  # straight from the repository
 ```
 
 | Feature | Default | Adds |
@@ -139,7 +142,6 @@ The complete description, with every formula and constant, is in
 | Footprint samples (max) | 256 | 1 024 | 4 096 | all |
 | Clustering passes | 1 | 1 | 2 | 2 |
 | Neighbourhood saliency | basic | full | full | full |
-| Contour bridging | off | on | on | on |
 | Palette optimisation iterations | 1 | 2 | 4 | 8 |
 | Palette split–merge | off | off | on | on |
 | Assignment refinement passes | 1 | 2 | 3 | until stable (≤ 12) |
@@ -227,7 +229,7 @@ palettes or in exact-colour mode.
 ### Legacy engine only
 
 `neighbor_weight`, `region_weight`, `two_pass_refinement`, `refinement_iterations`, `k_centroid`
-(1 average, 2 dominant, 3 foremost), `k_centroid_iterations`, `chroma_recovery`. PAX ignores
+(1 average, 2 dominant, 3 foremost, 4 salient), `k_centroid_iterations`, `chroma_recovery`. PAX ignores
 them: its footprint clustering, coherence pass and compensation replace them.
 
 ## Diagnostics
@@ -311,8 +313,10 @@ Sources may be `ImageData`, any `{data, width, height}`, canvases, `OffscreenCan
 families). For the last bit: `high` quality and, if the palette is very small, `skin_protection: 0.5`.
 
 **A sprite that was exported too large.** Downscale back to its logical size: flat-colour
-footprints are recovered exactly (see `upscaled_pixel_art_is_recovered_exactly` in the tests).
-Use `exact_colors()` if no colour may change at all.
+footprints are recovered exactly (see `upscaled_pixel_art_is_recovered_exactly` in the tests)
+as long as the source is within the resolution cap. For larger sources, and whenever no colour
+may change at all, use `exact_colors()` (or `palette_strategy = medoid`, selected when
+preparing): the cap then samples instead of averaging and every output colour is a source colour.
 
 **A fixed palette (PICO-8, NES, your own).** `smart_downscale_with_palette` /
 `sd.downscaleWithPalette(img, w, h, sd.getPresetPalette('pico8'))` /
@@ -379,7 +383,7 @@ hash-order-dependent iteration, and parallel work is reduced in a fixed order. A
   produce bit-identical results** (`DownscaleResult::digest()` / `result.digest`);
 - `cargo run --release --example digest` and `node scripts/check-wasm.mjs` print and compare
   the digests of every preset on every built-in chart (combined digest of 1.0.0:
-  `9e38d13c08509990`).
+  `6d9db53676008e43`; 1.0.0: `9e38d13c08509990`, which differs only in the `fast` preset).
 
 The legacy engine is deterministic as well in 1.0 (0.6 native builds were not: palette
 extraction depended on hash-map iteration order).
@@ -387,7 +391,7 @@ extraction depended on hash-map iteration order).
 ## Testing
 
 ```bash
-cargo test --release                       # 168 unit tests, 24 release gates, doc tests
+cargo test --release                       # 169 unit tests, 26 release gates, doc tests
 cargo run --release --example regression   # measurements + contact sheets in regression-out/
 cargo run --release --example digest       # determinism table
 cargo bench                                # criterion benchmarks
@@ -396,7 +400,8 @@ cargo bench                                # criterion benchmarks
 `tests/release_gates.rs` encodes the acceptance criteria on procedural charts with known
 content: determinism; exact recovery of enlarged pixel art; compensation never increasing
 chroma / contrast / lightness drift; crisper edges and more accurate structure than the legacy
-engine; thin-line retention without invented features; checkerboards and gradients; alpha
+engine; thin-line retention without invented features, also against the legacy salient mode
+on colourful lines; checkerboards and gradients; alpha
 correctness (no colour contamination, no fringes, hard edges stay hard); all aspect ratios,
 extreme and non-integer reductions, tiny palettes and degenerate inputs; fixed and exact-colour
 palettes; 0.x configuration compatibility.
@@ -429,6 +434,12 @@ that the typings declared but the module did not export, and the wrapper's impor
 - **Regular patterns near the sampling limit** (a 3-pixel checkerboard reduced 4×) cannot be
   represented; the result is a regular pattern rather than blotches, but its mean brightness
   can be off.
+- **Few-colour art above the resolution cap.** A source larger than `max_resolution_mp` is
+  resampled before extraction. For enlarged sprites that breaks the exact alignment: the
+  structure is still recovered, but colours can drift by a few levels (up to 4 of 255 in
+  `balanced` and 14 in `fast` on the pixel-art chart at 1.6 MP with a 1 MP cap), partly because
+  the lightness compensation over-reacts to distributions with only a few levels. Exact-colour
+  mode avoids both; a fix for the default path is planned.
 - **Small palettes on busy photographs** force choices. Families and reservation decide in
   favour of distinct colours over extra shades; raise `palette_size` if a ramp looks coarse.
 - **Colour families use a fixed separation threshold.** Two materials whose chromaticities are

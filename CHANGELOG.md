@@ -1,5 +1,49 @@
 # Changelog
 
+## 1.0.1
+
+### Performance
+
+- The palette stages scale much better with output size and palette size. Nearest-entry
+  searches go through a lightness-sorted index with an exact lower bound (`D ≥ w_L·ΔL²`), the
+  metric's per-colour terms are computed once per colour instead of once per comparison, the
+  reservation step skips colours a candidate cannot improve, and the coherence pass revisits
+  only the neighbourhoods of pixels that changed. Each of these returns exactly what the
+  exhaustive version returned: results are bit-identical to 1.0.0 in `balanced`, `high`,
+  `maximum`, exact-colour mode and the legacy engine.
+  Measured from a prepared 1 MP image (native, 2 cores), sum of five outputs of 160–320 px with
+  48–64 colours: `balanced` 1 107–1 341 ms → 668–810 ms, `high` 1 705–2 162 ms → 1 064–1 121 ms.
+
+### Changed
+
+- `fast` now runs contour bridging like the other modes (it works on the output grid and costs
+  next to nothing). Thin lines that 1.0.0 could leave open at T-junctions in `fast` are closed.
+  **`fast` results differ from 1.0.0; all other modes are unchanged.**
+
+### Fixed
+
+- The thin-feature release gate compared against the legacy *dominant* tile mode
+  (`k_centroid = 2`) while calling it "salient". It now compares against both `2` and the real
+  salient mode (`k_centroid = 4`), and a new gate tests saturated thin lines (red on skin, blue
+  on grey; 1–3 px wide) against the salient mode: gap-free, one pixel wide, no orientation
+  lost, nothing invented.
+- Exact-colour mode (`palette_strategy = Medoid`) could output colours that are not in the
+  source when the source exceeded the resolution cap (area averaging) or the colour-preprocess
+  threshold (colour reduction) and the mode was selected without the `exact_colors()` preset.
+  Preparing with the medoid strategy now samples instead of averaging and skips the colour
+  reduction.
+- Documentation listed three legacy tile modes; there are four (4 = salient).
+
+### Added
+
+- `synth::thin_lines_with` (thin-line chart with chosen colours).
+
+### Verification
+
+169 unit tests and 26 release gates pass; native and WebAssembly builds are bit-identical
+(combined digest `6d9db53676008e43`; the digest of 1.0.0 was `9e38d13c08509990`, the difference being the
+`fast` preset on one chart).
+
 ## 1.0.0
 
 The first stable release. A new default pipeline — **PAX, Perceptual Adaptive eXtraction** —

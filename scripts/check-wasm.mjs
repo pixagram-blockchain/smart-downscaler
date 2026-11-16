@@ -14,8 +14,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
 const sd = require(path.join(root, 'pkg/nodejs/smart_downscaler.js'));
 
-// Combined digest of release 1.0.0 (all presets × all charts).
-const EXPECTED = '9e38d13c08509990';
+// Combined digest of release 1.0.1 (all presets × all charts). 1.0.0: 9e38d13c08509990.
+const EXPECTED = '6d9db53676008e43';
 
 const presets = [['fast', 'fast'], ['balanced', 'balanced'], ['high', 'high'], ['maximum', 'maximum'], ['exact', 'exact_colors'], ['legacy', 'legacy']];
 const charts = [['portrait', 256, 256, 64, 64], ['illustration', 320, 180, 96, 54], ['gradient', 200, 120, 37, 23], ['texture', 192, 192, 48, 48], ['pixel_art', 192, 192, 40, 40]];

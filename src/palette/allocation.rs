@@ -19,7 +19,7 @@
 
 use super::candidates::PalColor;
 use super::families::{ClassPenalty, Classifier};
-use super::merging::{dedup, initial_cut, nearest_entry_class, refine, snap_to_members};
+use super::merging::{dedup, initial_cut, refine, snap_to_members, LightnessIndex};
 use super::PaletteStrategy;
 use crate::color::PerceptualMetric;
 use crate::math::pow_det;
@@ -115,6 +115,7 @@ fn reserve_adaptive(colors: &[PalColor], entries: &mut Vec<[f32; 3]>, p: &AllocP
 
     let classifier = p.classifier.filter(|c| c.active());
     let pen = classifier.map(|c| c.penalty()).unwrap_or(ClassPenalty::NONE);
+    let aux: Vec<crate::color::ColorAux> = colors.iter().map(|c| p.metric.aux(c.lab)).collect();
 
     for swap in 0..max_swaps {
         let forced = swap < p.reserve_min;
@@ -133,8 +134,9 @@ fn reserve_adaptive(colors: &[PalColor], entries: &mut Vec<[f32; 3]>, p: &AllocP
         // that speaks for all of its under-served members rather than for its worst outlier).
         let mut under: Vec<(f32, u32)> = Vec::new();
         let mut fam_acc = [[0.0f64; 4]; 128];
+        let index = LightnessIndex::new(entries, Some(&classes), &p.metric);
         for (i, c) in colors.iter().enumerate() {
-            let (e, d) = nearest_entry_class(entries, &classes, c.lab, c.class, &p.metric, pen);
+            let (e, d) = index.nearest(&p.metric, c.lab, aux[i], c.class, pen);
             ew[e] += c.weight;
             served[i] = d;
             if d < if forced { floor2 } else { tau2 } {
@@ -174,8 +176,14 @@ fn reserve_adaptive(colors: &[PalColor], entries: &mut Vec<[f32; 3]>, p: &AllocP
             let ca = p.metric.aux(lab);
             let cc = classifier.map(|c| c.class(lab)).unwrap_or(0);
             let mut gain = 0.0f32;
-            for (x, cur) in colors.iter().zip(&served) {
-                let d = p.metric.dist2(x.lab, p.metric.aux(x.lab), lab, ca) * pen.factor(x.class, cc);
+            let prune = p.metric.w_l >= 0.0 && p.metric.w_c >= 0.0 && p.metric.w_h >= 0.0;
+            for ((x, cur), xa) in colors.iter().zip(&served).zip(&aux) {
+                // The lightness term alone already exceeds what the colour has now: no gain.
+                let dl = x.lab[0] - lab[0];
+                if prune && p.metric.w_l * dl * dl >= *cur {
+                    continue;
+                }
+                let d = p.metric.dist2(x.lab, *xa, lab, ca) * pen.factor(x.class, cc);
                 if d < *cur {
                     gain += x.weight * (*cur - d);
                 }
@@ -232,7 +240,7 @@ fn reserve_adaptive(colors: &[PalColor], entries: &mut Vec<[f32; 3]>, p: &AllocP
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::palette::merging::nearest_entry;
+    use crate::palette::merging::{nearest_entry, nearest_entry_class};
     use crate::color::Oklr;
 
     fn col(l: f32, a: f32, b: f32, weight: f32) -> PalColor {

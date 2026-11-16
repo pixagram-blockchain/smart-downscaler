@@ -115,7 +115,7 @@ export interface DownscaleOptions {
   regionWeight?: number;
   twoPassRefinement?: boolean;
   refinementIterations?: number;
-  /** Tile mode of the legacy engine: 1 average, 2 dominant, 3 foremost. */
+  /** Tile mode of the legacy engine: 1 average, 2 dominant, 3 foremost, 4 salient. */
   kCentroid?: number;
   kCentroidIterations?: number;
   chromaRecovery?: number;

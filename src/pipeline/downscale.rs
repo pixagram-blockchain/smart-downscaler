@@ -145,7 +145,9 @@ fn pax_run(
         importance: ImportanceParams::from_config(cfg),
         metric,
         edge_preservation: cfg.structure.edge_preservation,
-        contour_preservation: if profile.structure_level >= 1 { cfg.structure.contour_preservation } else { 0.0 },
+        // Bridging runs in every mode: it works on the output grid (cheap), and without it
+        // non-maximum suppression can leave thin diagonals dashed and T-junctions open.
+        contour_preservation: cfg.structure.contour_preservation,
         full_saliency: profile.full_saliency,
         tau_match: xp.tau_distinct.max(0.06),
         has_alpha,
@@ -274,20 +276,17 @@ fn pax_run(
         (opt.base.clone(), p.colors.clone())
     } else if exact {
         // entries are member colours: recover their exact sRGB
+        let labs: Vec<[f32; 3]> = colors.iter().map(|c| c.lab).collect();
+        let index = crate::palette::merging::LightnessIndex::new(&labs, None, &metric);
         let rgb: Vec<Rgb> = opt
             .base
             .iter()
             .map(|e| {
-                let mut best = Oklr::from_array(*e).to_rgb();
-                let mut bd = f32::MAX;
-                for c in &colors {
-                    let d = metric.distance2(c.lab, *e);
-                    if d < bd {
-                        bd = d;
-                        best = c.rgb;
-                    }
+                if colors.is_empty() {
+                    return Oklr::from_array(*e).to_rgb();
                 }
-                best
+                let (i, _) = index.nearest(&metric, *e, metric.aux(*e), 0, crate::palette::families::ClassPenalty::NONE);
+                colors[i].rgb
             })
             .collect();
         (opt.base.clone(), rgb)

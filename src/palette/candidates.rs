@@ -92,6 +92,7 @@ pub fn pixel_weights(rec: &Reconstruction, metric: &PerceptualMetric, p: &Weight
     let (q02, q10, q90, q98) = (dist.quantile(0.02), dist.quantile(0.10), dist.quantile(0.90), dist.quantile(0.98));
 
     // Edge term per pixel: contrast against the 4-neighbourhood.
+    let taux: Vec<crate::color::ColorAux> = rec.target.iter().map(|t| metric.aux(*t)).collect();
     let mut edge = vec![0.0f32; n];
     for y in 0..h {
         for x in 0..w {
@@ -100,10 +101,11 @@ pub fn pixel_weights(rec: &Reconstruction, metric: &PerceptualMetric, p: &Weight
                 continue;
             }
             let t = rec.target[j];
+            let ta = taux[j];
             let mut contrast = 0.0f32;
             let mut probe = |q: usize| {
                 if rec.is_visible(q) {
-                    let d = metric.distance2(t, rec.target[q]);
+                    let d = metric.dist2(t, ta, rec.target[q], taux[q]);
                     if d > contrast {
                         contrast = d;
                     }

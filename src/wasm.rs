@@ -518,7 +518,9 @@ pub fn downscale_rgba(
 ///
 /// Settings that are fixed at prepare time: `engine`, `max_resolution_mp`,
 /// `max_color_preprocess`, the segmentation settings, `edge_weight`, `centroid_edge_weight`
-/// and the alpha settings. Prepare again if you change one of them.
+/// and the alpha settings. Prepare again if you change one of them. For exact source colours
+/// (`palette_strategy = "medoid"`) select the strategy when preparing as well: only then is
+/// the image prepared without averaging or colour reduction.
 #[wasm_bindgen]
 pub struct WasmPreparedImage {
     inner: PreparedImage,

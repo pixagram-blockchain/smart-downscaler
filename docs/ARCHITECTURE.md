@@ -336,10 +336,10 @@ is never used.
 
 | Gate (specification §11) | Result | Evidence |
 |---|---|---|
-| Determinism | **Met.** Identical across runs, thread counts and native / WebAssembly | `identical_inputs_give_identical_outputs`, `examples/digest.rs`, `scripts/check-wasm.mjs`: 42 results, combined digest `9e38d13c08509990` |
+| Determinism | **Met.** Identical across runs, thread counts and native / WebAssembly | `identical_inputs_give_identical_outputs`, `examples/digest.rs`, `scripts/check-wasm.mjs`: 42 results, combined digest `6d9db53676008e43` (1.0.1) |
 | Colour compensation reduces chroma, contrast and lightness drift | **Met** on the charts | `compensation_never_increases_drift_and_reports_it`, `muted_and_neutral_images_are_not_saturated` |
 | Edge preservation better than the current release | **Met** on the structural set | `edges_are_crisper_and_structure_more_accurate_than_the_legacy_engine`; see the README image |
-| Thin-feature retention: no regression against the salient mode | **Met** | `thin_features_are_kept_without_inventing_any` (the legacy engine loses 2-px lines at 4× entirely) |
+| Thin-feature retention: no regression against the salient mode | **Met** | `thin_features_are_kept_without_inventing_any` (against `k_centroid = 2` and the salient mode `k_centroid = 4`; with its defaults the legacy engine loses 2-px lines at 4× entirely) and `colourful_thin_features_hold_up_against_the_legacy_salient_mode` (saturated lines 1–3 px wide: gap-free, one pixel wide, no orientation lost) |
 | Alpha correctness | **Met** | `transparent_pixels_never_contaminate_colour`, `alpha_modes_and_opt_out` |
 | Performance: ≤ 20 % overhead in Balanced | **Met against the 0.x defaults, not against the cheapest 0.x configuration** | Balanced is 2.7–4.4× faster than `hierarchy_fast` and ≈ 100× faster than `hierarchy`, but 1.8–2.7× slower than 0.x without segmentation (README, Performance) |
 | Memory: reusable buffers, no per-tile heap allocations | **Met** for extraction (by construction, §4.4); the palette stages allocate per call, not per pixel | code |
@@ -347,7 +347,7 @@ is never used.
 
 ### 9.2 Test suite
 
-168 unit tests (next to the code they test), 24 release-gate tests on procedural charts
+169 unit tests (next to the code they test), 26 release-gate tests on procedural charts
 (`tests/release_gates.rs`), doc tests. The charts cover the specification's list: pixel art
 (contours, isolated pixels, dither), an illustration with outlines, a portrait (skin, lips,
 hair), gradients, high-frequency texture, thin lines in four orientations, checkerboards,

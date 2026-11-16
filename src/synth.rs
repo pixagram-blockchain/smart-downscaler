@@ -197,8 +197,12 @@ pub fn illustration(w: usize, h: usize) -> Vec<Rgb> {
 /// diagonals — plus isolated square dots of side `2·thickness`. Returns the image and a mask
 /// (`true` = feature) for scoring.
 pub fn thin_lines(w: usize, h: usize, thickness: usize, spacing: usize) -> (Vec<Rgb>, Vec<bool>) {
-    let bg = Rgb::new(232, 226, 210);
-    let fg = Rgb::new(34, 30, 48);
+    thin_lines_with(w, h, thickness, spacing, Rgb::new(34, 30, 48), Rgb::new(232, 226, 210))
+}
+
+/// [`thin_lines`] with a chosen feature colour `fg` and ground colour `bg` — e.g. a saturated
+/// red on a muted ground, the "colourful minority" case (lips, eyes, makeup).
+pub fn thin_lines_with(w: usize, h: usize, thickness: usize, spacing: usize, fg: Rgb, bg: Rgb) -> (Vec<Rgb>, Vec<bool>) {
     let (t, sp) = (thickness.max(1) as i64, spacing.max(4) as i64);
     let mut px = Vec::with_capacity(w * h);
     let mut mask = Vec::with_capacity(w * h);

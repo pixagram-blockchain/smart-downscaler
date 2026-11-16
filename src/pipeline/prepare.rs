@@ -246,8 +246,10 @@ pub(crate) fn build_work_image(
 ///
 /// Settings read at prepare time: `engine`, `quality_mode` (structural analysis level and cap
 /// filter), `max_resolution_mp`, `max_color_preprocess`, `edge_weight`, `segmentation`,
-/// `artifacts.preserve_alpha`. Change any of them → prepare again. Everything else may vary
-/// freely between [`crate::smart_downscale_prepared`] calls.
+/// `artifacts.preserve_alpha`, and whether `palette_strategy` is `Medoid` (exact-colour mode
+/// prepares without averaging or colour reduction, so that no colour is invented). Change any
+/// of them → prepare again. Everything else may vary freely between
+/// [`crate::smart_downscale_prepared`] calls.
 #[derive(Clone, Debug)]
 pub struct PreparedImage {
     /// Prepared sRGB pixels (after cap / pre-quantisation / transparent-colour padding).
@@ -383,8 +385,12 @@ fn prepare_impl(
     let profile = config.profile();
     let (width, height) = capped_dimensions(source_width, source_height, config.max_resolution_mp);
     let resolution_capped = (width, height) != (source_width, source_height);
+    // Exact-colour mode promises that every output colour exists in the source, so nothing
+    // before the extraction may invent one: the cap samples (nearest neighbour) instead of
+    // averaging, and the colour reduction below is skipped.
+    let exact = config.palette_strategy == crate::palette::PaletteStrategy::Medoid;
     let (mut pixels, mut alpha) = if resolution_capped {
-        if profile.area_cap {
+        if profile.area_cap && !exact {
             area_downscale(source_pixels, alpha.as_deref(), source_width, source_height, width, height)
         } else {
             (
@@ -408,7 +414,7 @@ fn prepare_impl(
         alpha::pad_transparent(&mut pixels, a, width, height);
     }
 
-    let colors_reduced = is_color_rich(&pixels, config.max_color_preprocess);
+    let colors_reduced = !exact && is_color_rich(&pixels, config.max_color_preprocess);
     if colors_reduced {
         quantize_rgb555_centroids(&mut pixels);
     }

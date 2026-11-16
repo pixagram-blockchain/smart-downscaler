@@ -89,6 +89,7 @@ pub fn entry_stats(
     metric: &PerceptualMetric,
 ) -> Vec<EntryStats> {
     let k = base.len();
+    let baux: Vec<crate::color::ColorAux> = base.iter().map(|b| metric.aux(*b)).collect();
     let mut acc = vec![[0.0f64; 9]; k]; // n, w, wl, wa, wb, chroma, scatter, hue_a, hue_b
     for j in 0..rec.target.len() {
         if !rec.is_visible(j) {
@@ -107,7 +108,7 @@ pub fn entry_stats(
         a[3] += w * t[1] as f64;
         a[4] += w * t[2] as f64;
         a[5] += al * rec.chroma_ref[j] as f64;
-        a[6] += al * metric.distance2(t, base[i]) as f64;
+        a[6] += al * metric.dist2(t, metric.aux(t), base[i], baux[i]) as f64;
         let c = rec.chroma_ref[j] as f64;
         a[7] += al * c * t[1] as f64;
         a[8] += al * c * t[2] as f64;
@@ -143,11 +144,12 @@ pub fn pair_stats(rec: &Reconstruction, idx: &[u8], k: usize, metric: &Perceptua
     };
     let mut inner_best = vec![0.0f32; k];
     let min2 = EDGE_PAIR_MIN * EDGE_PAIR_MIN;
+    let taux: Vec<crate::color::ColorAux> = rec.target.iter().map(|t| metric.aux(*t)).collect();
     let mut visit = |j: usize, q: usize, ps: &mut PairStats| {
         if !rec.is_visible(j) || !rec.is_visible(q) {
             return;
         }
-        let d = metric.distance2(rec.target[j], rec.target[q]);
+        let d = metric.dist2(rec.target[j], taux[j], rec.target[q], taux[q]);
         if d < min2 {
             return;
         }
